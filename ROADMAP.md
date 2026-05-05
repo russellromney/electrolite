@@ -5,8 +5,9 @@ shape before implementation starts.
 
 ## North Star
 
-Electrolite is an embeddable SQLite sync layer that gives browser clients
-Electric-style shape subscriptions without a separate sync daemon.
+Electrolite is a Rust-first embeddable SQLite sync layer that gives
+browser clients Electric-style shape subscriptions without a separate sync
+daemon.
 
 ```text
 SQLite + generated triggers
@@ -39,6 +40,15 @@ Prove the semantics before optimizing.
   - `GET /electrolite/v1/shape/:name?offset=123&live=true`
 - Support named shapes only.
 - Start with simple polling of `_electrolite_log` for live waits.
+
+### First Commit Shape
+
+- `electrolite-core` owns shape handles, predicates, log rows, and
+  membership transition messages.
+- `electrolite-sqlite` owns bootstrap DDL, trigger generation, and log
+  reads.
+- `electrolite-server` exists as a placeholder for the embedded HTTP
+  route layer.
 
 ### Non-goals
 

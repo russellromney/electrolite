@@ -2,8 +2,8 @@
 
 Embeddable Electric-style shape sync for SQLite.
 
-Electrolite is a design-stage project for syncing named SQLite table
-shapes to browsers without a separate sync daemon. The intended shape:
+Electrolite is a Rust-first project for syncing named SQLite table shapes
+to browsers without a separate sync daemon. The intended shape:
 
 ```text
 SQLite + generated triggers
@@ -15,6 +15,14 @@ SQLite + generated triggers
 The semantic core is a trigger-backed logical log. Honker-style commit
 wakes, Walrust physical replication, and S3/Cinch object storage are
 useful accelerants, but not required for the first version.
+
+## Workspace
+
+- `crates/electrolite-core` - shape definitions, handles, log rows, and
+  membership transition logic.
+- `crates/electrolite-sqlite` - SQLite metadata tables, trigger
+  generation, and log reads.
+- `crates/electrolite-server` - future embedded HTTP long-poll service.
 
 ## Goals
 
@@ -39,4 +47,5 @@ See [ROADMAP.md](ROADMAP.md).
 
 ## Status
 
-Idea scaffold. APIs and implementation language are not settled.
+Early scaffold. The first implemented slice is trigger-backed logical
+change capture for simple primary-key tables.
