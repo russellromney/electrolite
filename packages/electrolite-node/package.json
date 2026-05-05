@@ -5,8 +5,8 @@
   "type": "module",
   "exports": {
     ".": {
-      "types": "./electrolite-node.d.ts",
-      "default": "./electrolite-node.js"
+      "types": "./electrolite-node.ts",
+      "default": "./electrolite-node.ts"
     }
   },
   "scripts": {

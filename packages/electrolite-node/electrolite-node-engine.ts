@@ -3,15 +3,66 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 
+interface TableInfo {
+  table: string;
+  columns: string[];
+  pkColumns: string[];
+  columnTypes: Record<string, string>;
+}
+
+interface Shape {
+  name?: string;
+  table: string;
+  columns: string[];
+  predicate?: Predicate;
+  auth_scope?: string;
+  schema_version?: number;
+}
+
+type Predicate =
+  | { type: "all" }
+  | { type: "eq"; column: string; value: unknown }
+  | { type: "in"; column: string; values: unknown[] }
+  | { type: "and"; predicates: Predicate[] };
+
+interface CompiledPredicate {
+  where: string;
+  params: unknown[];
+}
+
+interface LogRow {
+  seq: number;
+  batch_id: string;
+  table_name: string;
+  op: string;
+  pk_json: Record<string, unknown>;
+  old_pk_json: Record<string, unknown> | null;
+  new_pk_json: Record<string, unknown> | null;
+  old_json: Record<string, unknown> | null;
+  new_json: Record<string, unknown> | null;
+  created_at: number;
+}
+
+interface ShapeMessage {
+  type: "insert" | "update" | "delete";
+  batch_id: string;
+  key: Record<string, unknown>;
+  value?: Record<string, unknown>;
+  offset: number;
+}
+
 export class JsElectroliteEngine {
-  constructor(dbPath) {
+  db;
+  tableInfoCache: Map<string, TableInfo>;
+
+  constructor(dbPath: string) {
     const { DatabaseSync } = loadNodeSqlite();
     this.db = new DatabaseSync(dbPath);
     this.tableInfoCache = new Map();
     this.bootstrap();
   }
 
-  installTriggersAuto(table) {
+  installTriggersAuto(table: string): string {
     this.tableInfoCache.delete(table);
     const info = this.inspectTable(table);
     if (info.pkColumns.length === 0) {
@@ -20,7 +71,7 @@ export class JsElectroliteEngine {
     return this.installTriggersForInfo(info);
   }
 
-  installTriggers(table, pkColumn) {
+  installTriggers(table: string, pkColumn: string): string {
     this.tableInfoCache.delete(table);
     const info = this.inspectTable(table);
     if (!info.columns.includes(pkColumn)) {
@@ -29,7 +80,7 @@ export class JsElectroliteEngine {
     return this.installTriggersForInfo({ ...info, pkColumns: [pkColumn] });
   }
 
-  installTriggersForInfo(info) {
+  installTriggersForInfo(info: TableInfo): string {
     this.bootstrap();
     this.db.prepare(`
       INSERT INTO _electrolite_watched_tables (table_name, pk_columns)
@@ -85,7 +136,7 @@ export class JsElectroliteEngine {
     });
   }
 
-  inspectTable(table) {
+  inspectTable(table: string): TableInfo {
     const cached = this.tableInfoCache.get(table);
     if (cached) {
       return {
@@ -105,8 +156,8 @@ export class JsElectroliteEngine {
     return info;
   }
 
-  snapshot(shapeJson) {
-    const shape = JSON.parse(shapeJson);
+  snapshot(shapeJson: string): string {
+    const shape = JSON.parse(shapeJson) as Shape;
     const info = this.validatedWatchedTable(shape);
     const normalizedShape = normalizeShape(info, shape);
     const compiled = compilePredicate(info, normalizedShape.predicate);
@@ -131,8 +182,8 @@ export class JsElectroliteEngine {
     });
   }
 
-  replay(shapeJson, offset, limit = 1000) {
-    const shape = JSON.parse(shapeJson);
+  replay(shapeJson: string, offset: number, limit = 1000): string {
+    const shape = JSON.parse(shapeJson) as Shape;
     const info = this.validatedWatchedTable(shape);
     const normalizedShape = normalizeShape(info, shape);
     return readTransaction(this.db, () => {
@@ -159,22 +210,22 @@ export class JsElectroliteEngine {
     });
   }
 
-  shapeHandle(shapeJson) {
-    const shape = JSON.parse(shapeJson);
+  shapeHandle(shapeJson: string): string {
+    const shape = JSON.parse(shapeJson) as Shape;
     const info = this.validatedWatchedTable(shape);
     return shapeHandleFor(normalizeShape(info, shape));
   }
 
-  highWaterMark() {
+  highWaterMark(): number {
     return this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS seq FROM _electrolite_log").get().seq;
   }
 
-  logId() {
+  logId(): string {
     this.bootstrap();
     return this.db.prepare("SELECT value FROM _electrolite_meta WHERE key = 'log_id'").get().value;
   }
 
-  compactLogToLastForTable(tableName, keepLast) {
+  compactLogToLastForTable(tableName: string, keepLast: number): string {
     const rows = this.db.prepare(`
       SELECT seq FROM _electrolite_log
       WHERE table_name = ?
@@ -193,16 +244,16 @@ export class JsElectroliteEngine {
     return JSON.stringify({ retained_offset: retainedOffset, deleted_rows: deleted });
   }
 
-  executeBatch(sql) {
+  executeBatch(sql: string): void {
     this.db.exec(sql);
   }
 
-  execute(sql, paramsJson = "[]") {
+  execute(sql: string, paramsJson = "[]"): number {
     const params = JSON.parse(paramsJson || "[]");
     return this.db.prepare(normalizePlaceholders(sql)).run(...params).changes;
   }
 
-  writeBatch(statementsJson) {
+  writeBatch(statementsJson: string): void {
     const statements = JSON.parse(statementsJson);
     const batchId = randomHex(16);
     this.db.exec("BEGIN IMMEDIATE");
@@ -227,7 +278,7 @@ export class JsElectroliteEngine {
     }
   }
 
-  bootstrap() {
+  bootstrap(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS _electrolite_meta (
         key TEXT PRIMARY KEY,
@@ -261,7 +312,7 @@ export class JsElectroliteEngine {
     `).run(randomHex(16));
   }
 
-  validatedWatchedTable(shape) {
+  validatedWatchedTable(shape: Shape): TableInfo {
     const info = this.inspectTable(shape.table);
     const watched = this.db.prepare(
       "SELECT pk_columns FROM _electrolite_watched_tables WHERE table_name = ?",
@@ -616,7 +667,7 @@ function loadNodeSqlite() {
     return require("node:sqlite");
   } catch (error) {
     error.message = [
-      "Electrolite's pure JavaScript engine requires Node's built-in node:sqlite module.",
+      "Electrolite requires Node's built-in node:sqlite module.",
       "Use Node 24+ to run Electrolite.",
       `Original error: ${error.message}`,
     ].join("\n");

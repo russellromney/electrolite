@@ -1,20 +1,102 @@
-import { JsElectroliteEngine } from "./electrolite-node-js.js";
+import { JsElectroliteEngine } from "./electrolite-node-engine.ts";
 
-export const all = () => ({ type: "all" });
-export const eq = (column, value) => ({ type: "eq", column, value });
-export const inList = (column, values) => ({ type: "in", column, values });
-export const and = (predicates) => ({ type: "and", predicates });
+export type ElectrolitePredicate =
+  | { type: "all" }
+  | { type: "eq"; column: string; value: unknown }
+  | { type: "in"; column: string; values: unknown[] }
+  | { type: "and"; predicates: ElectrolitePredicate[] };
 
-export function shape(definition) {
+export interface ShapeDefinitionContext<TContext = unknown> {
+  params: Record<string, string>;
+  request: Request;
+  context: TContext;
+}
+
+export interface ShapeAuthorizeContext<TContext = unknown>
+  extends ShapeDefinitionContext<TContext> {
+  scope: string;
+}
+
+export interface ShapeDefinition<TContext = unknown> {
+  table: string;
+  columns: string[];
+  params?: string[];
+  where?: (
+    context: ShapeDefinitionContext<TContext>,
+  ) => ElectrolitePredicate | Promise<ElectrolitePredicate>;
+  scope?:
+    | string
+    | ((
+        context: ShapeDefinitionContext<TContext>,
+      ) => string | Promise<string>);
+  authorize?: (
+    context: ShapeAuthorizeContext<TContext>,
+  ) => boolean | Promise<boolean>;
+  schemaVersion?: number;
+}
+
+export interface ElectroliteOptions<TContext = unknown> {
+  dbPath: string;
+  shapes?: Record<string, ShapeDefinition<TContext>>;
+  prefix?: string;
+  replayLimit?: number;
+  liveTimeoutMs?: number;
+  pollIntervalMs?: number;
+}
+
+export interface InstallResult {
+  table: string;
+  key_columns: string[];
+  columns: string[];
+}
+
+export interface RetentionStats {
+  retained_offset: number;
+  deleted_rows: number;
+}
+
+interface BuiltShape {
+  allow: boolean;
+  shape?: {
+    name: string;
+    table: string;
+    columns: string[];
+    predicate: ElectrolitePredicate;
+    auth_scope: string;
+    schema_version: number;
+  };
+}
+
+type Waiter = () => void;
+
+export const all = (): ElectrolitePredicate => ({ type: "all" });
+export const eq = (column: string, value: unknown): ElectrolitePredicate => ({ type: "eq", column, value });
+export const inList = (column: string, values: unknown[]): ElectrolitePredicate => ({ type: "in", column, values });
+export const and = (predicates: ElectrolitePredicate[]): ElectrolitePredicate => ({ type: "and", predicates });
+
+export function shape<TContext = unknown>(
+  definition: ShapeDefinition<TContext>,
+): ShapeDefinition<TContext> {
   return { ...definition };
 }
 
-export function createElectrolite(options) {
-  return new Electrolite(options);
+export function createElectrolite<TContext = unknown>(
+  options: ElectroliteOptions<TContext>,
+): Electrolite<TContext> {
+  return new Electrolite<TContext>(options);
 }
 
-export class Electrolite {
-  constructor(options = {}) {
+export class Electrolite<TContext = unknown> {
+  engine: JsElectroliteEngine;
+  shapes: Record<string, ShapeDefinition<TContext>>;
+  prefix: string;
+  replayLimit: number;
+  liveTimeoutMs: number;
+  pollIntervalMs: number;
+  activeShapes: Map<string, BuiltShape["shape"]>;
+  waiters: Map<string, Set<Waiter>>;
+
+  constructor(options: ElectroliteOptions<TContext>) {
     const {
       dbPath,
       shapes = {},
@@ -37,49 +119,49 @@ export class Electrolite {
     this.waiters = new Map();
   }
 
-  installTriggers(table) {
+  installTriggers(table: string): InstallResult {
     return JSON.parse(this.engine.installTriggersAuto(String(table)));
   }
 
-  installTriggersFor(table, pkColumn) {
+  installTriggersFor(table: string, pkColumn: string): InstallResult {
     return JSON.parse(this.engine.installTriggers(String(table), String(pkColumn)));
   }
 
-  executeBatch(sql) {
+  executeBatch(sql: string): void {
     const offset = this.highWaterMark();
     this.engine.executeBatch(String(sql));
     this.notifyChangedFrom(offset);
   }
 
-  execute(sql, params = []) {
+  execute(sql: string, params: unknown[] = []): number {
     const offset = this.highWaterMark();
     const rows = this.engine.execute(String(sql), JSON.stringify(params));
     this.notifyChangedFrom(offset);
     return rows;
   }
 
-  writeBatch(statements) {
+  writeBatch(statements: Array<[sql: string, params?: unknown[]]>): void {
     const offset = this.highWaterMark();
     const normalized = statements.map(([sql, params = []]) => ({ sql, params }));
     this.engine.writeBatch(JSON.stringify(normalized));
     this.notifyChangedFrom(offset);
   }
 
-  highWaterMark() {
+  highWaterMark(): number {
     return this.engine.highWaterMark();
   }
 
-  logId() {
+  logId(): string {
     return this.engine.logId();
   }
 
-  compactLogToLastForTable(tableName, keepLast) {
+  compactLogToLastForTable(tableName: string, keepLast: number): RetentionStats {
     return JSON.parse(
       this.engine.compactLogToLastForTable(String(tableName), Number(keepLast)),
     );
   }
 
-  notifyChanged() {
+  notifyChanged(): void {
     const waiters = new Set();
     for (const shapeWaiters of this.waiters.values()) {
       for (const waiter of shapeWaiters) {
@@ -92,7 +174,7 @@ export class Electrolite {
     }
   }
 
-  notifyChangedFrom(offset) {
+  notifyChangedFrom(offset: number): void {
     if (this.activeShapes.size === 0) {
       return;
     }
@@ -117,7 +199,7 @@ export class Electrolite {
     }
   }
 
-  notifyShapeChanged(shapeHandle) {
+  notifyShapeChanged(shapeHandle: string): void {
     const waiters = this.waiters.get(shapeHandle);
     if (!waiters) {
       return;
@@ -128,11 +210,11 @@ export class Electrolite {
     }
   }
 
-  async fetch(request, context) {
+  async fetch(request: Request, context?: TContext): Promise<Response> {
     return this.handle(request, context);
   }
 
-  async handle(request, context) {
+  async handle(request: Request, context?: TContext): Promise<Response> {
     if (request.method !== "GET") {
       return jsonError(405, "method_not_allowed");
     }
@@ -169,7 +251,12 @@ export class Electrolite {
     return this.replayResponse(built.shape, route.offset);
   }
 
-  async buildShape(definition, route, request, context) {
+  async buildShape(
+    definition: ShapeDefinition<TContext>,
+    route,
+    request: Request,
+    context: TContext | undefined,
+  ): Promise<BuiltShape> {
     const params = paramsFor(definition.params ?? [], route.path);
     if (!params) {
       return { allow: false };

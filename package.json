@@ -4,6 +4,7 @@
   "scripts": {
     "demo": "npm run demo:web",
     "demo:console": "node --no-warnings examples/basic-todos/demo.mjs",
+    "demo:fanout": "node --no-warnings examples/live-fanout/demo.mjs",
     "demo:web": "node --no-warnings examples/basic-web-app/server.mjs",
     "test": "npm run test:browser && npm run test:node",
     "test:all": "npm test && npm run test:python",

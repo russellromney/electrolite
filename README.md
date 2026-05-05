@@ -33,6 +33,8 @@ no native build, sidecar, npm install step, or separate sync service.
 
 > **Experimental software.**
 
+![Electrolite demo showing SQLite writes on the left and a live browser subscriber on the right](docs/assets/demo.png)
+
 ## Why This Is Interesting
 
 - SQLite becomes a live backend for browser state.
@@ -125,6 +127,16 @@ The page subscribes to `projectTodos/launch`. When you add a todo, the
 backend writes to SQLite and the browser updates from the live
 Electrolite Shape.
 
+100 live subscribers demo:
+
+```sh
+npm run demo:fanout
+```
+
+On one local run, a single SQLite write woke `100/100` live Shape clients
+and all 100 materialized the new row in about `13ms`. This is a demo, not
+a benchmark suite, but it is a useful smoke test for shared-Shape fanout.
+
 ## Semantic Coverage
 
 The Node implementation was checked against the previous reference
@@ -155,7 +167,7 @@ import {
   createElectrolite,
   eq,
   shape,
-} from "./vendor/electrolite/packages/electrolite-node/electrolite-node.js";
+} from "./vendor/electrolite/packages/electrolite-node/electrolite-node.ts";
 ```
 
 3. Serve the browser client from your app, or copy
@@ -227,7 +239,7 @@ import {
   createElectrolite,
   eq,
   shape,
-} from "./vendor/electrolite/packages/electrolite-node/electrolite-node.js";
+} from "./vendor/electrolite/packages/electrolite-node/electrolite-node.ts";
 
 const electrolite = createElectrolite<{ user: { projects: Set<string> } }>({
   dbPath: "./app.db",
@@ -345,7 +357,7 @@ For the user-facing TypeScript API, start with
 This is still early, but the main TypeScript path works end to end:
 
 - embedded Node package
-- pure JS engine using Node's built-in SQLite API
+- TypeScript engine using Node's built-in SQLite API
 - SQLite trigger install
 - initial snapshots
 - bounded replay

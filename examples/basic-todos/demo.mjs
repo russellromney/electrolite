@@ -6,7 +6,7 @@ import {
   createElectrolite,
   eq,
   shape,
-} from "../../packages/electrolite-node/electrolite-node.js";
+} from "../../packages/electrolite-node/electrolite-node.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "electrolite-demo-"));
 const dbPath = join(dir, "demo.db");

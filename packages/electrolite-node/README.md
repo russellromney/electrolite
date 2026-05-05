@@ -5,15 +5,15 @@ TypeScript-first Electric-style sync for SQLite.
 You write TypeScript. Electrolite installs SQLite triggers, keeps a
 durable change log, and serves browser Shapes over normal HTTP.
 
-Electrolite is pure JavaScript on the server side and uses Node's
-built-in SQLite API. You need Node 24+.
+Electrolite is TypeScript on the server side and uses Node's built-in
+SQLite API. You need Node 24+.
 
 ```ts
 import {
   createElectrolite,
   eq,
   shape,
-} from "./vendor/electrolite/packages/electrolite-node/electrolite-node.js";
+} from "./vendor/electrolite/packages/electrolite-node/electrolite-node.ts";
 
 const electrolite = createElectrolite({
   dbPath: "./app.db",

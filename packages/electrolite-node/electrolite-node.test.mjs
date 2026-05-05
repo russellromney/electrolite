@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { ShapeClient } from "../../clients/browser/electrolite.js";
-import { createElectrolite, all, eq, inList, shape } from "./electrolite-node.js";
+import { createElectrolite, all, eq, inList, shape } from "./electrolite-node.ts";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -121,6 +121,43 @@ test("live requests only wake for writes visible to that Shape", async () => {
     assert.deepEqual(p2Client.currentRows(), [
       { id: 2, project_id: "p2", title: "other project", done: 0 },
     ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("one write wakes 100 live subscribers to the same Shape", async () => {
+  const { dir, electrolite } = setup({ liveTimeoutMs: 250, pollIntervalMs: 1_000 });
+  try {
+    const fetch = (url, init) => {
+      return electrolite.handle(new Request(url, init), {
+        user: { projects: new Set(["p1"]) },
+      });
+    };
+    const clients = Array.from({ length: 100 }, () => new ShapeClient(
+      "https://app.test/electrolite/v1/projectTodos/p1",
+      {
+        fetch,
+        live: false,
+        retry: { minDelayMs: 5, maxDelayMs: 20 },
+      },
+    ));
+
+    await Promise.all(clients.map((client) => client.request({ offset: -1 })));
+    const liveRequests = clients.map((client) => client.request({
+      offset: client.offset,
+      live: true,
+    }));
+
+    await sleep(25);
+    electrolite.execute(
+      "INSERT INTO todos (id, project_id, title, done) VALUES (?1, ?2, ?3, 0)",
+      [3, "p1", "wake shared subscribers"],
+    );
+
+    const results = await Promise.all(liveRequests);
+    assert.equal(results.filter(Boolean).length, 100);
+    assert.equal(clients.filter((client) => client.currentRows().length === 2).length, 100);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
