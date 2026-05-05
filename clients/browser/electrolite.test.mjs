@@ -86,3 +86,52 @@ test("treats 204 live timeouts as no change", async () => {
     "http://app.test/electrolite/v1/shape/activeUsers?offset=10&live=true",
   );
 });
+
+test("handles resync_required by clearing rows and fetching a new snapshot", async () => {
+  const responses = [
+    { status: 409, ok: false },
+    {
+      status: 200,
+      ok: true,
+      json: async () => ({
+        type: "snapshot",
+        rows: [{ id: 7, name: "Ada", active: 1 }],
+        offset: 42,
+      }),
+    },
+  ];
+  const client = new ShapeClient("http://app.test/electrolite/v1/shape/activeUsers", {
+    keyColumns: ["id"],
+    fetch: async () => responses.shift(),
+  });
+  client.apply({
+    type: "snapshot",
+    rows: [{ id: 1, name: "Old", active: 1 }],
+    offset: 10,
+  });
+
+  assert.equal(await client.request({ offset: 10, live: true }), true);
+  assert.deepEqual(client.currentRows(), [{ id: 7, name: "Ada", active: 1 }]);
+  assert.equal(client.offset, 42);
+});
+
+test("emits status updates", async () => {
+  const client = new ShapeClient("http://app.test/electrolite/v1/shape/activeUsers", {
+    keyColumns: ["id"],
+    fetch: async () => ({
+      status: 200,
+      ok: true,
+      json: async () => ({
+        type: "snapshot",
+        rows: [],
+        offset: 0,
+      }),
+    }),
+  });
+  const statuses = [];
+  client.subscribeStatus((status) => statuses.push(status.type));
+
+  await client.request({ offset: -1 });
+
+  assert.deepEqual(statuses, ["idle", "snapshot", "ready"]);
+});

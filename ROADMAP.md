@@ -67,6 +67,10 @@ Make snapshot and replay behavior precise.
   2. run the shape query
   3. return rows plus `up-to-date` with the continuation offset
 - Replay from offset by scanning `_electrolite_log`.
+- Replay scans should filter by `table_name` before evaluating Shape
+  membership.
+- Keep a retained-log lower bound and return `409 resync_required` when
+  the requested offset is older than retained history.
 - Evaluate membership transitions:
 
 ```text
@@ -100,6 +104,23 @@ Make the default safe for real applications.
 - Ensure delete messages only reveal rows previously visible to that
   authorized shape.
 
+### Dynamic Authorization Gap
+
+The first server supports static named Shapes with an auth hook. Apps can
+model "this user's photos" by registering a named Shape whose predicate
+and `auth_scope` are already user-specific. A later phase should add
+Shape factories for app routes such as:
+
+```text
+/users/:user_id/photos
+/photos/:photo_id/friend-likes
+```
+
+Factories must still build server-side Shapes; browsers still must not
+send arbitrary SQL. Relationship-shaped data such as "your friends' likes
+on your photos" also needs richer predicate/index support than the first
+`Eq`/`And` predicate set.
+
 ## Phase Crowd - Fanout And Caching
 
 Support 10,000 concurrent clients when most clients share a small number
@@ -120,6 +141,10 @@ ETag: ...
   `shape_handle + offset` waits.
 - Origin should do one wait per `shape_handle + offset`, not one wait per
   browser.
+- The embedded server should use a bounded SQLite connection pool with a
+  default size of 1, configurable by the host app.
+- Add a benchmark harness that measures snapshot latency, replay latency,
+  live fanout latency, SQLite reads, and origin work across client counts.
 
 ### Target
 
@@ -194,4 +219,5 @@ Electrolite semantics still come from trigger logs.
 - Browser client adapters for React, Solid, Svelte, and vanilla stores.
 - IndexedDB persistence.
 - Multi-tab coordination.
+- Browser client retry/backoff/status reporting.
 - Offline writes and conflict handling as a separate track.

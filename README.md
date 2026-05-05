@@ -78,4 +78,6 @@ See [ROADMAP.md](ROADMAP.md).
 Early scaffold. The implemented slice is trigger-backed logical change
 capture for simple primary-key tables, plus an embedded HTTP route for
 authorized initial snapshots, bounded replay, and `live=true`
-long-polling.
+long-polling. The server now has a SQLite connection pool, in-process
+live wait coalescing, retained-offset resync errors, and a basic fanout
+benchmark harness.

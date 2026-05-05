@@ -1,6 +1,11 @@
 export class ShapeClient {
   constructor(url, options = {}) {
-    const { keyColumns, fetch: fetchFn = globalThis.fetch, live = true } = options;
+    const {
+      keyColumns,
+      fetch: fetchFn = globalThis.fetch,
+      live = true,
+      retry = {},
+    } = options;
     if (!Array.isArray(keyColumns) || keyColumns.length === 0) {
       throw new Error("ShapeClient requires keyColumns");
     }
@@ -12,10 +17,14 @@ export class ShapeClient {
     this.keyColumns = keyColumns;
     this.fetch = fetchFn;
     this.live = live;
+    this.retryMinDelayMs = retry.minDelayMs ?? 250;
+    this.retryMaxDelayMs = retry.maxDelayMs ?? 5_000;
     this.offset = -1;
     this.rows = new Map();
     this.subscribers = new Set();
+    this.statusSubscribers = new Set();
     this.stopped = false;
+    this.abortController = null;
   }
 
   subscribe(callback) {
@@ -24,8 +33,15 @@ export class ShapeClient {
     return () => this.subscribers.delete(callback);
   }
 
+  subscribeStatus(callback) {
+    this.statusSubscribers.add(callback);
+    callback({ type: "idle", offset: this.offset });
+    return () => this.statusSubscribers.delete(callback);
+  }
+
   stop() {
     this.stopped = true;
+    this.abortController?.abort();
   }
 
   currentRows() {
@@ -33,17 +49,54 @@ export class ShapeClient {
   }
 
   async start() {
-    await this.request({ offset: -1 });
+    this.stopped = false;
+    let delay = this.retryMinDelayMs;
 
-    while (this.live && !this.stopped) {
-      await this.request({ offset: this.offset, live: true });
+    while (!this.stopped) {
+      try {
+        if (this.offset < 0) {
+          await this.request({ offset: -1 });
+        } else if (!this.live) {
+          return;
+        } else {
+          await this.request({ offset: this.offset, live: true });
+        }
+        delay = this.retryMinDelayMs;
+      } catch (error) {
+        if (this.stopped || error?.name === "AbortError") {
+          return;
+        }
+        this.notifyStatus({ type: "error", error, offset: this.offset });
+        await this.sleep(delay);
+        delay = Math.min(delay * 2, this.retryMaxDelayMs);
+      }
     }
   }
 
   async request(params) {
-    const response = await this.fetch(this.requestUrl(params));
+    this.abortController = new AbortController();
+    this.notifyStatus({
+      type: params.live ? "live" : params.offset < 0 ? "snapshot" : "replay",
+      offset: params.offset,
+    });
+    let response;
+    try {
+      response = await this.fetch(this.requestUrl(params), {
+        signal: this.abortController.signal,
+      });
+    } finally {
+      this.abortController = null;
+    }
     if (response.status === 204) {
+      this.notifyStatus({ type: "timeout", offset: this.offset });
       return false;
+    }
+    if (response.status === 409) {
+      this.notifyStatus({ type: "resync_required", offset: this.offset });
+      this.offset = -1;
+      this.rows.clear();
+      this.notify();
+      return this.request({ offset: -1 });
     }
     if (!response.ok) {
       throw new Error(`Electrolite request failed: ${response.status}`);
@@ -70,6 +123,7 @@ export class ShapeClient {
       }
       this.offset = body.offset;
       this.notify();
+      this.notifyStatus({ type: "ready", offset: this.offset });
       return true;
     }
 
@@ -82,6 +136,7 @@ export class ShapeClient {
       if (changed) {
         this.notify();
       }
+      this.notifyStatus({ type: "ready", offset: this.offset });
       return changed;
     }
 
@@ -113,5 +168,15 @@ export class ShapeClient {
     for (const subscriber of this.subscribers) {
       subscriber(rows);
     }
+  }
+
+  notifyStatus(status) {
+    for (const subscriber of this.statusSubscribers) {
+      subscriber(status);
+    }
+  }
+
+  sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 }

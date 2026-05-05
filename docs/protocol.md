@@ -28,6 +28,11 @@ Example response:
 }
 ```
 
+There is an expected gap between the snapshot response and the next
+`live=true` request. The snapshot offset closes that gap: any commit that
+lands after the pinned snapshot has a higher log offset, so the first
+replay/live request with the snapshot offset returns it.
+
 ## Replay
 
 ```http
@@ -60,9 +65,10 @@ GET /electrolite/v1/shape/:name?offset=124&live=true
 The server:
 
 1. returns immediately if new messages exist
-2. otherwise waits up to a bounded timeout
-3. returns `204 No Content` if nothing changes
-4. lets the client reconnect at the latest offset
+2. coalesces identical `shape_handle + offset` waits in-process
+3. otherwise waits up to a bounded timeout
+4. returns `204 No Content` if nothing changes
+5. lets the client reconnect at the latest offset
 
 Long-polling keeps the endpoint HTTP/CDN friendly. WebSockets can come
 later as an adapter, not the core protocol.
@@ -76,10 +82,15 @@ The tiny browser client:
 3. reconnects with `live=true`
 4. applies insert, update, and delete messages
 5. notifies subscribers after materialized rows change
+6. reports connection/status changes
+7. retries transient failures with backoff
 
 The current snapshot response contains rows, while replay messages contain
 keys. The client is configured with the Shape key columns so it can derive
 snapshot keys without asking the browser to inspect SQLite schema.
+
+If replay returns `409 resync_required`, the client clears materialized
+rows and restarts from `offset=-1`.
 
 ## Membership Transitions
 
@@ -107,6 +118,32 @@ If a client asks for an offset older than retained history:
 ```
 
 The client restarts with `offset=-1`.
+
+## Runtime Notes
+
+The embedded server uses a bounded SQLite connection pool. The default
+pool size is 1, which is the conservative SQLite-friendly setting for
+small apps. Hosts can raise the pool size when read concurrency matters.
+
+```rust
+let state = ServerState::new(db_path, registry, AppAuthorizer)
+  .with_connection_pool_size(4);
+```
+
+The basic fanout benchmark can be run with:
+
+```sh
+cargo run -p electrolite-server --example fanout
+```
+
+Useful knobs:
+
+```sh
+ELECTROLITE_BENCH_ROWS=10000 \
+ELECTROLITE_BENCH_CLIENTS=1000 \
+ELECTROLITE_BENCH_POOL=8 \
+cargo run -p electrolite-server --example fanout
+```
 
 ## Public Errors
 

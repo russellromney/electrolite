@@ -23,6 +23,11 @@ pub enum Error {
         "shape {shape:?} references table {table:?}, but Electrolite triggers are not installed"
     )]
     UnwatchedTable { shape: String, table: String },
+    #[error("requested offset {requested_offset} is older than retained offset {retained_offset}")]
+    ResyncRequired {
+        requested_offset: i64,
+        retained_offset: i64,
+    },
     #[error("shape {shape:?} references missing column {column:?}")]
     MissingShapeColumn { shape: String, column: String },
     #[error("shape {shape:?} must include primary-key column {column:?}")]
@@ -213,17 +218,22 @@ fn record_watched_table(conn: &Connection, watched: &WatchedTable) -> Result<()>
     Ok(())
 }
 
-pub fn read_log_since(conn: &Connection, offset: i64, limit: i64) -> Result<Vec<LogRow>> {
+pub fn read_log_since(
+    conn: &Connection,
+    table_name: &str,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<LogRow>> {
     let mut stmt = conn.prepare(
         "
         SELECT seq, table_name, op, pk_json, old_pk_json, new_pk_json, old_json, new_json, created_at
         FROM _electrolite_log
-        WHERE seq > ?1
+        WHERE table_name = ?1 AND seq > ?2
         ORDER BY seq ASC
-        LIMIT ?2
+        LIMIT ?3
         ",
     )?;
-    let rows = stmt.query_map([offset, limit], |row| {
+    let rows = stmt.query_map(params![table_name, offset, limit], |row| {
         let pk_json: String = row.get(3)?;
         let old_pk_json: Option<String> = row.get(4)?;
         let new_pk_json: Option<String> = row.get(5)?;
@@ -356,8 +366,15 @@ pub fn replay(conn: &Connection, shape: &Shape, offset: i64, limit: i64) -> Resu
     let watched = inspect_table_primary_key(conn, &shape.table)?;
     validate_shape_columns(&watched, shape)?;
     require_watched_table(conn, shape, &watched)?;
+    let retained_offset = retained_lower_bound(conn)?;
+    if offset < retained_offset {
+        return Err(Error::ResyncRequired {
+            requested_offset: offset,
+            retained_offset,
+        });
+    }
 
-    let rows = read_log_since(conn, offset, limit)?;
+    let rows = read_log_since(conn, &shape.table, offset, limit)?;
     let mut messages = Vec::new();
     let mut latest = offset;
 
@@ -370,6 +387,14 @@ pub fn replay(conn: &Connection, shape: &Shape, offset: i64, limit: i64) -> Resu
         messages,
         offset: latest,
     })
+}
+
+pub fn retained_lower_bound(conn: &Connection) -> Result<i64> {
+    bootstrap(conn)?;
+    let min_seq = conn.query_row("SELECT MIN(seq) FROM _electrolite_log", [], |row| {
+        row.get::<_, Option<i64>>(0)
+    })?;
+    Ok(min_seq.map(|seq| seq - 1).unwrap_or(0))
 }
 
 fn require_watched_table(conn: &Connection, shape: &Shape, watched: &WatchedTable) -> Result<()> {
@@ -624,7 +649,7 @@ mod tests {
             .unwrap();
         conn.execute("DELETE FROM users WHERE id=1", []).unwrap();
 
-        let rows = read_log_since(&conn, 0, 10).unwrap();
+        let rows = read_log_since(&conn, "users", 0, 10).unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].op, LogOp::Insert);
         assert_eq!(rows[0].pk_json, json!({"id": 1}));
@@ -664,7 +689,7 @@ mod tests {
         .unwrap();
         tx.rollback().unwrap();
 
-        let rows = read_log_since(&conn, 0, 10).unwrap();
+        let rows = read_log_since(&conn, "users", 0, 10).unwrap();
         assert!(rows.is_empty());
     }
 
@@ -683,7 +708,7 @@ mod tests {
             )
             .unwrap();
 
-        let rows = read_log_since(&conn1, 0, 10).unwrap();
+        let rows = read_log_since(&conn1, "users", 0, 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].new_json,
@@ -795,6 +820,44 @@ mod tests {
             Error::UnwatchedTable { ref shape, ref table }
                 if shape == "activeUsers" && table == "users"
         ));
+    }
+
+    #[test]
+    fn replay_requires_resync_when_offset_is_older_than_retained_log() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let shape = active_users_shape();
+
+        conn.execute(
+            "INSERT INTO users (id, name, active) VALUES (1, 'Ada', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO users (id, name, active) VALUES (2, 'Grace', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO users (id, name, active) VALUES (3, 'Katherine', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM _electrolite_log WHERE seq <= 2", [])
+            .unwrap();
+
+        let err = replay(&conn, &shape, 0, 10).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::ResyncRequired {
+                requested_offset: 0,
+                retained_offset: 2,
+            }
+        ));
+
+        let replayed = replay(&conn, &shape, 2, 10).unwrap();
+        assert_eq!(replayed.offset, 3);
+        assert_eq!(replayed.messages.len(), 1);
     }
 
     #[test]

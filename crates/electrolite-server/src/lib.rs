@@ -8,20 +8,23 @@ use http::StatusCode;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore, watch};
 use tokio::time::{Instant, sleep_until};
 
 pub const DEFAULT_ROUTE_PREFIX: &str = "/electrolite/v1";
 
 #[derive(Clone)]
 pub struct ServerState {
-    db_path: Arc<PathBuf>,
+    pool: ConnectionPool,
     registry: Arc<ShapeRegistry>,
     authorizer: Arc<dyn Authorizer>,
     notify: Arc<Notify>,
+    waiters: LiveWaiters,
     replay_limit: i64,
     live_timeout: Duration,
     poll_interval: Duration,
@@ -33,11 +36,13 @@ impl ServerState {
         registry: ShapeRegistry,
         authorizer: impl Authorizer,
     ) -> Self {
+        let db_path = db_path.into();
         Self {
-            db_path: Arc::new(db_path.into()),
+            pool: ConnectionPool::new(db_path, 1),
             registry: Arc::new(registry),
             authorizer: Arc::new(authorizer),
             notify: Arc::new(Notify::new()),
+            waiters: LiveWaiters::default(),
             replay_limit: 1000,
             live_timeout: Duration::from_secs(20),
             poll_interval: Duration::from_millis(250),
@@ -46,6 +51,11 @@ impl ServerState {
 
     pub fn with_replay_limit(mut self, replay_limit: i64) -> Self {
         self.replay_limit = replay_limit.max(1);
+        self
+    }
+
+    pub fn with_connection_pool_size(mut self, pool_size: usize) -> Self {
+        self.pool = ConnectionPool::new(self.pool.db_path.as_ref().clone(), pool_size.max(1));
         self
     }
 
@@ -61,6 +71,70 @@ impl ServerState {
 
     pub fn notify_changed(&self) {
         self.notify.notify_waiters();
+    }
+}
+
+#[derive(Clone)]
+struct ConnectionPool {
+    db_path: Arc<PathBuf>,
+    idle: Arc<Mutex<Vec<Connection>>>,
+    permits: Arc<Semaphore>,
+}
+
+impl ConnectionPool {
+    fn new(db_path: impl Into<PathBuf>, size: usize) -> Self {
+        Self {
+            db_path: Arc::new(db_path.into()),
+            idle: Arc::new(Mutex::new(Vec::new())),
+            permits: Arc::new(Semaphore::new(size.max(1))),
+        }
+    }
+
+    async fn get(&self) -> Result<PooledConnection, rusqlite::Error> {
+        let permit = self
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("connection pool semaphore is never closed");
+        let conn = self
+            .idle
+            .lock()
+            .expect("connection pool mutex is not poisoned")
+            .pop()
+            .map(Ok)
+            .unwrap_or_else(|| Connection::open(self.db_path.as_ref()))?;
+
+        Ok(PooledConnection {
+            conn: Some(conn),
+            idle: self.idle.clone(),
+            _permit: permit,
+        })
+    }
+}
+
+struct PooledConnection {
+    conn: Option<Connection>,
+    idle: Arc<Mutex<Vec<Connection>>>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Deref for PooledConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.conn.as_ref().expect("pooled connection is present")
+    }
+}
+
+impl Drop for PooledConnection {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            self.idle
+                .lock()
+                .expect("connection pool mutex is not poisoned")
+                .push(conn);
+        }
     }
 }
 
@@ -145,6 +219,7 @@ pub struct ErrorBody {
 enum ServerError {
     ShapeNotFound,
     ShapeDenied,
+    ResyncRequired,
     Sqlite,
     Electrolite,
 }
@@ -155,6 +230,7 @@ impl IntoResponse for ServerError {
             Self::ShapeNotFound | Self::ShapeDenied => {
                 (StatusCode::NOT_FOUND, "shape_not_found".to_string())
             }
+            Self::ResyncRequired => (StatusCode::CONFLICT, "resync_required".to_string()),
             Self::Sqlite | Self::Electrolite => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_server_error".to_string(),
@@ -171,8 +247,11 @@ impl From<rusqlite::Error> for ServerError {
 }
 
 impl From<electrolite_sqlite::Error> for ServerError {
-    fn from(_e: electrolite_sqlite::Error) -> Self {
-        Self::Electrolite
+    fn from(e: electrolite_sqlite::Error) -> Self {
+        match e {
+            electrolite_sqlite::Error::ResyncRequired { .. } => Self::ResyncRequired,
+            _ => Self::Electrolite,
+        }
     }
 }
 
@@ -188,7 +267,7 @@ async fn get_shape(
         .cloned()
         .ok_or(ServerError::ShapeNotFound)?;
     authorize_shape(&state, &parts, &name, &shape, &query)?;
-    let conn = Connection::open(state.db_path.as_ref())?;
+    let conn = state.pool.get().await?;
 
     if query.offset < 0 {
         let snapshot = electrolite_sqlite::initial_snapshot(&conn, &shape)?;
@@ -228,17 +307,45 @@ async fn live_replay(
     shape: electrolite_core::Shape,
     offset: i64,
 ) -> Result<Response, ServerError> {
+    let key = LiveWaitKey {
+        shape_handle: shape.handle(),
+        offset,
+    };
+    match state.waiters.subscribe_or_create(key.clone()) {
+        WaitSubscription::Leader { sender } => {
+            let result = run_live_replay(state.clone(), shape, offset).await;
+            state.waiters.finish(&key, sender, result.clone());
+            live_result_response(result)
+        }
+        WaitSubscription::Follower { receiver } => await_live_result(receiver).await,
+    }
+}
+
+async fn run_live_replay(
+    state: ServerState,
+    shape: electrolite_core::Shape,
+    offset: i64,
+) -> LiveResult {
     let deadline = Instant::now() + state.live_timeout;
 
     loop {
-        let conn = Connection::open(state.db_path.as_ref())?;
-        let replay = electrolite_sqlite::replay(&conn, &shape, offset, state.replay_limit)?;
+        let conn = match state.pool.get().await {
+            Ok(conn) => conn,
+            Err(_) => return LiveResult::InternalError,
+        };
+        let replay = match electrolite_sqlite::replay(&conn, &shape, offset, state.replay_limit) {
+            Ok(replay) => replay,
+            Err(electrolite_sqlite::Error::ResyncRequired { .. }) => {
+                return LiveResult::ResyncRequired;
+            }
+            Err(_) => return LiveResult::InternalError,
+        };
         if replay.offset > offset || !replay.messages.is_empty() {
-            return Ok(Json(ShapeResponse::from(replay)).into_response());
+            return LiveResult::Replay(replay);
         }
 
         if Instant::now() >= deadline {
-            return Ok(StatusCode::NO_CONTENT.into_response());
+            return LiveResult::NoContent;
         }
 
         let next_poll = Instant::now() + state.poll_interval;
@@ -246,6 +353,87 @@ async fn live_replay(
             _ = state.notify.notified() => {}
             _ = sleep_until(next_poll.min(deadline)) => {}
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LiveWaitKey {
+    shape_handle: String,
+    offset: i64,
+}
+
+#[derive(Clone, Default)]
+struct LiveWaiters {
+    inner: Arc<Mutex<HashMap<LiveWaitKey, watch::Receiver<Option<LiveResult>>>>>,
+}
+
+enum WaitSubscription {
+    Leader {
+        sender: watch::Sender<Option<LiveResult>>,
+    },
+    Follower {
+        receiver: watch::Receiver<Option<LiveResult>>,
+    },
+}
+
+impl LiveWaiters {
+    fn subscribe_or_create(&self, key: LiveWaitKey) -> WaitSubscription {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("live waiter mutex is not poisoned");
+        if let Some(receiver) = inner.get(&key) {
+            return WaitSubscription::Follower {
+                receiver: receiver.clone(),
+            };
+        }
+
+        let (sender, receiver) = watch::channel(None);
+        inner.insert(key, receiver.clone());
+        WaitSubscription::Leader { sender }
+    }
+
+    fn finish(
+        &self,
+        key: &LiveWaitKey,
+        sender: watch::Sender<Option<LiveResult>>,
+        result: LiveResult,
+    ) {
+        let _ = sender.send(Some(result));
+        self.inner
+            .lock()
+            .expect("live waiter mutex is not poisoned")
+            .remove(key);
+    }
+}
+
+#[derive(Debug, Clone)]
+enum LiveResult {
+    Replay(Replay),
+    NoContent,
+    ResyncRequired,
+    InternalError,
+}
+
+async fn await_live_result(
+    mut receiver: watch::Receiver<Option<LiveResult>>,
+) -> Result<Response, ServerError> {
+    loop {
+        if let Some(result) = receiver.borrow().clone() {
+            return live_result_response(result);
+        }
+        if receiver.changed().await.is_err() {
+            return Err(ServerError::Electrolite);
+        }
+    }
+}
+
+fn live_result_response(result: LiveResult) -> Result<Response, ServerError> {
+    match result {
+        LiveResult::Replay(replay) => Ok(Json(ShapeResponse::from(replay)).into_response()),
+        LiveResult::NoContent => Ok(StatusCode::NO_CONTENT.into_response()),
+        LiveResult::ResyncRequired => Err(ServerError::ResyncRequired),
+        LiveResult::InternalError => Err(ServerError::Electrolite),
     }
 }
 
@@ -698,6 +886,52 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn replay_older_than_retention_returns_resync_required() {
+        let (_dir, path, _state, app) = setup();
+        let conn = Connection::open(path).unwrap();
+        conn.execute("UPDATE users SET active=1 WHERE id=2", [])
+            .unwrap();
+        conn.execute("DELETE FROM _electrolite_log WHERE seq <= 2", [])
+            .unwrap();
+
+        let (status, body) =
+            error_response(app, "/electrolite/v1/shape/activeUsers?offset=0").await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body,
+            ErrorBody {
+                error: "resync_required".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn coalesced_live_requests_share_result() {
+        let (_dir, path, state, app) = setup();
+        let live_a = {
+            let app = app.clone();
+            tokio::spawn(async move {
+                json_response(app, "/electrolite/v1/shape/activeUsers?offset=2&live=true").await
+            })
+        };
+        let live_b = tokio::spawn(async move {
+            json_response(app, "/electrolite/v1/shape/activeUsers?offset=2&live=true").await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let conn = Connection::open(path).unwrap();
+        conn.execute("UPDATE users SET active=1 WHERE id=2", [])
+            .unwrap();
+        state.notify_changed();
+
+        let result_a = live_a.await.unwrap();
+        let result_b = live_b.await.unwrap();
+        assert_eq!(result_a, result_b);
+        assert_eq!(result_a.0, StatusCode::OK);
     }
 
     #[tokio::test]
