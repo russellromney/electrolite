@@ -1,6 +1,6 @@
 # electrolite
 
-Electric-style sync for SQLite apps, written for TypeScript.
+Electric-style sync for SQLite apps, embeddable in your app.
 
 Electrolite lets your app say:
 
