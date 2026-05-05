@@ -6,9 +6,10 @@
     "demo:console": "node --no-warnings examples/basic-todos/demo.ts",
     "demo:fanout": "node --no-warnings examples/live-fanout/demo.ts",
     "demo:web": "node --no-warnings examples/basic-web-app/server.ts",
-    "test": "npm run test:browser && npm run test:node",
+    "test": "npm run test:browser && npm run test:node && npm run test:python",
     "test:all": "npm test",
     "test:browser": "npm test --prefix clients/browser",
-    "test:node": "npm test --prefix packages/electrolite-node"
+    "test:node": "npm test --prefix packages/electrolite-node",
+    "test:python": "python3 -m unittest discover -s engines/python"
   }
 }

@@ -20,6 +20,8 @@ Electrolite does the SQLite version inside your TypeScript app using
 SQLite triggers, a durable change log, and an ordinary HTTP endpoint. The
 backend runs in plain Node using Node's built-in SQLite API. There is no
 native build, sidecar, npm install step, or separate sync service.
+The same small protocol can also be implemented by other embedded
+engines, starting with a tiny Python engine for Flask-style apps.
 
 > **Experimental software.**
 
@@ -271,3 +273,4 @@ Completed work is tracked in [CHANGELOG.md](CHANGELOG.md).
 
 For the user-facing TypeScript API, start with
 [packages/electrolite-node/README.md](packages/electrolite-node/README.md).
+For other embedded engines, see [engines/](engines/).
