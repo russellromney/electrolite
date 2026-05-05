@@ -2,10 +2,7 @@
 
 Electric-style sync for SQLite apps, embeddable in your app.
 
-Electrolite lets your app say:
-
-> This browser is allowed to see this slice of SQLite rows. Send the rows
-> now, then keep them updated when SQLite changes.
+Electrolite lets your app say: this browser is allowed to see this slice of SQLite rows, so send the rows now and keep them updated when SQLite changes.
 
 Example: a user opens project `p1`. The browser should see todos where
 `project_id = "p1"`. If another request inserts, updates, moves, or
@@ -17,41 +14,17 @@ SQLite. Electric's [Electric Sync](https://electric.ax/docs/sync/) does
 this for Postgres. It exposes selected subsets of database rows called
 Shapes, sends an initial snapshot, then sends live logical changes.
 
-Electrolite keeps that lifecycle, but embedded in your app:
-
-```text
-your TypeScript app
-  -> SQLite
-  -> Electrolite generated triggers
-  -> durable change log
-  -> HTTP endpoint in your app
-  -> browser gets snapshot + live changes
-```
-
-The backend runs in plain Node using Node's built-in SQLite API. There is
-no native build, sidecar, npm install step, or separate sync service.
+Electrolite does the SQLite version inside your TypeScript app using
+SQLite triggers, a durable change log, and an ordinary HTTP endpoint. The
+backend runs in plain Node using Node's built-in SQLite API. There is no
+native build, sidecar, npm install step, or separate sync service.
 
 > **Experimental software.**
 
-## Why This Is Interesting
-
-- SQLite becomes a live backend for browser state.
-- The browser never sends SQL.
-- Auth stays in your app.
-- The sync endpoint is just a normal `Request -> Response` handler.
-- It is small enough to read.
-
-## What Works Now
-
-- The server defines what rows a browser may see.
-- The server checks auth before SQLite is touched.
-- The browser asks for a named row set, not arbitrary SQL.
-- The browser gets current rows first.
-- Then the browser long-polls for inserts, updates, and deletes.
-- Writes through the embedded TypeScript API wake only affected live
-  requests.
-- Browser rows can persist in IndexedDB and resume after reload.
-- Explicit write batches keep replay from publishing half a batch.
+SQLite becomes a live backend for browser state without letting the
+browser send SQL. Auth stays in your app, the sync endpoint is just a
+normal `Request -> Response` handler, and the code is small enough to
+read.
 
 ## Tiny Example
 
@@ -82,7 +55,7 @@ Give me todos for project p1, if this user is allowed to see p1.
 Then keep me updated.
 ```
 
-## Try It In 30 Seconds
+## Try It
 
 Electrolite is not published to npm yet. For now, the easiest path is to
 use this repository directly. You need Node 24 or newer.
@@ -93,75 +66,58 @@ cd electrolite
 npm run demo:web
 ```
 
-Then open:
-
-```text
-http://localhost:3000
-```
-
-That starts a tiny two-column web app: the left side writes todos to
-SQLite, and the right side subscribes to the live Shape. Add, rename,
-delete, and batch-write todos; the subscriber updates through
-Electrolite.
+Open `http://localhost:3000`. The left side writes todos to SQLite; the
+right side is a live Electrolite subscriber. Add, rename, delete, and
+batch-write todos to watch the Shape update.
 
 <img src="docs/assets/demo.png" alt="Electrolite demo showing SQLite writes on the left and a live browser subscriber on the right" width="520">
 
-Console demo:
+## What Works Now
 
-```sh
-npm run demo:console
+- Server-defined Shapes with app-owned authorization.
+- Initial snapshots plus `live=true` long-polling.
+- Inserts, updates, deletes, primary-key changes, and explicit batches.
+- Durable `log_id` and `shape_handle` validation for browser caches.
+- Browser IndexedDB persistence, replay draining, retry, and multi-tab
+  coordination.
+- Key-column metadata, composite primary keys, retained-log resync, and
+  schema-normalized predicates.
+
+## What Is A Shape?
+
+Electrolite exposes selected subsets of database rows called Shapes.
+
+A Shape is just:
+
+```text
+table + columns + filter + auth scope
 ```
 
-The demo creates a temporary SQLite database, defines `projectTodos`,
-loads it with the browser client, writes a new row through the
-TypeScript API, and shows the browser-side rows updating. It also shows
-that an unauthorized request returns `404`.
+Example Shapes:
 
-Tiny web app:
+- todos for one project
+- photos owned by one user
+- events for one account
+- likes on photos this user may see
 
-```sh
-npm run demo:web
-```
+In Electrolite today, a Shape is server-defined and contains:
 
-The page subscribes to `projectTodos/launch`. When you add a todo, the
-backend writes to SQLite and the browser updates from the live
-Electrolite Shape.
+- a source table
+- a column allowlist
+- a predicate, currently equality, `IN`, and conjunctions
+- an authorization scope
+- a schema version
 
-100 live subscribers demo:
+Browsers do not send arbitrary SQL. They request named Shapes that the
+host application has already defined and authorized.
 
-```sh
-npm run demo:fanout
-```
+That is the point. The browser can say "I want `projectTodos/p1`." It
+cannot say "run this SQL I made up."
 
-On one local run, a single SQLite write woke `100/100` live Shape clients
-and all 100 materialized the new row in about `13ms`. This is a demo, not
-a benchmark suite, but it is a useful smoke test for shared-Shape fanout.
-
-To try a bigger local smoke test:
-
-```sh
-ELECTROLITE_FANOUT_CLIENTS=1000 npm run demo:fanout
-```
-
-On one local run, that woke `1000/1000` clients and all 1000 materialized
-the new row in about `100ms`.
-
-## Semantic Coverage
-
-The Node implementation was checked against the previous reference
-implementation before the project went Node-only. The current test suite
-keeps those guarantees at the TypeScript API level:
-
-| Area | Covered behavior |
-|---|---|
-| Snapshot | rows, `log_id`, `shape_handle`, key metadata, and offset |
-| Replay | inserts, updates, deletes, bounded pages, and resync |
-| Live | long-poll waits wake only for Shapes affected by a write |
-| Predicates | `all`, `eq`, `in`, `and`, `null`, booleans, and type checks |
-| Keys | non-`id` keys, composite keys, and primary-key updates |
-| Retention | per-table lower bounds and `409 resync_required` |
-| Batches | explicit Electrolite batches keep a shared `batch_id` |
-| Browser | IndexedDB cache validation, retry, catch-up, and multi-tab state |
+Applications can also register dynamic, server-owned Shape routes such
+as `/projects/:project_id/todos`. The route turns request path/auth
+context into a concrete Shape, and the normal authorizer checks the
+generated authorization scope before SQLite is touched.
 
 ## Use It Before npm
 
@@ -202,42 +158,6 @@ Run every package test:
 ```sh
 npm run test:all
 ```
-
-## What Is A Shape?
-
-Electrolite exposes selected subsets of database rows called Shapes.
-
-A Shape is just:
-
-```text
-table + columns + filter + auth scope
-```
-
-Example Shapes:
-
-- todos for one project
-- photos owned by one user
-- events for one account
-- likes on photos this user may see
-
-In Electrolite today, a Shape is server-defined and contains:
-
-- a source table
-- a column allowlist
-- a predicate, currently equality, `IN`, and conjunctions
-- an authorization scope
-- a schema version
-
-Browsers do not send arbitrary SQL. They request named Shapes that the
-host application has already defined and authorized.
-
-That is the point. The browser can say "I want `projectTodos/p1`." It
-cannot say "run this SQL I made up."
-
-Applications can also register dynamic, server-owned Shape routes such
-as `/projects/:project_id/todos`. The route turns request path/auth
-context into a concrete Shape, and the normal authorizer checks the
-generated authorization scope before SQLite is touched.
 
 ## TypeScript Quick Start
 
@@ -330,6 +250,21 @@ You do not need to run a separate sync service for this path.
 - Good enough fanout for small and medium apps first. Shared team,
   workspace, and document Shapes should be cheap. Huge per-user-private
   fanout can come later.
+
+## Fanout Smoke Test
+
+The fanout demo starts many in-process browser clients against the
+embedded handler, puts them all into a live wait, performs one SQLite
+write, and checks that every client materializes the new row.
+
+```sh
+npm run demo:fanout
+ELECTROLITE_FANOUT_CLIENTS=1000 npm run demo:fanout
+```
+
+On one local run, a single SQLite write woke `1000/1000` live Shape
+clients and all 1000 materialized the new row in about `100ms`. This is a
+smoke test, not a network benchmark.
 
 ## Future Direction
 
