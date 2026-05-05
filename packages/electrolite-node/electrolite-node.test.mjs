@@ -74,6 +74,53 @@ test("browser client uses the Node handler without keyColumns", async () => {
   }
 });
 
+test("browser client stages bounded replay pages from the pooled Node backend", async () => {
+  const { dir, electrolite } = setup({ replayLimit: 1, connectionPoolSize: 1 });
+  try {
+    const fetch = (url, init) => {
+      return electrolite.handle(new Request(url, init), {
+        user: { projects: new Set(["p1"]) },
+      });
+    };
+    const client = new ShapeClient(
+      "https://app.test/electrolite/v1/projectTodos/p1",
+      {
+        fetch,
+        retry: { minDelayMs: 5, maxDelayMs: 20 },
+      },
+    );
+    const seen = [];
+    client.subscribe((rows) => seen.push(rows));
+
+    assert.equal(await client.request({ offset: -1 }), true);
+    const snapshotOffset = client.offset;
+    electrolite.execute(
+      "INSERT INTO todos (id, project_id, title, done) VALUES (?1, ?2, ?3, 0)",
+      [3, "p1", "bounded one"],
+    );
+    electrolite.execute(
+      "INSERT INTO todos (id, project_id, title, done) VALUES (?1, ?2, ?3, 0)",
+      [4, "p1", "bounded two"],
+    );
+
+    assert.equal(await client.request({ offset: snapshotOffset }), false);
+    assert.equal(client.offset, snapshotOffset + 1);
+    assert.deepEqual(client.currentRows(), [
+      { id: 1, project_id: "p1", title: "ship electrolite", done: 0 },
+    ]);
+
+    assert.equal(await client.request({ offset: client.offset }), true);
+    assert.deepEqual(client.currentRows(), [
+      { id: 1, project_id: "p1", title: "ship electrolite", done: 0 },
+      { id: 3, project_id: "p1", title: "bounded one", done: 0 },
+      { id: 4, project_id: "p1", title: "bounded two", done: 0 },
+    ]);
+    assert.equal(seen.length, 3);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("supports IN predicates and native write batches", async () => {
   const { dir, electrolite } = setup();
   try {
@@ -118,14 +165,15 @@ test("returns resync_required after retained history is compacted", async () => 
   }
 });
 
-function setup() {
+function setup(options = {}) {
   const dir = mkdtempSync(join(tmpdir(), "electrolite-node-"));
   const dbPath = join(dir, "app.db");
   const electrolite = createElectrolite({
     dbPath,
     liveTimeoutMs: 500,
     pollIntervalMs: 10,
-    connectionPoolSize: 2,
+    replayLimit: options.replayLimit,
+    connectionPoolSize: options.connectionPoolSize ?? 1,
     shapes: {
       projectTodos: shape({
         table: "todos",
