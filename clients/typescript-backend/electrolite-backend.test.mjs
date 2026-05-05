@@ -113,6 +113,20 @@ test("builds trusted shape headers for a TypeScript-defined Shape", () => {
   );
 });
 
+test("builds trusted shape headers for IN predicates", () => {
+  assert.equal(
+    trustedShapeHeaders({
+      name: "projectTodos/p1-p2",
+      table: "todos",
+      columns: ["id", "project_id", "title", "done"],
+      predicate: { type: "in", column: "project_id", values: ["p1", "p2"] },
+      auth_scope: "projects:p1,p2",
+      schema_version: 1,
+    })["x-electrolite-predicate"],
+    '{"type":"in","column":"project_id","values":["p1","p2"]}',
+  );
+});
+
 test("supports the trusted factory route used by TypeScript backends", async () => {
   const forwarded = [];
   const proxy = createElectroliteProxy({
@@ -232,9 +246,22 @@ test("e2e TypeScript backend proxy materializes a trusted Shape", async (t) => {
         return false;
       }
       const [shapeName, projectId] = path.split("/");
-      if (shapeName !== "projectTodos" || !session.projects.has(projectId)) {
+      const projectIds = projectId.split("-").filter(Boolean);
+      if (
+        shapeName !== "projectTodos" ||
+        projectIds.length === 0 ||
+        !projectIds.every((id) => session.projects.has(id))
+      ) {
         return false;
       }
+      const predicate =
+        projectIds.length === 1
+          ? { type: "eq", column: "project_id", value: projectIds[0] }
+          : { type: "in", column: "project_id", values: projectIds };
+      const authScope =
+        projectIds.length === 1
+          ? `project:${projectIds[0]}`
+          : `projects:${projectIds.join(",")}`;
       return {
         allow: true,
         headers: {
@@ -242,11 +269,11 @@ test("e2e TypeScript backend proxy materializes a trusted Shape", async (t) => {
             name: `${shapeName}/${projectId}`,
             table: "todos",
             columns: ["id", "project_id", "title", "done"],
-            predicate: { type: "eq", column: "project_id", value: projectId },
-            auth_scope: `project:${projectId}`,
+            predicate,
+            auth_scope: authScope,
             schema_version: 1,
           }),
-          "x-electrolite-scope": `project:${projectId}`,
+          "x-electrolite-scope": authScope,
         },
       };
     },
@@ -288,6 +315,25 @@ test("e2e TypeScript backend proxy materializes a trusted Shape", async (t) => {
     { id: 1, project_id: "p1", title: "ship electrolite", done: 0 },
     { id: 3, project_id: "p1", title: "from ts backend", done: 0 },
   ]);
+
+  session.projects.add("p2");
+  const multiProjectClient = new ShapeClient(
+    "https://app.test/electrolite/v1/factory/trusted/projectTodos/p1-p2",
+    {
+      keyColumns: ["id"],
+      fetch: fetchThroughTypeScriptBackend,
+      retry: { minDelayMs: 5, maxDelayMs: 20 },
+    },
+  );
+  assert.equal(await multiProjectClient.request({ offset: -1 }), true);
+  assert.deepEqual(
+    multiProjectClient.currentRows().sort((a, b) => a.id - b.id),
+    [
+      { id: 1, project_id: "p1", title: "ship electrolite", done: 0 },
+      { id: 2, project_id: "p2", title: "not visible", done: 0 },
+      { id: 3, project_id: "p1", title: "from ts backend", done: 0 },
+    ],
+  );
 });
 
 function routeSummary(route) {

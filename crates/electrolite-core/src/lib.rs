@@ -49,6 +49,7 @@ impl ShapeRegistry {
 pub enum Predicate {
     All,
     Eq { column: String, value: Value },
+    In { column: String, values: Vec<Value> },
     And { predicates: Vec<Predicate> },
 }
 
@@ -70,6 +71,10 @@ impl Predicate {
         match self {
             Predicate::All => true,
             Predicate::Eq { column, value } => row.get(column) == Some(value),
+            Predicate::In { column, values } => row
+                .get(column)
+                .map(|value| values.iter().any(|candidate| candidate == value))
+                .unwrap_or(false),
             Predicate::And { predicates } => predicates.iter().all(|p| p.matches_object(row)),
         }
     }
@@ -81,6 +86,14 @@ impl Predicate {
                 column: column.clone(),
                 value: value.clone(),
             }),
+            Predicate::In { column, values } => {
+                for value in values {
+                    terms.push(PredicateEqTerm {
+                        column: column.clone(),
+                        value: value.clone(),
+                    });
+                }
+            }
             Predicate::And { predicates } => {
                 for predicate in predicates {
                     predicate.collect_eq_terms(terms);
@@ -221,6 +234,7 @@ pub enum LogOp {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogRow {
     pub seq: i64,
+    pub batch_id: String,
     pub table_name: String,
     pub op: LogOp,
     pub pk_json: Value,
@@ -369,6 +383,7 @@ mod tests {
 
         let inserted = LogRow {
             seq: 1,
+            batch_id: "batch".to_string(),
             table_name: "users".to_string(),
             op: LogOp::Insert,
             pk_json: json!({"id": 7}),
@@ -385,6 +400,7 @@ mod tests {
 
         let updated = LogRow {
             seq: 2,
+            batch_id: "batch".to_string(),
             table_name: "users".to_string(),
             op: LogOp::Update,
             pk_json: json!({"id": 7}),
@@ -401,6 +417,7 @@ mod tests {
 
         let removed = LogRow {
             seq: 3,
+            batch_id: "batch".to_string(),
             table_name: "users".to_string(),
             op: LogOp::Update,
             pk_json: json!({"id": 7}),
@@ -421,6 +438,7 @@ mod tests {
         let shape = shape();
         let row = LogRow {
             seq: 4,
+            batch_id: "batch".to_string(),
             table_name: "users".to_string(),
             op: LogOp::Update,
             pk_json: json!({"id": 8}),
@@ -478,12 +496,37 @@ mod tests {
     }
 
     #[test]
+    fn in_predicate_matches_any_value_and_indexes_each_term() {
+        let predicate = Predicate::In {
+            column: "project_id".to_string(),
+            values: vec![json!("p1"), json!("p2")],
+        };
+        assert!(predicate.matches(Some(&json!({"project_id": "p1"}))));
+        assert!(predicate.matches(Some(&json!({"project_id": "p2"}))));
+        assert!(!predicate.matches(Some(&json!({"project_id": "p3"}))));
+        assert_eq!(
+            predicate.eq_terms(),
+            vec![
+                PredicateEqTerm {
+                    column: "project_id".to_string(),
+                    value: json!("p1"),
+                },
+                PredicateEqTerm {
+                    column: "project_id".to_string(),
+                    value: json!("p2"),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn shape_index_finds_equality_candidates_from_old_and_new_rows() {
         let mut index = ShapeIndex::new();
         index.add(shape());
 
         let inactive_insert = LogRow {
             seq: 1,
+            batch_id: "batch".to_string(),
             table_name: "users".to_string(),
             op: LogOp::Insert,
             pk_json: json!({"id": 1}),
@@ -510,6 +553,7 @@ mod tests {
 
         let leaving_shape = LogRow {
             seq: 2,
+            batch_id: "batch".to_string(),
             table_name: "users".to_string(),
             op: LogOp::Update,
             pk_json: json!({"id": 1}),
@@ -540,6 +584,7 @@ mod tests {
 
         let users_row = LogRow {
             seq: 1,
+            batch_id: "batch".to_string(),
             table_name: "users".to_string(),
             op: LogOp::Insert,
             pk_json: json!({"id": 1}),
@@ -588,6 +633,7 @@ mod tests {
 
         let row = LogRow {
             seq: 1,
+            batch_id: "batch".to_string(),
             table_name: "todos".to_string(),
             op: LogOp::Update,
             pk_json: json!({"id": 1}),
@@ -627,6 +673,7 @@ mod tests {
 
         let active_row = LogRow {
             seq: 1,
+            batch_id: "batch".to_string(),
             table_name: "users".to_string(),
             op: LogOp::Insert,
             pk_json: json!({"id": 1}),

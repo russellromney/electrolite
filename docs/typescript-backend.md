@@ -3,11 +3,17 @@
 Electrolite is Rust-first, but a TypeScript backend can still be the
 application security boundary.
 
-Run the Electrolite HTTP server as an internal service or sidecar with
-the trusted Shape factory enabled, then mount a TypeScript proxy in your
-app. The browser talks to the TypeScript app. The TypeScript app checks
-the user's session/RBAC and forwards only authorized Shape requests to
-the Electrolite origin.
+The core target is embedded: the host application owns SQLite, writes,
+authorization, and the Electrolite endpoint. For TypeScript app servers,
+the current bridge is an internal Electrolite HTTP origin with the
+trusted Shape factory enabled, plus a TypeScript proxy mounted in your
+app. That origin can be a loopback Rust process today; a native
+TypeScript embedding is future ergonomics, not a change to the security
+model. A separate sidecar is optional, not required by the protocol.
+
+The browser talks to the TypeScript app. The TypeScript app checks the
+user's session/RBAC and forwards only authorized Shape requests to the
+Electrolite origin.
 
 ```text
 browser
@@ -92,11 +98,11 @@ export async function GET(request: Request) {
 }
 ```
 
-The Electrolite sidecar still owns SQLite reads. The TypeScript app owns
-who may ask for which Shape and can construct the concrete Shape spec
-from app route params. By default, the proxy forwards only safe
-cache/request headers plus the headers returned by `authorize`; browser
-cookies and bearer tokens are not forwarded to the Electrolite origin.
+The Electrolite origin owns SQLite reads. The TypeScript app owns who may
+ask for which Shape and can construct the concrete Shape spec from app
+route params. By default, the proxy forwards only safe cache/request
+headers plus the headers returned by `authorize`; browser cookies and
+bearer tokens are not forwarded to the Electrolite origin.
 
 ## Routes
 

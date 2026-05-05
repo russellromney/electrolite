@@ -126,12 +126,31 @@ true  -> false  delete
 false -> false  ignore
 ```
 
+## Change Batches
+
+SQLite triggers only expose committed rows: rollback removes both the app
+write and the Electrolite log rows. Raw writes are therefore safe, but
+they are row-level for replay purposes.
+
+For app-controlled multi-row writes that should not be split by bounded
+replay, hosts can use Electrolite change batches. Rows written inside a
+batch share a logical batch ID; replay may exceed the configured row
+limit to include the rest of the final batch.
+
+```rust
+state.write_batch(|tx| {
+  tx.execute("UPDATE todos SET done = 1 WHERE project_id = 'p1'", [])?;
+  Ok(())
+}).await?;
+```
+
 ## Predicate Index
 
 The core crate has a `ShapeIndex` that narrows fanout work before exact
 membership evaluation. It indexes by table and equality predicate terms,
-then checks both old and new row images for candidate matches. That keeps
-rows entering and leaving a Shape visible to the exact transition logic.
+including each value in an `IN` predicate, then checks both old and new
+row images for candidate matches. That keeps rows entering and leaving a
+Shape visible to the exact transition logic.
 
 ## Resync
 
@@ -146,6 +165,15 @@ If a client asks for an offset older than retained history:
 ```
 
 The client restarts with `offset=-1`.
+
+Hosts can compact the log while preserving that lower bound:
+
+```rust
+state.compact_log_to_last(10_000).await?;
+```
+
+After compaction, offsets older than the durable retained offset return
+`409 resync_required` even if the compacted log table is empty.
 
 ## Runtime Notes
 

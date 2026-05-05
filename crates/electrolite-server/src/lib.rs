@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -87,6 +87,47 @@ impl ServerState {
     pub fn notify_changed(&self) {
         self.notify.notify_waiters();
     }
+
+    pub async fn write<T>(
+        &self,
+        write: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        let conn = self.pool.get().await?;
+        let out = write(&conn)?;
+        drop(conn);
+        self.notify_changed();
+        Ok(out)
+    }
+
+    pub async fn write_batch<T>(
+        &self,
+        write: impl FnOnce(&rusqlite::Transaction<'_>) -> electrolite_sqlite::Result<T>,
+    ) -> electrolite_sqlite::Result<T> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(electrolite_sqlite::Error::from)?;
+        let out = electrolite_sqlite::change_batch(&mut conn, write)?;
+        drop(conn);
+        self.notify_changed();
+        Ok(out)
+    }
+
+    pub async fn compact_log_to_last(
+        &self,
+        keep_last: i64,
+    ) -> electrolite_sqlite::Result<electrolite_sqlite::RetentionStats> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(electrolite_sqlite::Error::from)?;
+        let stats = electrolite_sqlite::compact_log_to_last(&conn, keep_last)?;
+        drop(conn);
+        self.notify_changed();
+        Ok(stats)
+    }
 }
 
 #[derive(Clone)]
@@ -139,6 +180,12 @@ impl Deref for PooledConnection {
 
     fn deref(&self) -> &Self::Target {
         self.conn.as_ref().expect("pooled connection is present")
+    }
+}
+
+impl DerefMut for PooledConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.conn.as_mut().expect("pooled connection is present")
     }
 }
 
@@ -1082,6 +1129,63 @@ mod tests {
                     offset: 3,
                 }],
                 offset: 3,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_write_helper_wakes_live_request() {
+        let (_dir, _path, state, app) = setup();
+        let live = tokio::spawn(async move {
+            json_response(app, "/electrolite/v1/shape/activeUsers?offset=2&live=true").await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        state
+            .write(|conn| {
+                conn.execute("UPDATE users SET active=1 WHERE id=2", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let (status, response) = live.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response,
+            ShapeResponse::Replay {
+                messages: vec![ShapeMessage::Insert {
+                    key: json!({"id": 2}),
+                    value: json!({"id": 2, "name": "Grace", "active": 1}),
+                    offset: 3,
+                }],
+                offset: 3,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_retention_compaction_returns_resync_required() {
+        let (_dir, _path, state, app) = setup();
+        state
+            .write(|conn| {
+                conn.execute("UPDATE users SET active=1 WHERE id=2", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let stats = state.compact_log_to_last(1).await.unwrap();
+        assert_eq!(stats.retained_offset, 2);
+        assert_eq!(stats.deleted_rows, 2);
+
+        let (status, body) =
+            error_response(app, "/electrolite/v1/shape/activeUsers?offset=1").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body,
+            ErrorBody {
+                error: "resync_required".to_string(),
             }
         );
     }

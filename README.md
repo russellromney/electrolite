@@ -34,7 +34,7 @@ In Electrolite today, a Shape is server-defined and contains:
 
 - a source table
 - a column allowlist
-- a predicate, currently simple equality and conjunctions
+- a predicate, currently equality, `IN`, and conjunctions
 - an authorization scope
 - a schema version
 
@@ -95,4 +95,7 @@ authorized initial snapshots, bounded replay, and `live=true`
 long-polling. The server now has a SQLite connection pool, in-process
 live wait coalescing, retained-offset resync errors, and a basic fanout
 benchmark harness. Dynamic Shape factories and a table/equality predicate
-index are in place for the next fanout broker layer.
+index are in place for the next fanout broker layer. Embedded write
+helpers can wake live requests automatically, retention compaction records
+a durable retained offset, and optional Electrolite change batches avoid
+splitting app-controlled transactions across bounded replay responses.

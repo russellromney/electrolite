@@ -71,6 +71,8 @@ Make snapshot and replay behavior precise.
   membership.
 - Keep a retained-log lower bound and return `409 resync_required` when
   the requested offset is older than retained history.
+- Compact `_electrolite_log` with a durable retained-offset marker so
+  resync still works even after all older rows are deleted.
 - Evaluate membership transitions:
 
 ```text
@@ -88,6 +90,9 @@ hash(table + columns + where + params + auth_scope + schema_version)
 
 - Return `409 resync_required` when the requested offset is older than
   retained history.
+- Treat ordinary trigger rows as committed row-level changes. For
+  app-controlled multi-row writes, support explicit Electrolite change
+  batches so bounded replay does not split the batch.
 
 ## Phase Guard - Security Model
 
@@ -101,6 +106,9 @@ Make the default safe for real applications.
 - Support TypeScript app servers as the authorization boundary by
   proxying browser Shape requests to an internal Electrolite origin with
   scoped headers.
+- Keep sidecar deployment optional. The protocol is embedded-first; the
+  TypeScript bridge exists so TypeScript apps can own authorization until
+  native Node/Bun bindings exist.
 - Include auth scope in shape handles.
 - Keep raw `_electrolite_log` private.
 - Add optional signed shape URLs for proxy/CDN/object-store delivery.
@@ -193,6 +201,7 @@ table=todos, done=false    -> [shapeA, shapeC]
 ### Implemented Slice
 
 - `ShapeIndex` indexes Shapes by table and equality predicate terms.
+- `IN` predicates expand into equality terms for index candidate lookup.
 - Candidate lookup considers both old and new row images so inserts,
   updates, deletes, and membership transitions are all eligible for exact
   evaluation.
@@ -225,11 +234,26 @@ primary SQLite
 Walrust provides physical replication, PITR, and remote read replicas.
 Electrolite semantics still come from trigger logs.
 
+## hadb Format Notes
+
+hadb's `.hadbp` physical changesets are useful for moving SQLite pages to
+replicas or object storage. They can help decide where an Electrolite
+Shape endpoint runs, but they do not define Shape semantics.
+
+hadb's planned `.hadbj` journal changesets are closer in spirit: a
+logical journal with sequence, checksum chain, and deterministic replay.
+Electrolite's trigger log is the local SQLite version of that semantic
+journal. If Electrolite later exports chunks to S3/Cinch, borrowing the
+hadb generation/key/checksum discipline would be more useful than trying
+to infer Shapes from physical pages.
+
 ## Phase Later - Fancy Things
 
 - WAL page invalidation to reduce shape evaluation work.
 - Precomputed per-shape logs.
 - Browser client adapters for React, Solid, Svelte, and vanilla stores.
+- Native TypeScript backend ergonomics through Node/Bun bindings, so a
+  TypeScript server can embed Electrolite without a separate process.
 - IndexedDB persistence.
 - Multi-tab coordination.
 - Browser client retry/backoff/status reporting.

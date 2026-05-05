@@ -3,6 +3,7 @@ export type ElectroliteRouteKind = "shape" | "factory";
 export type ElectrolitePredicate =
   | { type: "all" }
   | { type: "eq"; column: string; value: unknown }
+  | { type: "in"; column: string; values: unknown[] }
   | { type: "and"; predicates: ElectrolitePredicate[] };
 
 export interface ElectroliteShapeSpec {

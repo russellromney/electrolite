@@ -52,6 +52,7 @@ pub fn bootstrap(conn: &Connection) -> Result<()> {
         "
         CREATE TABLE IF NOT EXISTS _electrolite_log (
           seq INTEGER PRIMARY KEY AUTOINCREMENT,
+          batch_id TEXT NOT NULL DEFAULT '',
           table_name TEXT NOT NULL,
           op TEXT NOT NULL,
           pk_json TEXT NOT NULL,
@@ -69,6 +70,16 @@ pub fn bootstrap(conn: &Connection) -> Result<()> {
           value TEXT NOT NULL
         );
         ",
+    )?;
+    add_column_if_missing(
+        conn,
+        "_electrolite_log",
+        "batch_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    conn.execute(
+        "UPDATE _electrolite_log SET batch_id = 'legacy-' || seq WHERE batch_id = ''",
+        [],
     )?;
     add_column_if_missing(conn, "_electrolite_log", "old_pk_json", "TEXT")?;
     add_column_if_missing(conn, "_electrolite_log", "new_pk_json", "TEXT")?;
@@ -150,6 +161,35 @@ pub fn install_triggers_auto(conn: &Connection, table: &str) -> Result<WatchedTa
     install_triggers_for_watched(conn, watched)
 }
 
+pub fn change_batch<T>(
+    conn: &mut Connection,
+    write: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+) -> Result<T> {
+    bootstrap(conn)?;
+    let batch_id = format!(
+        "{}-{}",
+        unix_millis(),
+        conn.query_row("SELECT lower(hex(randomblob(16)))", [], |row| {
+            row.get::<_, String>(0)
+        })?
+    );
+    let tx = conn.transaction()?;
+    tx.execute(
+        "
+        INSERT OR REPLACE INTO _electrolite_meta (key, value)
+        VALUES (?1, ?2)
+        ",
+        params![current_batch_id_key(), batch_id],
+    )?;
+    let out = write(&tx)?;
+    tx.execute(
+        "DELETE FROM _electrolite_meta WHERE key = ?1",
+        params![current_batch_id_key()],
+    )?;
+    tx.commit()?;
+    Ok(out)
+}
+
 fn install_triggers_for_watched(conn: &Connection, watched: WatchedTable) -> Result<WatchedTable> {
     let table_ident = quote_ident(&watched.table);
     let trigger_prefix = trigger_prefix(&watched.table);
@@ -158,6 +198,7 @@ fn install_triggers_for_watched(conn: &Connection, watched: WatchedTable) -> Res
     let new_row = row_json_expr("NEW", &watched.columns);
     let old_row = row_json_expr("OLD", &watched.columns);
     let table_lit = quote_string(&watched.table);
+    let batch_id = batch_id_expr();
 
     conn.execute_batch(&format!(
         "
@@ -169,27 +210,27 @@ fn install_triggers_for_watched(conn: &Connection, watched: WatchedTable) -> Res
         AFTER INSERT ON {table_ident}
         BEGIN
           INSERT INTO _electrolite_log (
-            table_name, op, pk_json, old_pk_json, new_pk_json, old_json, new_json
+            batch_id, table_name, op, pk_json, old_pk_json, new_pk_json, old_json, new_json
           )
-          VALUES ({table_lit}, 'insert', {pk_new}, NULL, {pk_new}, NULL, {new_row});
+          VALUES ({batch_id}, {table_lit}, 'insert', {pk_new}, NULL, {pk_new}, NULL, {new_row});
         END;
 
         CREATE TRIGGER IF NOT EXISTS {update_trigger}
         AFTER UPDATE ON {table_ident}
         BEGIN
           INSERT INTO _electrolite_log (
-            table_name, op, pk_json, old_pk_json, new_pk_json, old_json, new_json
+            batch_id, table_name, op, pk_json, old_pk_json, new_pk_json, old_json, new_json
           )
-          VALUES ({table_lit}, 'update', {pk_new}, {pk_old}, {pk_new}, {old_row}, {new_row});
+          VALUES ({batch_id}, {table_lit}, 'update', {pk_new}, {pk_old}, {pk_new}, {old_row}, {new_row});
         END;
 
         CREATE TRIGGER IF NOT EXISTS {delete_trigger}
         AFTER DELETE ON {table_ident}
         BEGIN
           INSERT INTO _electrolite_log (
-            table_name, op, pk_json, old_pk_json, new_pk_json, old_json, new_json
+            batch_id, table_name, op, pk_json, old_pk_json, new_pk_json, old_json, new_json
           )
-          VALUES ({table_lit}, 'delete', {pk_old}, {pk_old}, NULL, {old_row}, NULL);
+          VALUES ({batch_id}, {table_lit}, 'delete', {pk_old}, {pk_old}, NULL, {old_row}, NULL);
         END;
         ",
         insert_trigger = quote_ident(&format!("{trigger_prefix}_ai")),
@@ -224,78 +265,135 @@ pub fn read_log_since(
     offset: i64,
     limit: i64,
 ) -> Result<Vec<LogRow>> {
+    let mut out = read_log_since_limited(conn, table_name, offset, limit)?;
+    if out.len() == limit.max(0) as usize {
+        if let Some(last) = out.last() {
+            let mut rest = read_log_batch_after(conn, table_name, last.seq, &last.batch_id)?;
+            out.append(&mut rest);
+        }
+    }
+    Ok(out)
+}
+
+fn read_log_since_limited(
+    conn: &Connection,
+    table_name: &str,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<LogRow>> {
     let mut stmt = conn.prepare(
         "
-        SELECT seq, table_name, op, pk_json, old_pk_json, new_pk_json, old_json, new_json, created_at
+        SELECT seq, batch_id, table_name, op, pk_json, old_pk_json, new_pk_json, old_json, new_json, created_at
         FROM _electrolite_log
         WHERE table_name = ?1 AND seq > ?2
         ORDER BY seq ASC
         LIMIT ?3
         ",
     )?;
-    let rows = stmt.query_map(params![table_name, offset, limit], |row| {
-        let pk_json: String = row.get(3)?;
-        let old_pk_json: Option<String> = row.get(4)?;
-        let new_pk_json: Option<String> = row.get(5)?;
-        let old_json: Option<String> = row.get(6)?;
-        let new_json: Option<String> = row.get(7)?;
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            pk_json,
-            old_pk_json,
-            new_pk_json,
-            old_json,
-            new_json,
-            row.get::<_, i64>(8)?,
-        ))
-    })?;
+    log_rows_from_query(stmt.query_map(params![table_name, offset, limit], log_row_from_sql)?)
+}
 
+fn read_log_batch_after(
+    conn: &Connection,
+    table_name: &str,
+    seq: i64,
+    batch_id: &str,
+) -> Result<Vec<LogRow>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT seq, batch_id, table_name, op, pk_json, old_pk_json, new_pk_json, old_json, new_json, created_at
+        FROM _electrolite_log
+        WHERE table_name = ?1 AND seq > ?2 AND batch_id = ?3
+        ORDER BY seq ASC
+        ",
+    )?;
+    log_rows_from_query(stmt.query_map(params![table_name, seq, batch_id], log_row_from_sql)?)
+}
+
+fn log_rows_from_query(
+    rows: impl Iterator<Item = rusqlite::Result<RawLogRow>>,
+) -> Result<Vec<LogRow>> {
     let mut out = Vec::new();
     for row in rows {
-        let (
-            seq,
-            table_name,
-            op_text,
-            pk_json,
-            old_pk_json,
-            new_pk_json,
-            old_json,
-            new_json,
-            created_at,
-        ) = row?;
-        let op = match op_text.as_str() {
+        out.push(row?.try_into()?);
+    }
+    Ok(out)
+}
+
+#[derive(Debug)]
+struct RawLogRow {
+    seq: i64,
+    batch_id: String,
+    table_name: String,
+    op_text: String,
+    pk_json: String,
+    old_pk_json: Option<String>,
+    new_pk_json: Option<String>,
+    old_json: Option<String>,
+    new_json: Option<String>,
+    created_at: i64,
+}
+
+fn log_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawLogRow> {
+    Ok(RawLogRow {
+        seq: row.get(0)?,
+        batch_id: row.get(1)?,
+        table_name: row.get(2)?,
+        op_text: row.get(3)?,
+        pk_json: row.get(4)?,
+        old_pk_json: row.get(5)?,
+        new_pk_json: row.get(6)?,
+        old_json: row.get(7)?,
+        new_json: row.get(8)?,
+        created_at: row.get(9)?,
+    })
+}
+
+impl TryFrom<RawLogRow> for LogRow {
+    type Error = Error;
+
+    fn try_from(row: RawLogRow) -> Result<Self> {
+        let op = match row.op_text.as_str() {
             "insert" => LogOp::Insert,
             "update" => LogOp::Update,
             "delete" => LogOp::Delete,
-            _ => return Err(Error::InvalidLogOp(op_text)),
+            _ => return Err(Error::InvalidLogOp(row.op_text)),
         };
-        out.push(LogRow {
-            seq,
-            table_name,
+        Ok(Self {
+            seq: row.seq,
+            batch_id: row.batch_id,
+            table_name: row.table_name,
             op,
-            pk_json: serde_json::from_str::<Value>(&pk_json)?,
-            old_pk_json: old_pk_json
+            pk_json: serde_json::from_str::<Value>(&row.pk_json)?,
+            old_pk_json: row
+                .old_pk_json
                 .as_deref()
                 .map(serde_json::from_str::<Value>)
                 .transpose()?,
-            new_pk_json: new_pk_json
+            new_pk_json: row
+                .new_pk_json
                 .as_deref()
                 .map(serde_json::from_str::<Value>)
                 .transpose()?,
-            old_json: old_json
+            old_json: row
+                .old_json
                 .as_deref()
                 .map(serde_json::from_str::<Value>)
                 .transpose()?,
-            new_json: new_json
+            new_json: row
+                .new_json
                 .as_deref()
                 .map(serde_json::from_str::<Value>)
                 .transpose()?,
-            created_at,
-        });
+            created_at: row.created_at,
+        })
     }
-    Ok(out)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionStats {
+    pub retained_offset: i64,
+    pub deleted_rows: usize,
 }
 
 pub fn initial_snapshot(conn: &Connection, shape: &Shape) -> Result<Snapshot> {
@@ -391,10 +489,52 @@ pub fn replay(conn: &Connection, shape: &Shape, offset: i64, limit: i64) -> Resu
 
 pub fn retained_lower_bound(conn: &Connection) -> Result<i64> {
     bootstrap(conn)?;
+    let stored_offset = conn
+        .query_row(
+            "SELECT value FROM _electrolite_meta WHERE key = ?1",
+            params![retained_offset_key()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
     let min_seq = conn.query_row("SELECT MIN(seq) FROM _electrolite_log", [], |row| {
         row.get::<_, Option<i64>>(0)
     })?;
-    Ok(min_seq.map(|seq| seq - 1).unwrap_or(0))
+    Ok(stored_offset.max(min_seq.map(|seq| seq - 1).unwrap_or(0)))
+}
+
+pub fn compact_log_before(conn: &Connection, retained_offset: i64) -> Result<RetentionStats> {
+    bootstrap(conn)?;
+    let retained_offset = retained_offset.max(retained_lower_bound(conn)?);
+    let deleted_rows = conn.execute(
+        "DELETE FROM _electrolite_log WHERE seq <= ?1",
+        params![retained_offset],
+    )?;
+    record_retained_offset(conn, retained_offset)?;
+    Ok(RetentionStats {
+        retained_offset,
+        deleted_rows,
+    })
+}
+
+pub fn compact_log_to_last(conn: &Connection, keep_last: i64) -> Result<RetentionStats> {
+    bootstrap(conn)?;
+    let keep_last = keep_last.max(0);
+    let high_water = high_water_mark(conn)?;
+    let retained_offset = high_water.saturating_sub(keep_last);
+    compact_log_before(conn, retained_offset)
+}
+
+fn record_retained_offset(conn: &Connection, retained_offset: i64) -> Result<()> {
+    conn.execute(
+        "
+        INSERT OR REPLACE INTO _electrolite_meta (key, value)
+        VALUES (?1, ?2)
+        ",
+        params![retained_offset_key(), retained_offset.to_string()],
+    )?;
+    Ok(())
 }
 
 fn require_watched_table(conn: &Connection, shape: &Shape, watched: &WatchedTable) -> Result<()> {
@@ -467,7 +607,7 @@ fn validate_predicate_columns(
 ) -> Result<()> {
     match predicate {
         Predicate::All => Ok(()),
-        Predicate::Eq { column, .. } => {
+        Predicate::Eq { column, .. } | Predicate::In { column, .. } => {
             if watched.columns.contains(column) {
                 Ok(())
             } else {
@@ -496,6 +636,7 @@ fn compile_predicate(shape: &Shape, predicate: &Predicate) -> Result<(String, Ve
             let param = SqlParam::try_from_value(shape, value)?;
             Ok((format!("{} = ?", quote_ident(column)), vec![param]))
         }
+        Predicate::In { column, values } => compile_in_predicate(shape, column, values),
         Predicate::And { predicates } => {
             let mut sql = Vec::new();
             let mut params = Vec::new();
@@ -510,6 +651,40 @@ fn compile_predicate(shape: &Shape, predicate: &Predicate) -> Result<(String, Ve
             Ok((sql.join(" AND "), params))
         }
     }
+}
+
+fn compile_in_predicate(
+    shape: &Shape,
+    column: &str,
+    values: &[Value],
+) -> Result<(String, Vec<SqlParam>)> {
+    if values.is_empty() {
+        return Ok(("0".to_string(), Vec::new()));
+    }
+
+    let mut has_null = false;
+    let mut params = Vec::new();
+    for value in values {
+        if value.is_null() {
+            has_null = true;
+        } else {
+            params.push(SqlParam::try_from_value(shape, value)?);
+        }
+    }
+
+    let column = quote_ident(column);
+    let mut parts = Vec::new();
+    if !params.is_empty() {
+        let placeholders = std::iter::repeat_n("?", params.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("{column} IN ({placeholders})"));
+    }
+    if has_null {
+        parts.push(format!("{column} IS NULL"));
+    }
+
+    Ok((parts.join(" OR "), params))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -599,6 +774,28 @@ fn trigger_prefix(table: &str) -> String {
 
 fn watched_table_key(table: &str) -> String {
     format!("watched_table:{table}")
+}
+
+fn retained_offset_key() -> &'static str {
+    "retained_offset"
+}
+
+fn current_batch_id_key() -> &'static str {
+    "current_batch_id"
+}
+
+fn batch_id_expr() -> String {
+    format!(
+        "COALESCE((SELECT value FROM _electrolite_meta WHERE key = {}), lower(hex(randomblob(16))))",
+        quote_string(current_batch_id_key())
+    )
+}
+
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -691,6 +888,57 @@ mod tests {
 
         let rows = read_log_since(&conn, "users", 0, 10).unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn change_batch_marks_rows_and_replay_does_not_split_batch() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let shape = active_users_shape();
+
+        change_batch(&mut conn, |tx| {
+            tx.execute(
+                "INSERT INTO users (id, name, active) VALUES (1, 'Ada', 1)",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO users (id, name, active) VALUES (2, 'Grace', 1)",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO users (id, name, active) VALUES (3, 'Katherine', 1)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let rows = read_log_since(&conn, "users", 0, 1).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row.batch_id == rows[0].batch_id));
+
+        let replayed = replay(&conn, &shape, 0, 1).unwrap();
+        assert_eq!(replayed.offset, 3);
+        assert_eq!(replayed.messages.len(), 3);
+    }
+
+    #[test]
+    fn failed_change_batch_rolls_back_log_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+
+        let err = change_batch(&mut conn, |tx| {
+            tx.execute(
+                "INSERT INTO users (id, name, active) VALUES (1, 'Ada', 1)",
+                [],
+            )?;
+            Err::<(), Error>(Error::UnsupportedPredicate {
+                shape: "forced".to_string(),
+            })
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::UnsupportedPredicate { .. }));
+        assert!(read_log_since(&conn, "users", 0, 10).unwrap().is_empty());
     }
 
     #[test]
@@ -861,6 +1109,60 @@ mod tests {
     }
 
     #[test]
+    fn compaction_records_retained_offset_even_when_log_is_empty() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let shape = active_users_shape();
+
+        for id in 1..=3 {
+            conn.execute(
+                "INSERT INTO users (id, name, active) VALUES (?1, ?2, 1)",
+                (id, format!("user {id}")),
+            )
+            .unwrap();
+        }
+
+        let stats = compact_log_before(&conn, 3).unwrap();
+        assert_eq!(
+            stats,
+            RetentionStats {
+                retained_offset: 3,
+                deleted_rows: 3,
+            }
+        );
+        assert_eq!(retained_lower_bound(&conn).unwrap(), 3);
+
+        let err = replay(&conn, &shape, 2, 10).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::ResyncRequired {
+                requested_offset: 2,
+                retained_offset: 3,
+            }
+        ));
+    }
+
+    #[test]
+    fn compaction_can_keep_last_n_log_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+
+        for id in 1..=5 {
+            conn.execute(
+                "INSERT INTO users (id, name, active) VALUES (?1, ?2, 1)",
+                (id, format!("user {id}")),
+            )
+            .unwrap();
+        }
+
+        let stats = compact_log_to_last(&conn, 2).unwrap();
+        assert_eq!(stats.retained_offset, 3);
+        assert_eq!(stats.deleted_rows, 3);
+        assert_eq!(retained_lower_bound(&conn).unwrap(), 3);
+        assert_eq!(read_log_since(&conn, "users", 3, 10).unwrap().len(), 2);
+    }
+
+    #[test]
     fn primary_key_update_replays_delete_then_insert() {
         let conn = Connection::open_in_memory().unwrap();
         setup(&conn);
@@ -946,6 +1248,73 @@ mod tests {
                 if *key == json!({"id": 2})
                     && *value == json!({"id": 2, "name": "Grace", "nickname": null})
         ));
+    }
+
+    #[test]
+    fn in_predicate_matches_snapshot_and_replay() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE todos (
+              id INTEGER PRIMARY KEY,
+              project_id TEXT,
+              title TEXT NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+        install_triggers(&conn, "todos", "id").unwrap();
+        let shape = Shape {
+            name: "selectedProjectTodos".to_string(),
+            table: "todos".to_string(),
+            columns: vec![
+                "id".to_string(),
+                "project_id".to_string(),
+                "title".to_string(),
+            ],
+            predicate: Predicate::In {
+                column: "project_id".to_string(),
+                values: vec![json!("p1"), json!("p2"), Value::Null],
+            },
+            auth_scope: "projects:p1,p2,null".to_string(),
+            schema_version: 1,
+        };
+
+        conn.execute(
+            "INSERT INTO todos (id, project_id, title) VALUES (1, 'p1', 'one')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO todos (id, project_id, title) VALUES (2, 'p3', 'three')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO todos (id, project_id, title) VALUES (3, NULL, 'null project')",
+            [],
+        )
+        .unwrap();
+        let snapshot = initial_snapshot(&conn, &shape).unwrap();
+        assert_eq!(
+            snapshot.rows,
+            vec![
+                json!({"id": 1, "project_id": "p1", "title": "one"}),
+                json!({"id": 3, "project_id": null, "title": "null project"}),
+            ]
+        );
+
+        conn.execute("UPDATE todos SET project_id='p2' WHERE id=2", [])
+            .unwrap();
+        let replayed = replay(&conn, &shape, snapshot.offset, 10).unwrap();
+        assert_eq!(
+            replayed.messages,
+            vec![ShapeMessage::Insert {
+                key: json!({"id": 2}),
+                value: json!({"id": 2, "project_id": "p2", "title": "three"}),
+                offset: 4,
+            }]
+        );
     }
 
     #[test]
