@@ -45,6 +45,9 @@ Applications can also register Shape factories for dynamic, server-owned
 routes such as `/projects/:project_id/todos`. A factory turns request
 path/auth context into a concrete Shape, and the normal authorizer still
 checks the generated authorization scope before SQLite is touched.
+TypeScript app servers can use the trusted-header factory plus the
+backend proxy helper to authorize and construct those concrete Shapes
+without letting browsers send SQL.
 
 ## Workspace
 
@@ -56,6 +59,9 @@ checks the generated authorization scope before SQLite is touched.
   replay routes.
 - `clients/browser` - dependency-free browser materializer for Shape
   snapshots and live replay messages.
+- `clients/typescript-backend` - dependency-free Web Fetch proxy helper
+  for TypeScript app servers that authorize requests before forwarding
+  them to an internal Electrolite origin.
 
 ## Goals
 
@@ -77,6 +83,9 @@ checks the generated authorization scope before SQLite is touched.
 ## Roadmap
 
 See [ROADMAP.md](ROADMAP.md).
+
+For TypeScript app-server integration, see
+[docs/typescript-backend.md](docs/typescript-backend.md).
 
 ## Status
 

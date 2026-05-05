@@ -3,9 +3,10 @@ use axum::http::{HeaderMap, request::Parts};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use electrolite_core::{Replay, Shape, ShapeMessage, ShapeRegistry, Snapshot};
+use electrolite_core::{Predicate, Replay, Shape, ShapeMessage, ShapeRegistry, Snapshot};
 use http::StatusCode;
 use rusqlite::Connection;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -17,6 +18,7 @@ use tokio::sync::{Notify, Semaphore, watch};
 use tokio::time::{Instant, sleep_until};
 
 pub const DEFAULT_ROUTE_PREFIX: &str = "/electrolite/v1";
+pub const TRUSTED_SHAPE_FACTORY_NAME: &str = "trusted";
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -182,6 +184,62 @@ pub enum ShapeFactoryDecision {
     BadRequest,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct TrustedHeaderShapeFactory;
+
+impl ShapeFactory for TrustedHeaderShapeFactory {
+    fn build(&self, context: &ShapeFactoryContext<'_>) -> ShapeFactoryDecision {
+        let Some(name) = required_header(context.headers, "x-electrolite-shape-name") else {
+            return ShapeFactoryDecision::BadRequest;
+        };
+        let Some(table) = required_header(context.headers, "x-electrolite-table") else {
+            return ShapeFactoryDecision::BadRequest;
+        };
+        let Some(auth_scope) = required_header(context.headers, "x-electrolite-auth-scope") else {
+            return ShapeFactoryDecision::BadRequest;
+        };
+        let Some(columns) =
+            required_json_header::<Vec<String>>(context.headers, "x-electrolite-columns")
+        else {
+            return ShapeFactoryDecision::BadRequest;
+        };
+        let Some(predicate) =
+            required_json_header::<Predicate>(context.headers, "x-electrolite-predicate")
+        else {
+            return ShapeFactoryDecision::BadRequest;
+        };
+        let Some(schema_version) = required_header(context.headers, "x-electrolite-schema-version")
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return ShapeFactoryDecision::BadRequest;
+        };
+
+        if columns.is_empty() {
+            return ShapeFactoryDecision::BadRequest;
+        }
+
+        ShapeFactoryDecision::Shape(Shape {
+            name: name.to_string(),
+            table: table.to_string(),
+            columns,
+            predicate,
+            auth_scope: auth_scope.to_string(),
+            schema_version,
+        })
+    }
+}
+
+fn required_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+}
+
+fn required_json_header<T: DeserializeOwned>(headers: &HeaderMap, name: &str) -> Option<T> {
+    required_header(headers, name).and_then(|value| serde_json::from_str(value).ok())
+}
+
 #[derive(Debug)]
 pub struct AuthContext<'a> {
     pub headers: &'a HeaderMap,
@@ -198,6 +256,24 @@ pub struct AllowAll;
 impl Authorizer for AllowAll {
     fn authorize(&self, _context: &AuthContext<'_>) -> AuthDecision {
         AuthDecision::Allow
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TrustedHeaderAuthorizer;
+
+impl Authorizer for TrustedHeaderAuthorizer {
+    fn authorize(&self, context: &AuthContext<'_>) -> AuthDecision {
+        if context
+            .headers
+            .get("x-electrolite-scope")
+            .and_then(|value| value.to_str().ok())
+            == Some(context.shape.auth_scope.as_str())
+        {
+            AuthDecision::Allow
+        } else {
+            AuthDecision::Deny
+        }
     }
 }
 
@@ -1506,5 +1582,92 @@ mod tests {
         assert_ne!(p1.handle(), p2.handle());
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn trusted_header_factory_allows_typescript_defined_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE todos (
+              id INTEGER PRIMARY KEY,
+              project_id TEXT NOT NULL,
+              title TEXT NOT NULL,
+              done INTEGER NOT NULL DEFAULT 0
+            );
+            ",
+        )
+        .unwrap();
+        electrolite_sqlite::install_triggers(&conn, "todos", "id").unwrap();
+        conn.execute_batch(
+            "
+            INSERT INTO todos (id, project_id, title, done) VALUES
+              (1, 'p1', 'ship electrolite', 0),
+              (2, 'p2', 'other project', 0);
+            ",
+        )
+        .unwrap();
+
+        let state = ServerState::new(path, ShapeRegistry::new(), TrustedHeaderAuthorizer)
+            .with_shape_factory(TRUSTED_SHAPE_FACTORY_NAME, TrustedHeaderShapeFactory);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/electrolite/v1/factory/trusted/projectTodos/p1?offset=-1")
+                    .header("x-electrolite-shape-name", "projectTodos/p1")
+                    .header("x-electrolite-table", "todos")
+                    .header(
+                        "x-electrolite-columns",
+                        r#"["id","project_id","title","done"]"#,
+                    )
+                    .header(
+                        "x-electrolite-predicate",
+                        r#"{"type":"eq","column":"project_id","value":"p1"}"#,
+                    )
+                    .header("x-electrolite-auth-scope", "project:p1")
+                    .header("x-electrolite-schema-version", "1")
+                    .header("x-electrolite-scope", "project:p1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ShapeResponse>(&body).unwrap(),
+            ShapeResponse::Snapshot {
+                rows: vec![
+                    json!({"id": 1, "project_id": "p1", "title": "ship electrolite", "done": 0})
+                ],
+                offset: 2,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_header_factory_rejects_malformed_shape_specs() {
+        let app = router(
+            ServerState::new("/missing/app.db", ShapeRegistry::new(), AllowAll)
+                .with_shape_factory(TRUSTED_SHAPE_FACTORY_NAME, TrustedHeaderShapeFactory),
+        );
+
+        let (status, body) = error_response(
+            app,
+            "/electrolite/v1/factory/trusted/projectTodos/p1?offset=-1",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            ErrorBody {
+                error: "bad_shape_request".to_string(),
+            }
+        );
     }
 }

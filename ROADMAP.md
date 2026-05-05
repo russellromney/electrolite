@@ -98,6 +98,9 @@ Make the default safe for real applications.
 - Require server-defined named shapes.
 - Require column allowlists.
 - Run authorization in host app code before serving a shape.
+- Support TypeScript app servers as the authorization boundary by
+  proxying browser Shape requests to an internal Electrolite origin with
+  scoped headers.
 - Include auth scope in shape handles.
 - Keep raw `_electrolite_log` private.
 - Add optional signed shape URLs for proxy/CDN/object-store delivery.

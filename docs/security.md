@@ -14,6 +14,15 @@ browser
 The browser never sends arbitrary SQL. It asks for named shapes that the
 app has already defined.
 
+TypeScript app servers can use the helper in
+`clients/typescript-backend` to make the same pattern explicit: the app
+checks its session/RBAC, then forwards to an internal Electrolite origin
+with only scoped Electrolite headers. Browser cookies and bearer tokens
+are not forwarded by default. When the internal origin enables
+`TrustedHeaderShapeFactory`, those scoped headers can include the
+server-constructed Shape spec; this mode should only be exposed behind
+the TypeScript app, never directly to browsers.
+
 In the embedded server, the host app passes an explicit `Authorizer` when
 constructing `ServerState`. The authorizer receives request headers,
 request extensions, the named Shape, the requested offset, and whether the
