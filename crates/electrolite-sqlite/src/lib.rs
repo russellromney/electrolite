@@ -11,6 +11,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("table {table:?} has no primary-key column {pk_column:?}")]
     MissingPrimaryKey { table: String, pk_column: String },
+    #[error("table {table:?} must have exactly one primary-key column, found {columns:?}")]
+    UnsupportedPrimaryKey { table: String, columns: Vec<String> },
     #[error("table {table:?} has no columns")]
     EmptyTable { table: String },
     #[error("unknown electrolite log operation {0:?}")]
@@ -63,25 +65,14 @@ pub fn bootstrap(conn: &Connection) -> Result<()> {
 }
 
 pub fn inspect_table(conn: &Connection, table: &str, pk_column: &str) -> Result<WatchedTable> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", quote_string(table)))?;
-    let mut rows = stmt.query([])?;
-    let mut columns = Vec::new();
-    let mut has_pk = false;
-
-    while let Some(row) = rows.next()? {
-        let name: String = row.get(1)?;
-        let pk: i64 = row.get(5)?;
-        if name == pk_column && pk > 0 {
-            has_pk = true;
-        }
-        columns.push(name);
-    }
-
-    if columns.is_empty() {
-        return Err(Error::EmptyTable {
+    let (columns, primary_keys) = table_columns(conn, table)?;
+    if primary_keys.len() != 1 {
+        return Err(Error::UnsupportedPrimaryKey {
             table: table.to_string(),
+            columns: primary_keys,
         });
     }
+    let has_pk = primary_keys[0] == pk_column;
     if !has_pk {
         return Err(Error::MissingPrimaryKey {
             table: table.to_string(),
@@ -96,9 +87,59 @@ pub fn inspect_table(conn: &Connection, table: &str, pk_column: &str) -> Result<
     })
 }
 
+pub fn inspect_table_primary_key(conn: &Connection, table: &str) -> Result<WatchedTable> {
+    let (columns, primary_keys) = table_columns(conn, table)?;
+    let [pk_column] = primary_keys.as_slice() else {
+        return Err(Error::UnsupportedPrimaryKey {
+            table: table.to_string(),
+            columns: primary_keys,
+        });
+    };
+
+    Ok(WatchedTable {
+        table: table.to_string(),
+        pk_column: pk_column.clone(),
+        columns,
+    })
+}
+
+fn table_columns(conn: &Connection, table: &str) -> Result<(Vec<String>, Vec<String>)> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", quote_string(table)))?;
+    let mut rows = stmt.query([])?;
+    let mut columns = Vec::new();
+    let mut primary_keys = Vec::new();
+
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        let pk: i64 = row.get(5)?;
+        if pk > 0 {
+            primary_keys.push(name.clone());
+        }
+        columns.push(name);
+    }
+
+    if columns.is_empty() {
+        return Err(Error::EmptyTable {
+            table: table.to_string(),
+        });
+    }
+
+    Ok((columns, primary_keys))
+}
+
 pub fn install_triggers(conn: &Connection, table: &str, pk_column: &str) -> Result<WatchedTable> {
     bootstrap(conn)?;
     let watched = inspect_table(conn, table, pk_column)?;
+    install_triggers_for_watched(conn, watched)
+}
+
+pub fn install_triggers_auto(conn: &Connection, table: &str) -> Result<WatchedTable> {
+    bootstrap(conn)?;
+    let watched = inspect_table_primary_key(conn, table)?;
+    install_triggers_for_watched(conn, watched)
+}
+
+fn install_triggers_for_watched(conn: &Connection, watched: WatchedTable) -> Result<WatchedTable> {
     let table_ident = quote_ident(&watched.table);
     let trigger_prefix = trigger_prefix(&watched.table);
     let pk_new = row_json_expr("NEW", &[watched.pk_column.clone()]);
@@ -225,7 +266,7 @@ pub fn read_log_since(conn: &Connection, offset: i64, limit: i64) -> Result<Vec<
 
 pub fn initial_snapshot(conn: &Connection, shape: &Shape) -> Result<Snapshot> {
     bootstrap(conn)?;
-    let watched = inspect_table(conn, &shape.table, "id")?;
+    let watched = inspect_table_primary_key(conn, &shape.table)?;
     validate_shape_columns(&watched, shape)?;
 
     let (where_sql, params) = compile_predicate(shape, &shape.predicate)?;
@@ -726,6 +767,82 @@ mod tests {
             ShapeMessage::Insert { ref key, ref value, offset: 3 }
                 if *key == json!({"id": 2})
                     && *value == json!({"id": 2, "name": "Grace", "nickname": null})
+        ));
+    }
+
+    #[test]
+    fn snapshot_discovers_non_id_primary_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE projects (
+              slug TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              public INTEGER NOT NULL DEFAULT 0
+            );
+            ",
+        )
+        .unwrap();
+        install_triggers_auto(&conn, "projects").unwrap();
+        let shape = Shape {
+            name: "publicProjects".to_string(),
+            table: "projects".to_string(),
+            columns: vec![
+                "slug".to_string(),
+                "title".to_string(),
+                "public".to_string(),
+            ],
+            predicate: Predicate::Eq {
+                column: "public".to_string(),
+                value: json!(1),
+            },
+            auth_scope: "public".to_string(),
+            schema_version: 1,
+        };
+
+        conn.execute(
+            "INSERT INTO projects (slug, title, public) VALUES ('electrolite', 'Electrolite', 1)",
+            [],
+        )
+        .unwrap();
+        let snapshot = initial_snapshot(&conn, &shape).unwrap();
+
+        assert_eq!(
+            snapshot.rows,
+            vec![json!({"slug": "electrolite", "title": "Electrolite", "public": 1})]
+        );
+        let replayed = replay(&conn, &shape, 0, 10).unwrap();
+        assert_eq!(
+            replayed.messages,
+            vec![ShapeMessage::Insert {
+                key: json!({"slug": "electrolite"}),
+                value: json!({"slug": "electrolite", "title": "Electrolite", "public": 1}),
+                offset: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn composite_primary_keys_are_explicitly_unsupported() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE memberships (
+              account_id INTEGER NOT NULL,
+              user_id INTEGER NOT NULL,
+              role TEXT NOT NULL,
+              PRIMARY KEY (account_id, user_id)
+            );
+            ",
+        )
+        .unwrap();
+
+        let err = install_triggers(&conn, "memberships", "account_id").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::UnsupportedPrimaryKey { ref table, ref columns }
+                if table == "memberships"
+                    && columns == &vec!["account_id".to_string(), "user_id".to_string()]
         ));
     }
 }

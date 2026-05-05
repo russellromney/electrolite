@@ -67,6 +67,20 @@ The server:
 Long-polling keeps the endpoint HTTP/CDN friendly. WebSockets can come
 later as an adapter, not the core protocol.
 
+## Browser Materialization
+
+The tiny browser client:
+
+1. requests `offset=-1`
+2. stores snapshot rows in a `Map`
+3. reconnects with `live=true`
+4. applies insert, update, and delete messages
+5. notifies subscribers after materialized rows change
+
+The current snapshot response contains rows, while replay messages contain
+keys. The client is configured with the Shape key columns so it can derive
+snapshot keys without asking the browser to inspect SQLite schema.
+
 ## Membership Transitions
 
 For each log row:
