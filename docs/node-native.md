@@ -20,6 +20,22 @@ browser ShapeClient
 The package is currently local to this repository at
 `packages/electrolite-node`.
 
+## Try The Demo
+
+From the repository root:
+
+```sh
+cd packages/electrolite-node
+npm run build:native
+cd ../..
+node examples/basic-todos/demo.mjs
+```
+
+The demo runs entirely on your machine. It creates a temporary SQLite
+database, defines a server-owned Shape for one project's todos,
+materializes that Shape with the browser client, performs a backend
+write, and prints the updated browser-side rows.
+
 ## Basic Use
 
 ```ts

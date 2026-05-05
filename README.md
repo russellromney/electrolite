@@ -2,6 +2,14 @@
 
 Fast Electric-style sync for SQLite, exposed as a TypeScript package.
 
+Electrolite lets a normal TypeScript app say: "this browser can see this
+subset of SQLite rows; keep it updated." The app defines the subset and
+authorization rules. The browser gets an initial result, then receives
+inserts, updates, and deletes as the database changes.
+
+The database work is fast Rust under the hood, loaded through a native
+Node/Bun package. The app code stays TypeScript.
+
 Electrolite is a TypeScript-first embedded sync library inspired directly by
 [ElectricSQL](https://electric-sql.com/) and its
 [Electric Sync](https://electric.ax/docs/sync/) engine. Electric Sync is
@@ -28,6 +36,22 @@ The semantic core is a trigger-backed logical log. Honker-style commit
 wakes, Walrust physical replication, and S3/Cinch object storage are
 useful accelerants, but not required for the first version.
 
+## Try It
+
+Electrolite is not published to npm yet. From this repository:
+
+```sh
+cd packages/electrolite-node
+npm run build:native
+cd ../..
+node examples/basic-todos/demo.mjs
+```
+
+The demo creates a temporary SQLite database, defines a `projectTodos`
+Shape, materializes it with the browser client, writes a new row through
+the TypeScript API, and shows the browser-side rows updating. It also
+shows that an unauthorized Shape request returns `404`.
+
 ## Shape Definition
 
 A Shape is a client-consumable subset of a database, delivered as an HTTP
@@ -44,6 +68,12 @@ In Electrolite today, a Shape is server-defined and contains:
 
 Browsers do not send arbitrary SQL. They request named Shapes that the
 host application has already defined and authorized.
+
+Plain-English examples:
+
+- `projectTodos/project-123`: todos for one project
+- `userPhotos/user-456`: photos owned by one user
+- `accountEvents/account-789`: event rows for one account
 
 Applications can also register dynamic, server-owned Shape routes such
 as `/projects/:project_id/todos`. The route turns request path/auth
@@ -95,6 +125,11 @@ The browser requests `/electrolite/v1/projectTodos/project-123?offset=-1`
 for the initial Shape snapshot, then continues from the returned offset
 with ordinary replay or `live=true` long-polling.
 
+Under the hood, Electrolite installs SQLite triggers, records a durable
+logical change log, normalizes Shape handles against the SQLite schema,
+and uses replay boundaries so browsers do not publish half-applied
+batches.
+
 ## Workspace
 
 - `crates/electrolite-core` - Shape definitions, handles, log rows, and
@@ -145,14 +180,15 @@ authorized initial snapshots, bounded replay, and `live=true`
 long-polling. Rust apps can use `electrolite-server` directly;
 TypeScript apps can use `@electrolite/node`, which loads the Rust core
 through a native Node-API binding and exposes a Web Fetch route handler.
-The server has a SQLite connection pool, in-process live wait coalescing,
-retained-offset resync errors, and a basic fanout benchmark harness.
-Dynamic Shape factories and a table/equality predicate index are in place
-for the next fanout broker layer. Embedded write helpers can wake live
-requests automatically, retention compaction records a durable retained
-offset, and optional Electrolite change batches avoid splitting
-app-controlled transactions across bounded replay responses. Responses
-include key-column metadata and an explicit `up_to_date` boundary; Shape
-handles are canonicalized across equivalent definitions; and SQLite
-predicate values are normalized against declared column types to avoid
-snapshot/replay drift.
+The Node package and Rust server both use bounded SQLite connection
+pools. Live waits coalesce in-process, retained-offset errors return
+`409 resync_required`, and a benchmark harness exists for fanout work.
+Dynamic Shape factories and a table/equality predicate index are in
+place for the next fanout broker layer. Embedded write helpers can wake
+live requests automatically, retention compaction records durable
+retained offsets, and optional Electrolite change batches avoid
+splitting app-controlled transactions across bounded replay responses.
+Responses include key-column metadata and an explicit `up_to_date`
+boundary; Shape handles are canonicalized and schema-normalized against
+SQLite declared types; and SQLite predicate values are normalized against
+declared column types to avoid snapshot/replay drift.
