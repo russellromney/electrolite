@@ -1,14 +1,20 @@
 # electrolite
 
-Embeddable Electric-style shape sync for SQLite.
+Embeddable Electric-style Shape sync for SQLite.
 
-Electrolite is a Rust-first project for syncing named SQLite table shapes
-to browsers without a separate sync daemon. The intended shape:
+Electrolite is a Rust-first experiment inspired directly by
+[Electric Sync](https://electric.ax/docs/sync/). Electric is a Postgres
+read-path sync engine: it consumes Postgres logical replication, exposes
+Shapes over HTTP, and lets clients materialize those Shapes with an
+initial sync followed by live logical updates.
+
+Electrolite tries to preserve that lifecycle for SQLite without requiring
+a separate sync daemon. The intended architecture:
 
 ```text
 SQLite + generated triggers
   -> durable logical change log
-  -> app-embedded HTTP shape endpoint
+  -> app-embedded HTTP Shape endpoint
   -> browser client consumes snapshot + offset log
 ```
 
@@ -16,9 +22,26 @@ The semantic core is a trigger-backed logical log. Honker-style commit
 wakes, Walrust physical replication, and S3/Cinch object storage are
 useful accelerants, but not required for the first version.
 
+## What Is A Shape?
+
+A Shape is an ElectricSQL term of art: a client-consumable subset of a
+database, delivered as an HTTP log that starts with current rows and then
+continues with inserts, updates, and deletes.
+
+In Electrolite today, a Shape is server-defined and contains:
+
+- a source table
+- a column allowlist
+- a predicate, currently simple equality and conjunctions
+- an authorization scope
+- a schema version
+
+Browsers do not send arbitrary SQL. They request named Shapes that the
+host application has already defined and authorized.
+
 ## Workspace
 
-- `crates/electrolite-core` - shape definitions, handles, log rows, and
+- `crates/electrolite-core` - Shape definitions, handles, log rows, and
   membership transition logic.
 - `crates/electrolite-sqlite` - SQLite metadata tables, trigger
   generation, and log reads.
@@ -27,12 +50,12 @@ useful accelerants, but not required for the first version.
 ## Goals
 
 - Electric-like initial snapshot plus live offset replay for SQLite.
-- Named server-side shapes instead of arbitrary browser SQL.
+- Named server-side Shapes instead of arbitrary browser SQL.
 - Browser delivery over cache-friendly HTTP long-polling.
-- Strong security defaults: app-authorized shapes, column allowlists,
-  private raw logs, and short-lived signed shape URLs when needed.
+- Strong security defaults: app-authorized Shapes, column allowlists,
+  private raw logs, and short-lived signed Shape URLs when needed.
 - Honest fanout economics: excellent for shared team/workspace/document
-  shapes, explicit tradeoffs for per-user private shapes.
+  Shapes, explicit tradeoffs for per-user private Shapes.
 
 ## Non-goals
 
