@@ -1,13 +1,14 @@
 # electrolite
 
-Embeddable Electric-style Shape sync for SQLite.
+Embeddable Electric-style sync for SQLite.
 
 Electrolite is a Rust-first experiment inspired directly by
 [ElectricSQL](https://electric-sql.com/) and its
 [Electric Sync](https://electric.ax/docs/sync/) engine. Electric Sync is
 a Postgres read-path sync engine: it consumes Postgres logical
-replication, exposes Shapes over HTTP, and lets clients materialize those
-Shapes with an initial sync followed by live logical updates.
+replication, exposes selected subsets of database rows over HTTP, and
+lets clients materialize those subsets with an initial sync followed by
+live logical updates.
 
 Electrolite tries to preserve that lifecycle for SQLite without requiring
 a separate sync daemon. The intended architecture:
@@ -15,7 +16,7 @@ a separate sync daemon. The intended architecture:
 ```text
 SQLite + generated triggers
   -> durable logical change log
-  -> app-embedded HTTP Shape endpoint
+  -> app-embedded HTTP sync endpoint
   -> browser client consumes snapshot + offset log
 ```
 
@@ -23,11 +24,12 @@ The semantic core is a trigger-backed logical log. Honker-style commit
 wakes, Walrust physical replication, and S3/Cinch object storage are
 useful accelerants, but not required for the first version.
 
-## What Is A Shape?
+## The Sync Primitive
 
-A Shape is an ElectricSQL term of art: a client-consumable subset of a
-database, delivered as an HTTP log that starts with current rows and then
-continues with inserts, updates, and deletes.
+ElectricSQL calls one of these synced subsets a Shape. A Shape is a
+client-consumable subset of a database, delivered as an HTTP log that
+starts with current rows and then continues with inserts, updates, and
+deletes.
 
 In Electrolite today, a Shape is server-defined and contains:
 
