@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
+import { spawn } from "node:child_process";
 import test from "node:test";
+import { ShapeClient } from "../browser/electrolite.js";
 import {
   createElectroliteProxy,
   parseElectroliteRequest,
@@ -219,6 +222,74 @@ test("treats malformed encoded paths as not found", () => {
   );
 });
 
+test("e2e TypeScript backend proxy materializes a trusted Shape", async (t) => {
+  const origin = await startRustOrigin(t);
+  const session = { userId: "u1", projects: new Set(["p1"]) };
+  const proxy = createElectroliteProxy({
+    origin,
+    authorize: async ({ kind, name, path }) => {
+      if (kind !== "factory" || name !== "trusted") {
+        return false;
+      }
+      const [shapeName, projectId] = path.split("/");
+      if (shapeName !== "projectTodos" || !session.projects.has(projectId)) {
+        return false;
+      }
+      return {
+        allow: true,
+        headers: {
+          ...trustedShapeHeaders({
+            name: `${shapeName}/${projectId}`,
+            table: "todos",
+            columns: ["id", "project_id", "title", "done"],
+            predicate: { type: "eq", column: "project_id", value: projectId },
+            auth_scope: `project:${projectId}`,
+            schema_version: 1,
+          }),
+          "x-electrolite-scope": `project:${projectId}`,
+        },
+      };
+    },
+  });
+  const fetchThroughTypeScriptBackend = (url, init) => {
+    const request = new Request(url, init);
+    return proxy(request);
+  };
+  const client = new ShapeClient(
+    "https://app.test/electrolite/v1/factory/trusted/projectTodos/p1",
+    {
+      keyColumns: ["id"],
+      fetch: fetchThroughTypeScriptBackend,
+      retry: { minDelayMs: 5, maxDelayMs: 20 },
+    },
+  );
+
+  assert.equal(await client.request({ offset: -1 }), true);
+  assert.deepEqual(client.currentRows(), [
+    { id: 1, project_id: "p1", title: "ship electrolite", done: 0 },
+  ]);
+
+  const denied = await proxy(
+    new Request("https://app.test/electrolite/v1/factory/trusted/projectTodos/p2?offset=-1"),
+  );
+  assert.equal(denied.status, 404);
+
+  const ignoredLive = client.request({ offset: client.offset, live: true });
+  await fetch(`${origin}/test/update-p2`, { method: "POST" });
+  assert.equal(await ignoredLive, false);
+  assert.deepEqual(client.currentRows(), [
+    { id: 1, project_id: "p1", title: "ship electrolite", done: 0 },
+  ]);
+
+  const visibleLive = client.request({ offset: client.offset, live: true });
+  await fetch(`${origin}/test/insert-p1`, { method: "POST" });
+  assert.equal(await visibleLive, true);
+  assert.deepEqual(client.currentRows(), [
+    { id: 1, project_id: "p1", title: "ship electrolite", done: 0 },
+    { id: 3, project_id: "p1", title: "from ts backend", done: 0 },
+  ]);
+});
+
 function routeSummary(route) {
   return {
     kind: route.kind,
@@ -228,4 +299,43 @@ function routeSummary(route) {
     live: route.live,
     forwardPath: route.forwardPath,
   };
+}
+
+async function startRustOrigin(t) {
+  const child = spawn(
+    "cargo",
+    ["run", "-q", "-p", "electrolite-server", "--example", "typescript_backend_origin"],
+    {
+      cwd: new URL("../..", import.meta.url),
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  t.after(() => child.kill());
+
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  child.stdout.setEncoding("utf8");
+
+  const timeout = setTimeout(() => child.kill(), 30_000);
+  try {
+    let stdout = "";
+    while (true) {
+      const [chunk] = await Promise.race([
+        once(child.stdout, "data"),
+        once(child, "exit").then(([code]) => {
+          throw new Error(`Rust origin exited with ${code}: ${stderr}`);
+        }),
+      ]);
+      stdout += chunk;
+      const match = stdout.match(/ELECTROLITE_ORIGIN=(http:\/\/[^\s]+)/);
+      if (match) {
+        return match[1];
+      }
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
 }
