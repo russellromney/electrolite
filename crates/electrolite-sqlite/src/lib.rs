@@ -42,6 +42,8 @@ pub fn bootstrap(conn: &Connection) -> Result<()> {
           table_name TEXT NOT NULL,
           op TEXT NOT NULL,
           pk_json TEXT NOT NULL,
+          old_pk_json TEXT,
+          new_pk_json TEXT,
           old_json TEXT,
           new_json TEXT,
           created_at INTEGER NOT NULL DEFAULT (unixepoch())
@@ -55,6 +57,8 @@ pub fn bootstrap(conn: &Connection) -> Result<()> {
         );
         ",
     )?;
+    add_column_if_missing(conn, "_electrolite_log", "old_pk_json", "TEXT")?;
+    add_column_if_missing(conn, "_electrolite_log", "new_pk_json", "TEXT")?;
     Ok(())
 }
 
@@ -105,25 +109,35 @@ pub fn install_triggers(conn: &Connection, table: &str, pk_column: &str) -> Resu
 
     conn.execute_batch(&format!(
         "
+        DROP TRIGGER IF EXISTS {insert_trigger};
+        DROP TRIGGER IF EXISTS {update_trigger};
+        DROP TRIGGER IF EXISTS {delete_trigger};
+
         CREATE TRIGGER IF NOT EXISTS {insert_trigger}
         AFTER INSERT ON {table_ident}
         BEGIN
-          INSERT INTO _electrolite_log (table_name, op, pk_json, old_json, new_json)
-          VALUES ({table_lit}, 'insert', {pk_new}, NULL, {new_row});
+          INSERT INTO _electrolite_log (
+            table_name, op, pk_json, old_pk_json, new_pk_json, old_json, new_json
+          )
+          VALUES ({table_lit}, 'insert', {pk_new}, NULL, {pk_new}, NULL, {new_row});
         END;
 
         CREATE TRIGGER IF NOT EXISTS {update_trigger}
         AFTER UPDATE ON {table_ident}
         BEGIN
-          INSERT INTO _electrolite_log (table_name, op, pk_json, old_json, new_json)
-          VALUES ({table_lit}, 'update', {pk_new}, {old_row}, {new_row});
+          INSERT INTO _electrolite_log (
+            table_name, op, pk_json, old_pk_json, new_pk_json, old_json, new_json
+          )
+          VALUES ({table_lit}, 'update', {pk_new}, {pk_old}, {pk_new}, {old_row}, {new_row});
         END;
 
         CREATE TRIGGER IF NOT EXISTS {delete_trigger}
         AFTER DELETE ON {table_ident}
         BEGIN
-          INSERT INTO _electrolite_log (table_name, op, pk_json, old_json, new_json)
-          VALUES ({table_lit}, 'delete', {pk_old}, {old_row}, NULL);
+          INSERT INTO _electrolite_log (
+            table_name, op, pk_json, old_pk_json, new_pk_json, old_json, new_json
+          )
+          VALUES ({table_lit}, 'delete', {pk_old}, {pk_old}, NULL, {old_row}, NULL);
         END;
         ",
         insert_trigger = quote_ident(&format!("{trigger_prefix}_ai")),
@@ -137,7 +151,7 @@ pub fn install_triggers(conn: &Connection, table: &str, pk_column: &str) -> Resu
 pub fn read_log_since(conn: &Connection, offset: i64, limit: i64) -> Result<Vec<LogRow>> {
     let mut stmt = conn.prepare(
         "
-        SELECT seq, table_name, op, pk_json, old_json, new_json, created_at
+        SELECT seq, table_name, op, pk_json, old_pk_json, new_pk_json, old_json, new_json, created_at
         FROM _electrolite_log
         WHERE seq > ?1
         ORDER BY seq ASC
@@ -146,22 +160,36 @@ pub fn read_log_since(conn: &Connection, offset: i64, limit: i64) -> Result<Vec<
     )?;
     let rows = stmt.query_map([offset, limit], |row| {
         let pk_json: String = row.get(3)?;
-        let old_json: Option<String> = row.get(4)?;
-        let new_json: Option<String> = row.get(5)?;
+        let old_pk_json: Option<String> = row.get(4)?;
+        let new_pk_json: Option<String> = row.get(5)?;
+        let old_json: Option<String> = row.get(6)?;
+        let new_json: Option<String> = row.get(7)?;
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
             pk_json,
+            old_pk_json,
+            new_pk_json,
             old_json,
             new_json,
-            row.get::<_, i64>(6)?,
+            row.get::<_, i64>(8)?,
         ))
     })?;
 
     let mut out = Vec::new();
     for row in rows {
-        let (seq, table_name, op_text, pk_json, old_json, new_json, created_at) = row?;
+        let (
+            seq,
+            table_name,
+            op_text,
+            pk_json,
+            old_pk_json,
+            new_pk_json,
+            old_json,
+            new_json,
+            created_at,
+        ) = row?;
         let op = match op_text.as_str() {
             "insert" => LogOp::Insert,
             "update" => LogOp::Update,
@@ -173,6 +201,14 @@ pub fn read_log_since(conn: &Connection, offset: i64, limit: i64) -> Result<Vec<
             table_name,
             op,
             pk_json: serde_json::from_str::<Value>(&pk_json)?,
+            old_pk_json: old_pk_json
+                .as_deref()
+                .map(serde_json::from_str::<Value>)
+                .transpose()?,
+            new_pk_json: new_pk_json
+                .as_deref()
+                .map(serde_json::from_str::<Value>)
+                .transpose()?,
             old_json: old_json
                 .as_deref()
                 .map(serde_json::from_str::<Value>)
@@ -188,10 +224,10 @@ pub fn read_log_since(conn: &Connection, offset: i64, limit: i64) -> Result<Vec<
 }
 
 pub fn initial_snapshot(conn: &Connection, shape: &Shape) -> Result<Snapshot> {
+    bootstrap(conn)?;
     let watched = inspect_table(conn, &shape.table, "id")?;
     validate_shape_columns(&watched, shape)?;
 
-    let offset = high_water_mark(conn)?;
     let (where_sql, params) = compile_predicate(shape, &shape.predicate)?;
     let row_expr = row_json_expr("", &shape.columns);
     let mut sql = format!(
@@ -206,15 +242,47 @@ pub fn initial_snapshot(conn: &Connection, shape: &Shape) -> Result<Snapshot> {
     sql.push_str(" ORDER BY ");
     sql.push_str(&quote_ident(&watched.pk_column));
 
+    let tx = conn.unchecked_transaction()?;
+    let offset = tx.query_row(
+        "SELECT COALESCE(MAX(seq), 0) FROM _electrolite_log",
+        [],
+        |r| r.get(0),
+    )?;
     let params_ref: Vec<&dyn ToSql> = params.iter().map(|p| p as &dyn ToSql).collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_ref.as_slice(), |row| row.get::<_, String>(0))?;
+    let out = {
+        let mut stmt = tx.prepare(&sql)?;
+        let rows = stmt.query_map(params_ref.as_slice(), |row| row.get::<_, String>(0))?;
 
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(serde_json::from_str::<Value>(&row?)?);
-    }
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str::<Value>(&row?)?);
+        }
+        out
+    };
+    tx.commit()?;
     Ok(Snapshot { rows: out, offset })
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", quote_string(table)))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(());
+        }
+    }
+    conn.execute_batch(&format!(
+        "ALTER TABLE {} ADD COLUMN {} {definition}",
+        quote_ident(table),
+        quote_ident(column)
+    ))?;
+    Ok(())
 }
 
 pub fn replay(conn: &Connection, shape: &Shape, offset: i64, limit: i64) -> Result<Replay> {
@@ -224,9 +292,7 @@ pub fn replay(conn: &Connection, shape: &Shape, offset: i64, limit: i64) -> Resu
 
     for row in rows {
         latest = latest.max(row.seq);
-        if let Some(message) = electrolite_core::message_for_log(shape, &row) {
-            messages.push(message);
-        }
+        messages.extend(electrolite_core::messages_for_log(shape, &row));
     }
 
     Ok(Replay {
@@ -294,6 +360,9 @@ fn compile_predicate(shape: &Shape, predicate: &Predicate) -> Result<(String, Ve
     match predicate {
         Predicate::All => Ok((String::new(), Vec::new())),
         Predicate::Eq { column, value } => {
+            if value.is_null() {
+                return Ok((format!("{} IS NULL", quote_ident(column)), Vec::new()));
+            }
             let param = SqlParam::try_from_value(shape, value)?;
             Ok((format!("{} = ?", quote_ident(column)), vec![param]))
         }
@@ -569,6 +638,94 @@ mod tests {
         assert!(matches!(
             replayed.messages[0],
             ShapeMessage::Delete { ref key, offset: 5 } if *key == json!({"id": 2})
+        ));
+    }
+
+    #[test]
+    fn primary_key_update_replays_delete_then_insert() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let shape = active_users_shape();
+
+        conn.execute(
+            "INSERT INTO users (id, name, active) VALUES (1, 'Ada', 1)",
+            [],
+        )
+        .unwrap();
+        let snapshot = initial_snapshot(&conn, &shape).unwrap();
+
+        conn.execute("UPDATE users SET id=10 WHERE id=1", [])
+            .unwrap();
+        let replayed = replay(&conn, &shape, snapshot.offset, 10).unwrap();
+
+        assert_eq!(replayed.offset, 2);
+        assert_eq!(
+            replayed.messages,
+            vec![
+                ShapeMessage::Delete {
+                    key: json!({"id": 1}),
+                    offset: 2,
+                },
+                ShapeMessage::Insert {
+                    key: json!({"id": 10}),
+                    value: json!({"id": 10, "name": "Ada", "active": 1}),
+                    offset: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn null_equality_matches_snapshot_and_replay() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE people (
+              id INTEGER PRIMARY KEY,
+              name TEXT NOT NULL,
+              nickname TEXT
+            );
+            ",
+        )
+        .unwrap();
+        install_triggers(&conn, "people", "id").unwrap();
+        let shape = Shape {
+            name: "unnicknamedPeople".to_string(),
+            table: "people".to_string(),
+            columns: vec!["id".to_string(), "name".to_string(), "nickname".to_string()],
+            predicate: Predicate::Eq {
+                column: "nickname".to_string(),
+                value: Value::Null,
+            },
+            auth_scope: "public".to_string(),
+            schema_version: 1,
+        };
+
+        conn.execute(
+            "INSERT INTO people (id, name, nickname) VALUES (1, 'Ada', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO people (id, name, nickname) VALUES (2, 'Grace', 'Amazing Grace')",
+            [],
+        )
+        .unwrap();
+        let snapshot = initial_snapshot(&conn, &shape).unwrap();
+        assert_eq!(
+            snapshot.rows,
+            vec![json!({"id": 1, "name": "Ada", "nickname": null})]
+        );
+
+        conn.execute("UPDATE people SET nickname=NULL WHERE id=2", [])
+            .unwrap();
+        let replayed = replay(&conn, &shape, snapshot.offset, 10).unwrap();
+        assert_eq!(replayed.messages.len(), 1);
+        assert!(matches!(
+            replayed.messages[0],
+            ShapeMessage::Insert { ref key, ref value, offset: 3 }
+                if *key == json!({"id": 2})
+                    && *value == json!({"id": 2, "name": "Grace", "nickname": null})
         ));
     }
 }

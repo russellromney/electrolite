@@ -83,6 +83,8 @@ pub struct LogRow {
     pub table_name: String,
     pub op: LogOp,
     pub pk_json: Value,
+    pub old_pk_json: Option<Value>,
+    pub new_pk_json: Option<Value>,
     pub old_json: Option<Value>,
     pub new_json: Option<Value>,
     pub created_at: i64,
@@ -120,29 +122,67 @@ pub struct Replay {
 }
 
 pub fn message_for_log(shape: &Shape, row: &LogRow) -> Option<ShapeMessage> {
+    messages_for_log(shape, row).into_iter().next()
+}
+
+pub fn messages_for_log(shape: &Shape, row: &LogRow) -> Vec<ShapeMessage> {
     if row.table_name != shape.table {
-        return None;
+        return Vec::new();
     }
 
     let old_matches = shape.predicate.matches(row.old_json.as_ref());
     let new_matches = shape.predicate.matches(row.new_json.as_ref());
+    let old_key = row
+        .old_pk_json
+        .clone()
+        .unwrap_or_else(|| row.pk_json.clone());
+    let new_key = row
+        .new_pk_json
+        .clone()
+        .unwrap_or_else(|| row.pk_json.clone());
 
     match (old_matches, new_matches) {
-        (false, true) => row.new_json.clone().map(|value| ShapeMessage::Insert {
-            key: row.pk_json.clone(),
-            value,
+        (false, true) => row
+            .new_json
+            .clone()
+            .map(|value| {
+                vec![ShapeMessage::Insert {
+                    key: new_key,
+                    value,
+                    offset: row.seq,
+                }]
+            })
+            .unwrap_or_default(),
+        (true, true) => row
+            .new_json
+            .clone()
+            .map(|value| {
+                if old_key == new_key {
+                    vec![ShapeMessage::Update {
+                        key: new_key,
+                        value,
+                        offset: row.seq,
+                    }]
+                } else {
+                    vec![
+                        ShapeMessage::Delete {
+                            key: old_key,
+                            offset: row.seq,
+                        },
+                        ShapeMessage::Insert {
+                            key: new_key,
+                            value,
+                            offset: row.seq,
+                        },
+                    ]
+                }
+            })
+            .unwrap_or_default(),
+        (true, false) => vec![ShapeMessage::Delete {
+            key: old_key,
             offset: row.seq,
-        }),
-        (true, true) => row.new_json.clone().map(|value| ShapeMessage::Update {
-            key: row.pk_json.clone(),
-            value,
-            offset: row.seq,
-        }),
-        (true, false) => Some(ShapeMessage::Delete {
-            key: row.pk_json.clone(),
-            offset: row.seq,
-        }),
-        (false, false) => None,
+        }],
+        (false, false) => Vec::new(),
     }
 }
 
@@ -191,6 +231,8 @@ mod tests {
             table_name: "users".to_string(),
             op: LogOp::Insert,
             pk_json: json!({"id": 7}),
+            old_pk_json: None,
+            new_pk_json: Some(json!({"id": 7})),
             old_json: None,
             new_json: Some(json!({"id": 7, "name": "Ada", "active": 1})),
             created_at: 0,
@@ -205,6 +247,8 @@ mod tests {
             table_name: "users".to_string(),
             op: LogOp::Update,
             pk_json: json!({"id": 7}),
+            old_pk_json: Some(json!({"id": 7})),
+            new_pk_json: Some(json!({"id": 7})),
             old_json: Some(json!({"id": 7, "name": "Ada", "active": 1})),
             new_json: Some(json!({"id": 7, "name": "Ada Lovelace", "active": 1})),
             created_at: 0,
@@ -219,6 +263,8 @@ mod tests {
             table_name: "users".to_string(),
             op: LogOp::Update,
             pk_json: json!({"id": 7}),
+            old_pk_json: Some(json!({"id": 7})),
+            new_pk_json: Some(json!({"id": 7})),
             old_json: Some(json!({"id": 7, "name": "Ada", "active": 1})),
             new_json: Some(json!({"id": 7, "name": "Ada", "active": 0})),
             created_at: 0,
@@ -227,5 +273,36 @@ mod tests {
             message_for_log(&shape, &removed),
             Some(ShapeMessage::Delete { .. })
         ));
+    }
+
+    #[test]
+    fn primary_key_change_in_shape_expands_to_delete_insert() {
+        let shape = shape();
+        let row = LogRow {
+            seq: 4,
+            table_name: "users".to_string(),
+            op: LogOp::Update,
+            pk_json: json!({"id": 8}),
+            old_pk_json: Some(json!({"id": 7})),
+            new_pk_json: Some(json!({"id": 8})),
+            old_json: Some(json!({"id": 7, "name": "Ada", "active": 1})),
+            new_json: Some(json!({"id": 8, "name": "Ada", "active": 1})),
+            created_at: 0,
+        };
+
+        assert_eq!(
+            messages_for_log(&shape, &row),
+            vec![
+                ShapeMessage::Delete {
+                    key: json!({"id": 7}),
+                    offset: 4,
+                },
+                ShapeMessage::Insert {
+                    key: json!({"id": 8}),
+                    value: json!({"id": 8, "name": "Ada", "active": 1}),
+                    offset: 4,
+                },
+            ]
+        );
     }
 }
