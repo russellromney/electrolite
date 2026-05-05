@@ -57,11 +57,13 @@ without letting browsers send SQL.
   generation, and log reads.
 - `crates/electrolite-server` - embedded authorized HTTP snapshot and
   replay routes.
+- `packages/electrolite-node` - Node/Bun native binding that exposes the
+  Rust core as a TypeScript-friendly embedded backend package.
 - `clients/browser` - dependency-free browser materializer for Shape
   snapshots and live replay messages.
 - `clients/typescript-backend` - dependency-free Web Fetch proxy helper
-  for TypeScript app servers that authorize requests before forwarding
-  them to an internal Electrolite origin.
+  for the older internal-origin bridge. New TypeScript apps should start
+  with `packages/electrolite-node`.
 
 ## Goals
 
@@ -84,22 +86,27 @@ without letting browsers send SQL.
 
 See [ROADMAP.md](ROADMAP.md).
 
-For TypeScript app-server integration, see
+For TypeScript app-server integration, start with
+[docs/node-native.md](docs/node-native.md). The older internal-origin
+bridge is documented in
 [docs/typescript-backend.md](docs/typescript-backend.md).
 
 ## Status
 
 Early scaffold. The implemented slice is trigger-backed logical change
-capture for primary-keyed SQLite tables, plus an embedded HTTP route for
+capture for primary-keyed SQLite tables, plus embedded HTTP routes for
 authorized initial snapshots, bounded replay, and `live=true`
-long-polling. The server now has a SQLite connection pool, in-process
-live wait coalescing, retained-offset resync errors, and a basic fanout
-benchmark harness. Dynamic Shape factories and a table/equality predicate
-index are in place for the next fanout broker layer. Embedded write
-helpers can wake live requests automatically, retention compaction records
-a durable retained offset, and optional Electrolite change batches avoid
-splitting app-controlled transactions across bounded replay responses.
-Responses now include key-column metadata and an explicit `up_to_date`
-boundary; Shape handles are canonicalized across equivalent definitions;
-and SQLite predicate values are normalized against declared column types
-to avoid snapshot/replay drift.
+long-polling. Rust apps can use `electrolite-server` directly;
+TypeScript apps can use `@electrolite/node`, which loads the Rust core
+through a native Node-API binding and exposes a Web Fetch route handler.
+The server has a SQLite connection pool, in-process live wait coalescing,
+retained-offset resync errors, and a basic fanout benchmark harness.
+Dynamic Shape factories and a table/equality predicate index are in place
+for the next fanout broker layer. Embedded write helpers can wake live
+requests automatically, retention compaction records a durable retained
+offset, and optional Electrolite change batches avoid splitting
+app-controlled transactions across bounded replay responses. Responses
+include key-column metadata and an explicit `up_to_date` boundary; Shape
+handles are canonicalized across equivalent definitions; and SQLite
+predicate values are normalized against declared column types to avoid
+snapshot/replay drift.

@@ -3,6 +3,7 @@ members = [
   "crates/electrolite-core",
   "crates/electrolite-sqlite",
   "crates/electrolite-server",
+  "packages/electrolite-node/native",
 ]
 resolver = "2"
 
@@ -24,3 +25,5 @@ serde_json = "1.0"
 sha2 = "0.10"
 thiserror = "2.0"
 tokio = { version = "1.52", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+napi = "3.8"
+napi-derive = "3.3"

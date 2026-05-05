@@ -1,15 +1,21 @@
-# TypeScript Backend Integration
+# Legacy TypeScript Backend Bridge
 
-Electrolite is Rust-first, but a TypeScript backend can still be the
-application security boundary.
+New TypeScript apps should use the native package in
+[node-native.md](node-native.md). It embeds the Rust core directly in
+Node/Bun through Node-API, so there is no separate Electrolite origin to
+run.
+
+This document describes the older bridge for apps that want a
+TypeScript authorization layer in front of an internal Electrolite HTTP
+origin. It remains useful for experiments and for comparing deployment
+models, but it is no longer the preferred TypeScript integration path.
 
 The core target is embedded: the host application owns SQLite, writes,
-authorization, and the Electrolite endpoint. For TypeScript app servers,
-the current bridge is an internal Electrolite HTTP origin with the
-trusted Shape factory enabled, plus a TypeScript proxy mounted in your
-app. That origin can be a loopback Rust process today; a native
-TypeScript embedding is future ergonomics, not a change to the security
-model. A separate sidecar is optional, not required by the protocol.
+authorization, and the Electrolite endpoint. In the bridge model, the
+internal Electrolite origin has the trusted Shape factory enabled, and a
+TypeScript proxy is mounted in your app. That origin can be a loopback
+Rust process. A separate sidecar is optional, not required by the
+protocol.
 
 The browser talks to the TypeScript app. The TypeScript app checks the
 user's session/RBAC and forwards only authorized Shape requests to the

@@ -105,6 +105,30 @@ hash(table + canonical columns + canonical predicate + auth_scope + schema_versi
 - Support composite primary keys by emitting JSON keys with all primary
   key columns and including all key columns in snapshot metadata.
 
+## Phase Node - TypeScript Native Embedding
+
+Make the intended TypeScript consumer path feel like a normal Node/Bun
+library, with Rust kept behind the package boundary.
+
+### Implemented Slice
+
+- `@electrolite/node` loads the Rust core through Node-API.
+- TypeScript apps can register server-owned dynamic Shapes, authorize
+  requests in app code, and serve snapshot/replay/live responses from a
+  Web Fetch handler.
+- The package exposes trigger installation, ordinary writes, explicit
+  Electrolite write batches, retention compaction, and live wakeups.
+- End-to-end tests exercise the user-facing flow: TypeScript route,
+  dynamic authorized Shape, native SQLite triggers/log replay, browser
+  `ShapeClient`, and live long-poll delivery.
+
+### Remaining Work
+
+- Replace per-call SQLite opens with a small native connection pool.
+- Publish prebuilt native artifacts for the main Node/Bun platforms.
+- Add IndexedDB persistence, React hooks, and multi-tab support in the
+  browser package.
+
 ## Phase Guard - Security Model
 
 Make the default safe for real applications.
@@ -114,12 +138,10 @@ Make the default safe for real applications.
 - Require server-defined named shapes.
 - Require column allowlists.
 - Run authorization in host app code before serving a shape.
-- Support TypeScript app servers as the authorization boundary by
-  proxying browser Shape requests to an internal Electrolite origin with
-  scoped headers.
-- Keep sidecar deployment optional. The protocol is embedded-first; the
-  TypeScript bridge exists so TypeScript apps can own authorization until
-  native Node/Bun bindings exist.
+- Support TypeScript app servers as the authorization boundary through
+  the native Node/Bun package. The older proxy-to-internal-origin bridge
+  remains a fallback deployment model.
+- Keep sidecar deployment optional. The protocol is embedded-first.
 - Include auth scope in shape handles.
 - Keep raw `_electrolite_log` private.
 - Add optional signed shape URLs for proxy/CDN/object-store delivery.

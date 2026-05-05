@@ -1,0 +1,20 @@
+[package]
+name = "electrolite-node-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+electrolite-core.workspace = true
+electrolite-sqlite.workspace = true
+napi.workspace = true
+napi-derive.workspace = true
+rusqlite.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+

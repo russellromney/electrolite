@@ -1,0 +1,16 @@
+{
+  "name": "@electrolite/node",
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./electrolite-node.d.ts",
+      "default": "./electrolite-node.js"
+    }
+  },
+  "scripts": {
+    "build:native": "node scripts/build-native.mjs",
+    "test": "node scripts/build-native.mjs && node --test electrolite-node.test.mjs"
+  }
+}
+
