@@ -361,14 +361,47 @@ pub fn read_log_since(
     offset: i64,
     limit: i64,
 ) -> Result<Vec<LogRow>> {
-    let mut out = read_log_since_limited(conn, table_name, offset, limit)?;
-    if out.len() == limit.max(0) as usize {
-        if let Some(last) = out.last() {
+    Ok(read_log_page_since(conn, table_name, offset, limit)?.rows)
+}
+
+#[derive(Debug)]
+struct LogPage {
+    rows: Vec<LogRow>,
+    up_to_date: bool,
+}
+
+fn read_log_page_since(
+    conn: &Connection,
+    table_name: &str,
+    offset: i64,
+    limit: i64,
+) -> Result<LogPage> {
+    let limit = limit.max(0);
+    let mut rows = read_log_since_limited(conn, table_name, offset, limit)?;
+    if limit > 0 && rows.len() == limit as usize {
+        if let Some(last) = rows.last() {
             let mut rest = read_log_batch_after(conn, table_name, last.seq, &last.batch_id)?;
-            out.append(&mut rest);
+            rows.append(&mut rest);
         }
     }
-    Ok(out)
+
+    let latest = rows.last().map(|row| row.seq).unwrap_or(offset);
+    Ok(LogPage {
+        rows,
+        up_to_date: !table_has_log_after(conn, table_name, latest)?,
+    })
+}
+
+fn table_has_log_after(conn: &Connection, table_name: &str, offset: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        "
+        SELECT EXISTS(
+          SELECT 1 FROM _electrolite_log WHERE table_name = ?1 AND seq > ?2
+        )
+        ",
+        params![table_name, offset],
+        |row| row.get::<_, bool>(0),
+    )?)
 }
 
 fn read_log_since_limited(
@@ -572,29 +605,50 @@ pub fn replay(conn: &Connection, shape: &Shape, offset: i64, limit: i64) -> Resu
     let watched = inspect_table_primary_key(conn, &shape.table)?;
     validate_shape_columns(&watched, shape)?;
     require_watched_table(conn, shape, &watched)?;
-    let retained_offset = retained_lower_bound_for_table(conn, &shape.table)?;
-    if offset < retained_offset {
-        return Err(Error::ResyncRequired {
-            requested_offset: offset,
-            retained_offset,
-        });
-    }
-
-    let rows = read_log_since(conn, &shape.table, offset, limit)?;
     let normalized_shape = normalize_shape_predicate(&watched, shape)?;
-    let mut messages = Vec::new();
-    let mut latest = offset;
 
-    for row in rows {
-        latest = latest.max(row.seq);
-        messages.extend(electrolite_core::messages_for_log(&normalized_shape, &row));
-    }
+    read_transaction(conn, |conn| {
+        let retained_offset = retained_lower_bound_for_table_unbootstrapped(conn, &shape.table)?;
+        if offset < retained_offset {
+            return Err(Error::ResyncRequired {
+                requested_offset: offset,
+                retained_offset,
+            });
+        }
 
-    Ok(Replay {
-        messages,
-        offset: latest,
-        up_to_date: true,
+        let page = read_log_page_since(conn, &shape.table, offset, limit)?;
+        let mut messages = Vec::new();
+        let mut latest = offset;
+
+        for row in page.rows {
+            latest = latest.max(row.seq);
+            messages.extend(electrolite_core::messages_for_log(&normalized_shape, &row));
+        }
+
+        Ok(Replay {
+            messages,
+            offset: latest,
+            up_to_date: page.up_to_date,
+        })
     })
+}
+
+fn read_transaction<T>(
+    conn: &Connection,
+    read: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    conn.execute_batch("BEGIN DEFERRED TRANSACTION")?;
+    let out = read(conn);
+    match out {
+        Ok(out) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(out)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 fn normalize_shape_predicate(watched: &WatchedTable, shape: &Shape) -> Result<Shape> {
@@ -652,6 +706,10 @@ fn normalize_predicate_value(
 
 pub fn retained_lower_bound(conn: &Connection) -> Result<i64> {
     bootstrap(conn)?;
+    retained_lower_bound_unbootstrapped(conn)
+}
+
+fn retained_lower_bound_unbootstrapped(conn: &Connection) -> Result<i64> {
     let stored_offset = conn
         .query_row(
             "SELECT value FROM _electrolite_meta WHERE key = ?1",
@@ -669,6 +727,13 @@ pub fn retained_lower_bound(conn: &Connection) -> Result<i64> {
 
 pub fn retained_lower_bound_for_table(conn: &Connection, table_name: &str) -> Result<i64> {
     bootstrap(conn)?;
+    retained_lower_bound_for_table_unbootstrapped(conn, table_name)
+}
+
+fn retained_lower_bound_for_table_unbootstrapped(
+    conn: &Connection,
+    table_name: &str,
+) -> Result<i64> {
     let stored_offset = conn
         .query_row(
             "SELECT value FROM _electrolite_meta WHERE key = ?1",
@@ -1197,6 +1262,7 @@ mod tests {
     use super::*;
     use electrolite_core::{Predicate, Shape, ShapeMessage};
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     fn setup(conn: &Connection) {
         conn.execute_batch(
@@ -1223,6 +1289,108 @@ mod tests {
             },
             auth_scope: "public".to_string(),
             schema_version: 1,
+        }
+    }
+
+    #[derive(Debug)]
+    struct MaterializedShape {
+        key_columns: Vec<String>,
+        offset: i64,
+        rows: BTreeMap<String, Value>,
+        pending_rows: Option<BTreeMap<String, Value>>,
+        pending_changed: bool,
+    }
+
+    impl MaterializedShape {
+        fn from_snapshot(snapshot: Snapshot) -> Self {
+            let mut out = Self {
+                key_columns: snapshot.key_columns,
+                offset: snapshot.offset,
+                rows: BTreeMap::new(),
+                pending_rows: None,
+                pending_changed: false,
+            };
+            for row in snapshot.rows {
+                out.rows.insert(out.key_for_row(&row), row);
+            }
+            out
+        }
+
+        fn apply_replay(&mut self, replay: Replay) -> bool {
+            let mut changed = false;
+            let mut rows = self
+                .pending_rows
+                .clone()
+                .unwrap_or_else(|| self.rows.clone());
+            for message in replay.messages {
+                changed = Self::apply_message_to(&mut rows, message) || changed;
+            }
+            self.offset = replay.offset;
+            if !replay.up_to_date {
+                self.pending_rows = Some(rows);
+                self.pending_changed = self.pending_changed || changed;
+                return false;
+            }
+
+            changed = self.pending_changed || changed;
+            self.rows = rows;
+            self.pending_rows = None;
+            self.pending_changed = false;
+            changed
+        }
+
+        fn values(&self) -> Vec<Value> {
+            self.rows.values().cloned().collect()
+        }
+
+        fn key_for_row(&self, row: &Value) -> String {
+            let mut key = serde_json::Map::new();
+            for column in &self.key_columns {
+                key.insert(column.clone(), row[column].clone());
+            }
+            Self::key_to_string(&Value::Object(key))
+        }
+
+        fn apply_message_to(rows: &mut BTreeMap<String, Value>, message: ShapeMessage) -> bool {
+            match message {
+                ShapeMessage::Insert { key, value, .. }
+                | ShapeMessage::Update { key, value, .. } => {
+                    rows.insert(Self::key_to_string(&key), value);
+                    true
+                }
+                ShapeMessage::Delete { key, .. } => {
+                    rows.remove(&Self::key_to_string(&key)).is_some()
+                }
+            }
+        }
+
+        fn key_to_string(key: &Value) -> String {
+            serde_json::to_string(key).unwrap()
+        }
+    }
+
+    fn authoritative_rows(conn: &Connection, shape: &Shape) -> Vec<Value> {
+        let snapshot = initial_snapshot(conn, shape).unwrap();
+        let materialized = MaterializedShape::from_snapshot(snapshot);
+        materialized.values()
+    }
+
+    fn sync_until_up_to_date(
+        conn: &Connection,
+        shape: &Shape,
+        materialized: &mut MaterializedShape,
+        limit: i64,
+    ) -> usize {
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            let replayed = replay(conn, shape, materialized.offset, limit).unwrap();
+            let up_to_date = replayed.up_to_date;
+            materialized.apply_replay(replayed);
+            if up_to_date {
+                return pages;
+            }
+            assert!(pages < 32, "replay did not reach up_to_date");
         }
     }
 
@@ -1415,6 +1583,134 @@ mod tests {
             replayed.messages[0],
             ShapeMessage::Delete { ref key, offset: 5 } if *key == json!({"id": 2})
         ));
+    }
+
+    #[test]
+    fn bounded_replay_reports_up_to_date_only_at_consistency_boundary() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let shape = active_users_shape();
+
+        for id in 1..=3 {
+            conn.execute(
+                "INSERT INTO users (id, name, active) VALUES (?1, ?2, 1)",
+                (id, format!("user {id}")),
+            )
+            .unwrap();
+        }
+
+        let first = replay(&conn, &shape, 0, 1).unwrap();
+        assert_eq!(first.offset, 1);
+        assert!(!first.up_to_date);
+        assert_eq!(first.messages.len(), 1);
+
+        let second = replay(&conn, &shape, first.offset, 1).unwrap();
+        assert_eq!(second.offset, 2);
+        assert!(!second.up_to_date);
+
+        let third = replay(&conn, &shape, second.offset, 1).unwrap();
+        assert_eq!(third.offset, 3);
+        assert!(third.up_to_date);
+    }
+
+    #[test]
+    fn semantic_oracle_converges_across_membership_batches_pk_changes_and_compaction() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE todos (
+              id INTEGER PRIMARY KEY,
+              project_id TEXT NOT NULL,
+              title TEXT NOT NULL,
+              done BOOLEAN NOT NULL DEFAULT 0,
+              rank INTEGER
+            );
+            ",
+        )
+        .unwrap();
+        install_triggers_auto(&conn, "todos").unwrap();
+        let shape = Shape {
+            name: "doneP1Todos".to_string(),
+            table: "todos".to_string(),
+            columns: vec![
+                "id".to_string(),
+                "project_id".to_string(),
+                "title".to_string(),
+                "done".to_string(),
+                "rank".to_string(),
+            ],
+            predicate: Predicate::And {
+                predicates: vec![
+                    Predicate::Eq {
+                        column: "project_id".to_string(),
+                        value: json!("p1"),
+                    },
+                    Predicate::Eq {
+                        column: "done".to_string(),
+                        value: json!(true),
+                    },
+                ],
+            },
+            auth_scope: "project:p1".to_string(),
+            schema_version: 1,
+        };
+
+        conn.execute_batch(
+            "
+            INSERT INTO todos (id, project_id, title, done, rank) VALUES
+              (1, 'p1', 'visible', 1, 10),
+              (2, 'p2', 'other project', 1, 20),
+              (3, 'p1', 'not done', 0, 30);
+            ",
+        )
+        .unwrap();
+        let mut materialized =
+            MaterializedShape::from_snapshot(initial_snapshot(&conn, &shape).unwrap());
+        assert_eq!(materialized.values(), authoritative_rows(&conn, &shape));
+
+        let operations: &[&str] = &[
+            "UPDATE todos SET title='still private' WHERE id=2",
+            "UPDATE todos SET project_id='p1' WHERE id=2",
+            "UPDATE todos SET title='visible updated' WHERE id=1",
+            "UPDATE todos SET done=1 WHERE id=3",
+            "UPDATE todos SET project_id='p3' WHERE id=1",
+            "DELETE FROM todos WHERE id=1",
+        ];
+        for operation in operations {
+            conn.execute(operation, []).unwrap();
+            sync_until_up_to_date(&conn, &shape, &mut materialized, 1);
+            assert_eq!(materialized.values(), authoritative_rows(&conn, &shape));
+        }
+
+        change_batch(&mut conn, |tx| {
+            tx.execute(
+                "INSERT INTO todos (id, project_id, title, done, rank) VALUES (4, 'p1', 'batch one', 1, 40)",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO todos (id, project_id, title, done, rank) VALUES (5, 'p1', 'batch two', 1, 50)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let pages = sync_until_up_to_date(&conn, &shape, &mut materialized, 1);
+        assert_eq!(
+            pages, 1,
+            "Electrolite batches must not be split across replay pages"
+        );
+        assert_eq!(materialized.values(), authoritative_rows(&conn, &shape));
+
+        conn.execute("UPDATE todos SET id=40 WHERE id=4", [])
+            .unwrap();
+        sync_until_up_to_date(&conn, &shape, &mut materialized, 1);
+        assert_eq!(materialized.values(), authoritative_rows(&conn, &shape));
+
+        compact_log_to_last_for_table(&conn, "todos", 4).unwrap();
+        conn.execute("UPDATE todos SET rank=NULL WHERE id=5", [])
+            .unwrap();
+        sync_until_up_to_date(&conn, &shape, &mut materialized, 1);
+        assert_eq!(materialized.values(), authoritative_rows(&conn, &shape));
     }
 
     #[test]
@@ -1617,6 +1913,39 @@ mod tests {
     }
 
     #[test]
+    fn quiet_tables_are_not_forced_to_resync_by_unrelated_compaction() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        conn.execute_batch(
+            "
+            CREATE TABLE projects (
+              id INTEGER PRIMARY KEY,
+              name TEXT NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+        install_triggers(&conn, "projects", "id").unwrap();
+        let users_shape = active_users_shape();
+
+        let users_snapshot = initial_snapshot(&conn, &users_shape).unwrap();
+        assert_eq!(users_snapshot.offset, 0);
+        for id in 1..=5 {
+            conn.execute(
+                "INSERT INTO projects (id, name) VALUES (?1, ?2)",
+                (id, format!("project {id}")),
+            )
+            .unwrap();
+        }
+
+        compact_log_to_last(&conn, 0).unwrap();
+        let replayed = replay(&conn, &users_shape, users_snapshot.offset, 10).unwrap();
+        assert_eq!(replayed.offset, 0);
+        assert!(replayed.up_to_date);
+        assert!(replayed.messages.is_empty());
+    }
+
+    #[test]
     fn boolean_predicates_are_normalized_for_declared_boolean_columns() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -1682,6 +2011,55 @@ mod tests {
             err,
             Error::UnsupportedPredicateValue { ref shape, ref value }
                 if shape == "activeUsersBool" && value == &json!(true)
+        ));
+    }
+
+    #[test]
+    fn ambiguous_text_and_numeric_predicate_values_are_rejected() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE typed_values (
+              id INTEGER PRIMARY KEY,
+              count INTEGER NOT NULL,
+              label TEXT NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+        install_triggers_auto(&conn, "typed_values").unwrap();
+
+        let numeric_string = Shape {
+            name: "numericString".to_string(),
+            table: "typed_values".to_string(),
+            columns: vec!["id".to_string(), "count".to_string(), "label".to_string()],
+            predicate: Predicate::Eq {
+                column: "count".to_string(),
+                value: json!("1"),
+            },
+            auth_scope: "public".to_string(),
+            schema_version: 1,
+        };
+        let err = initial_snapshot(&conn, &numeric_string).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::UnsupportedPredicateValue { ref shape, ref value }
+                if shape == "numericString" && value == &json!("1")
+        ));
+
+        let text_number = Shape {
+            name: "textNumber".to_string(),
+            predicate: Predicate::Eq {
+                column: "label".to_string(),
+                value: json!(1),
+            },
+            ..numeric_string
+        };
+        let err = initial_snapshot(&conn, &text_number).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::UnsupportedPredicateValue { ref shape, ref value }
+                if shape == "textNumber" && value == &json!(1)
         ));
     }
 

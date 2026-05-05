@@ -118,6 +118,11 @@ response reaches its `up_to_date` boundary.
 If replay returns `409 resync_required`, the client clears materialized
 rows and restarts from `offset=-1`.
 
+Replay reads pin one SQLite snapshot for the retained-offset check, log
+page read, and `up_to_date` decision. A bounded replay page reports
+`up_to_date: false` when more table log rows remain after the returned
+offset, so clients can stage partial pages until a consistency boundary.
+
 ## Membership Transitions
 
 For each log row:

@@ -287,6 +287,45 @@ impl ShapeIndex {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct AffectedShape {
+    pub shape: Shape,
+    pub messages: Vec<ShapeMessage>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ShapeLogBroker {
+    index: ShapeIndex,
+}
+
+impl ShapeLogBroker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&mut self, shape: Shape) -> Option<Shape> {
+        self.index.add(shape)
+    }
+
+    pub fn affected_shapes(&self, row: &LogRow) -> Vec<AffectedShape> {
+        self.index
+            .candidates_for_log(row)
+            .into_iter()
+            .filter_map(|shape| {
+                let messages = messages_for_log(shape, row);
+                if messages.is_empty() {
+                    None
+                } else {
+                    Some(AffectedShape {
+                        shape: shape.clone(),
+                        messages,
+                    })
+                }
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct EqIndexKey {
     table: String,
@@ -613,6 +652,34 @@ mod tests {
     }
 
     #[test]
+    fn invisible_updates_and_deletes_do_not_reveal_keys() {
+        let shape = shape();
+        let invisible_update = LogRow {
+            seq: 5,
+            batch_id: "batch".to_string(),
+            table_name: "users".to_string(),
+            op: LogOp::Update,
+            pk_json: json!({"id": 99}),
+            old_pk_json: Some(json!({"id": 99})),
+            new_pk_json: Some(json!({"id": 99})),
+            old_json: Some(json!({"id": 99, "name": "Private", "active": 0})),
+            new_json: Some(json!({"id": 99, "name": "Still Private", "active": 0})),
+            created_at: 0,
+        };
+        assert!(messages_for_log(&shape, &invisible_update).is_empty());
+
+        let invisible_delete = LogRow {
+            seq: 6,
+            op: LogOp::Delete,
+            new_pk_json: None,
+            old_json: Some(json!({"id": 99, "name": "Still Private", "active": 0})),
+            new_json: None,
+            ..invisible_update
+        };
+        assert!(messages_for_log(&shape, &invisible_delete).is_empty());
+    }
+
+    #[test]
     fn predicate_eq_terms_collect_nested_and_terms() {
         let predicate = Predicate::And {
             predicates: vec![
@@ -877,6 +944,49 @@ mod tests {
         index.add(alias_private);
         assert_eq!(index.len(), 2);
         assert_eq!(index.candidates_for_log(&row).len(), 2);
+    }
+
+    #[test]
+    fn shape_log_broker_returns_only_exactly_affected_shapes() {
+        let mut active = shape();
+        active.name = "activeUsers".to_string();
+
+        let mut inactive = shape();
+        inactive.name = "inactiveUsers".to_string();
+        inactive.predicate = Predicate::Eq {
+            column: "active".to_string(),
+            value: json!(0),
+        };
+
+        let mut broker = ShapeLogBroker::new();
+        broker.add(active);
+        broker.add(inactive);
+
+        let row = LogRow {
+            seq: 7,
+            batch_id: "batch".to_string(),
+            table_name: "users".to_string(),
+            op: LogOp::Update,
+            pk_json: json!({"id": 1}),
+            old_pk_json: Some(json!({"id": 1})),
+            new_pk_json: Some(json!({"id": 1})),
+            old_json: Some(json!({"id": 1, "name": "Ada", "active": 0})),
+            new_json: Some(json!({"id": 1, "name": "Ada", "active": 1})),
+            created_at: 0,
+        };
+
+        let mut affected = broker.affected_shapes(&row);
+        affected.sort_by(|a, b| a.shape.name.cmp(&b.shape.name));
+        assert!(matches!(
+            affected[0].messages.as_slice(),
+            [ShapeMessage::Insert { key, offset: 7, .. }] if key == &json!({"id": 1})
+        ));
+        assert_eq!(affected[0].shape.name, "activeUsers");
+        assert!(matches!(
+            affected[1].messages.as_slice(),
+            [ShapeMessage::Delete { key, offset: 7 }] if key == &json!({"id": 1})
+        ));
+        assert_eq!(affected[1].shape.name, "inactiveUsers");
     }
 
     fn shape_with_name(name: &str) -> Shape {
