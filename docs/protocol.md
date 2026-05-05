@@ -123,6 +123,13 @@ page read, and `up_to_date` decision. A bounded replay page reports
 `up_to_date: false` when more table log rows remain after the returned
 offset, so clients can stage partial pages until a consistency boundary.
 
+Internally, replay is represented as a Shape replay page with a
+`ShapeCursor`: the Shape handle, source log offset, retained source
+offset, and source start/end offsets for the page. The public protocol
+still exposes the familiar `offset` field, but the engine keeps the
+Shape-native cursor metadata needed for retention, chunking, and fanout
+work.
+
 ## Membership Transitions
 
 For each log row:

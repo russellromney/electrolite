@@ -25,12 +25,16 @@ export class Electrolite {
       replayLimit = 1000,
       liveTimeoutMs = 20_000,
       pollIntervalMs = 250,
+      connectionPoolSize = 1,
     } = options;
     if (!dbPath) {
       throw new Error("createElectrolite requires dbPath");
     }
 
-    this.native = new native.NativeElectrolite(String(dbPath));
+    this.native = new native.NativeElectrolite(
+      String(dbPath),
+      Math.max(1, Number(connectionPoolSize)),
+    );
     this.shapes = shapes;
     this.prefix = normalizePrefix(prefix);
     this.replayLimit = replayLimit;

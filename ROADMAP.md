@@ -118,13 +118,14 @@ library, with Rust kept behind the package boundary.
   Web Fetch handler.
 - The package exposes trigger installation, ordinary writes, explicit
   Electrolite write batches, retention compaction, and live wakeups.
+- The package owns a bounded native SQLite connection pool, defaulting
+  to one connection for SQLite-friendly embedded operation.
 - End-to-end tests exercise the user-facing flow: TypeScript route,
   dynamic authorized Shape, native SQLite triggers/log replay, browser
   `ShapeClient`, and live long-poll delivery.
 
 ### Remaining Work
 
-- Replace per-call SQLite opens with a small native connection pool.
 - Publish prebuilt native artifacts for the main Node/Bun platforms.
 - Add IndexedDB persistence, React hooks, and multi-tab support in the
   browser package.

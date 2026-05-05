@@ -409,6 +409,42 @@ pub struct Replay {
     pub up_to_date: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShapeCursor {
+    pub shape_handle: String,
+    pub source_offset: i64,
+    pub retained_source_offset: i64,
+}
+
+impl ShapeCursor {
+    pub fn new(shape: &Shape, source_offset: i64, retained_source_offset: i64) -> Self {
+        Self {
+            shape_handle: shape.handle(),
+            source_offset,
+            retained_source_offset,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShapeReplayPage {
+    pub cursor: ShapeCursor,
+    pub messages: Vec<ShapeMessage>,
+    pub source_offset_start: i64,
+    pub source_offset_end: i64,
+    pub up_to_date: bool,
+}
+
+impl ShapeReplayPage {
+    pub fn replay(&self) -> Replay {
+        Replay {
+            messages: self.messages.clone(),
+            offset: self.cursor.source_offset,
+            up_to_date: self.up_to_date,
+        }
+    }
+}
+
 pub fn message_for_log(shape: &Shape, row: &LogRow) -> Option<ShapeMessage> {
     messages_for_log(shape, row).into_iter().next()
 }

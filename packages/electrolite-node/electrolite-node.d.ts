@@ -40,6 +40,7 @@ export interface ElectroliteOptions<TContext = unknown> {
   replayLimit?: number;
   liveTimeoutMs?: number;
   pollIntervalMs?: number;
+  connectionPoolSize?: number;
 }
 
 export interface InstallResult {
@@ -83,4 +84,3 @@ export declare const inList: (
 export declare const and: (
   predicates: ElectrolitePredicate[],
 ) => ElectrolitePredicate;
-

@@ -125,6 +125,7 @@ function setup() {
     dbPath,
     liveTimeoutMs: 500,
     pollIntervalMs: 10,
+    connectionPoolSize: 2,
     shapes: {
       projectTodos: shape({
         table: "todos",

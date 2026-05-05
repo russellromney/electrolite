@@ -27,6 +27,7 @@ import { createElectrolite, eq, shape } from "@electrolite/node";
 
 const electrolite = createElectrolite<{ user: { projects: Set<string> } }>({
   dbPath: "./app.db",
+  connectionPoolSize: 1,
   shapes: {
     projectTodos: shape({
       table: "todos",
@@ -124,8 +125,8 @@ snapshot.
 
 - Predicates are intentionally Shape-oriented, not arbitrary SQL:
   `all`, equality, `IN`, and conjunction.
-- The native package opens SQLite connections per call today. The Rust
-  embedded server already has pooling; the Node package should grow a
-  small connection pool next.
+- The native package owns a small bounded SQLite connection pool. The
+  default size is `1`, which is conservative for SQLite; increase
+  `connectionPoolSize` when read concurrency matters.
 - IndexedDB persistence, React hooks, and multi-tab coordination belong
   in the browser client and are not implemented yet.

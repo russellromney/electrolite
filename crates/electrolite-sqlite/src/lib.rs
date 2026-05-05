@@ -1,4 +1,6 @@
-use electrolite_core::{LogOp, LogRow, Predicate, Replay, Shape, Snapshot};
+use electrolite_core::{
+    LogOp, LogRow, Predicate, Replay, Shape, ShapeCursor, ShapeReplayPage, Snapshot,
+};
 use rusqlite::{Connection, OptionalExtension, ToSql, params};
 use serde_json::{Number, Value};
 use std::collections::HashMap;
@@ -601,6 +603,15 @@ fn add_column_if_missing(
 }
 
 pub fn replay(conn: &Connection, shape: &Shape, offset: i64, limit: i64) -> Result<Replay> {
+    Ok(replay_page(conn, shape, offset, limit)?.replay())
+}
+
+pub fn replay_page(
+    conn: &Connection,
+    shape: &Shape,
+    offset: i64,
+    limit: i64,
+) -> Result<ShapeReplayPage> {
     bootstrap(conn)?;
     let watched = inspect_table_primary_key(conn, &shape.table)?;
     validate_shape_columns(&watched, shape)?;
@@ -625,9 +636,11 @@ pub fn replay(conn: &Connection, shape: &Shape, offset: i64, limit: i64) -> Resu
             messages.extend(electrolite_core::messages_for_log(&normalized_shape, &row));
         }
 
-        Ok(Replay {
+        Ok(ShapeReplayPage {
+            cursor: ShapeCursor::new(&normalized_shape, latest, retained_offset),
             messages,
-            offset: latest,
+            source_offset_start: offset,
+            source_offset_end: latest,
             up_to_date: page.up_to_date,
         })
     })
@@ -1611,6 +1624,34 @@ mod tests {
         let third = replay(&conn, &shape, second.offset, 1).unwrap();
         assert_eq!(third.offset, 3);
         assert!(third.up_to_date);
+    }
+
+    #[test]
+    fn replay_page_exposes_shape_cursor_metadata_without_changing_replay_contract() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let shape = active_users_shape();
+
+        for id in 1..=2 {
+            conn.execute(
+                "INSERT INTO users (id, name, active) VALUES (?1, ?2, 1)",
+                (id, format!("user {id}")),
+            )
+            .unwrap();
+        }
+
+        let page = replay_page(&conn, &shape, 0, 1).unwrap();
+        assert_eq!(page.cursor.shape_handle, shape.handle());
+        assert_eq!(page.cursor.retained_source_offset, 0);
+        assert_eq!(page.cursor.source_offset, 1);
+        assert_eq!(page.source_offset_start, 0);
+        assert_eq!(page.source_offset_end, 1);
+        assert!(!page.up_to_date);
+
+        let public_replay = page.replay();
+        assert_eq!(public_replay.offset, 1);
+        assert_eq!(public_replay.up_to_date, false);
+        assert_eq!(public_replay.messages.len(), 1);
     }
 
     #[test]
