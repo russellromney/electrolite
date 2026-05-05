@@ -21,7 +21,8 @@ SQLite triggers, a durable change log, and an ordinary HTTP endpoint. The
 backend runs in plain Node using Node's built-in SQLite API. There is no
 native build, sidecar, npm install step, or separate sync service.
 The same small protocol can also be implemented by other embedded
-engines, starting with a tiny Python engine for Flask-style apps.
+engines. Experimental ports exist for Python, Rust, Go, and Elixir under
+[engines/](engines/).
 
 > **Experimental software.**
 

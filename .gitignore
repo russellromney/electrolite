@@ -8,3 +8,6 @@ build/
 target/
 Cargo.lock
 packages/electrolite-node/native/*.node
+engines/elixir/_build/
+engines/elixir/deps/
+engines/elixir/mix.lock
