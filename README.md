@@ -2,17 +2,19 @@
 
 Electric-style sync for SQLite apps, embeddable in your app.
 
-Electrolite lets your app say: this browser is allowed to see this slice of SQLite rows, so send the rows now and keep them updated when SQLite changes.
+Electrolite brings Electric-style reactive Shapes to SQLite. Your app
+defines a subset of rows once, the browser gets an initial snapshot, and
+then SQLite changes stream into the browser as live logical updates.
 
 Example: a user opens project `p1`. The browser should see todos where
 `project_id = "p1"`. If another request inserts, updates, moves, or
 deletes one of those todos, the browser should update without a full page
 refresh.
 
-That is the basic [ElectricSQL](https://electric-sql.com/) idea, but for
-SQLite. Electric's [Electric Sync](https://electric.ax/docs/sync/) does
-this for Postgres. It exposes selected subsets of database rows called
-Shapes, sends an initial snapshot, then sends live logical changes.
+[ElectricSQL](https://electric-sql.com/)'s [Electric Sync](https://electric.ax/docs/sync/)
+does this for Postgres: it exposes selected subsets of database rows
+called Shapes, sends an initial snapshot, then sends live logical
+changes. Electrolite is that idea for SQLite.
 
 Electrolite does the SQLite version inside your TypeScript app using
 SQLite triggers, a durable change log, and an ordinary HTTP endpoint. The
