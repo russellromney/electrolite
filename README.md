@@ -33,8 +33,6 @@ no native build, sidecar, npm install step, or separate sync service.
 
 > **Experimental software.**
 
-![Electrolite demo showing SQLite writes on the left and a live browser subscriber on the right](docs/assets/demo.png)
-
 ## Why This Is Interesting
 
 - SQLite becomes a live backend for browser state.
@@ -105,6 +103,8 @@ That starts a tiny two-column web app: the left side writes todos to
 SQLite, and the right side subscribes to the live Shape. Add, rename,
 delete, and batch-write todos; the subscriber updates through
 Electrolite.
+
+<img src="docs/assets/demo.png" alt="Electrolite demo showing SQLite writes on the left and a live browser subscriber on the right" width="520">
 
 Console demo:
 
@@ -319,9 +319,6 @@ You do not need to run a separate sync service for this path.
   package using Node's built-in SQLite API.
 - `clients/browser` - dependency-free browser materializer for Shape
   snapshots and live replay messages.
-- `clients/python` - dependency-free synchronous Python materializer for
-  consuming Electrolite HTTP Shapes from scripts, tests, or Python
-  services.
 
 ## Goals
 
@@ -387,7 +384,6 @@ This is still early, but the main TypeScript path works end to end:
 - replay messages include `batch_id` for real batch grouping
 - explicit TypeScript write batches for consistency boundaries
 - E2E tests for the browser/client/backend flow
-- basic Python client for consuming Shape HTTP endpoints
 - basic real web app example
 
 Still rough:

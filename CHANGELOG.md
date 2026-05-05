@@ -26,7 +26,6 @@ SQLite sync.
 - Browser `ShapeClient` with IndexedDB persistence, `log_id` and
   `shape_handle` validation, replay draining, retry/backoff, status
   events, low-level replay events, and multi-tab coordination.
-- Python materializer client for consuming Shape HTTP endpoints.
 - Tiny console demo and two-column web app demo.
 - Local live fanout demo, defaulting to 100 in-process Shape clients and
   configurable with `ELECTROLITE_FANOUT_CLIENTS`.
