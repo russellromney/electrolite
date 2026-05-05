@@ -1,62 +1,203 @@
 # electrolite
 
-Fast Electric-style sync for SQLite, exposed as a TypeScript package.
+Electric-style sync for SQLite apps, written for TypeScript.
 
-Electrolite lets a normal TypeScript app say: "this browser can see this
-subset of SQLite rows; keep it updated." The app defines the subset and
-authorization rules. The browser gets an initial result, then receives
-inserts, updates, and deletes as the database changes.
+Electrolite lets your app say:
 
-The database work is fast Rust under the hood, loaded through a native
-Node/Bun package. The app code stays TypeScript.
+> This browser is allowed to see this slice of SQLite rows. Send the rows
+> now, then keep them updated when SQLite changes.
 
-Electrolite is a TypeScript-first embedded sync library inspired directly by
-[ElectricSQL](https://electric-sql.com/) and its
-[Electric Sync](https://electric.ax/docs/sync/) engine. Electric Sync is
-a Postgres read-path sync engine: it consumes Postgres logical
-replication, exposes selected subsets of database rows called Shapes over
-HTTP, and lets clients materialize those Shapes with an initial sync
-followed by live logical updates.
+Example: a user opens project `p1`. The browser should see todos where
+`project_id = "p1"`. If another request inserts, updates, moves, or
+deletes one of those todos, the browser should update without a full page
+refresh.
 
-Electrolite tries to preserve that lifecycle for SQLite without requiring
-a separate sync daemon. Apps use the `@electrolite/node` API from
-Node/Bun, while the hot path runs in Rust underneath through a native
-Node-API binding.
+That is the basic [ElectricSQL](https://electric-sql.com/) idea, but for
+SQLite. Electric's [Electric Sync](https://electric.ax/docs/sync/) does
+this for Postgres. It exposes selected subsets of database rows called
+Shapes, sends an initial snapshot, then sends live logical changes.
 
-The intended architecture:
+Electrolite keeps that lifecycle, but embedded in your app:
 
 ```text
-SQLite + generated triggers
-  -> durable logical change log
-  -> TypeScript app-embedded HTTP sync endpoint
-  -> browser client consumes snapshot + offset log
+your TypeScript app
+  -> SQLite
+  -> Electrolite generated triggers
+  -> durable change log
+  -> HTTP endpoint in your app
+  -> browser gets snapshot + live changes
 ```
 
-The semantic core is a trigger-backed logical log. Honker-style commit
-wakes, Walrust physical replication, and S3/Cinch object storage are
-useful accelerants, but not required for the first version.
+The backend runs in plain Node using Node's built-in SQLite API. There is
+no native build, sidecar, npm install step, or separate sync service.
 
-## Try It
+> **Experimental software.**
 
-Electrolite is not published to npm yet. From this repository:
+## Why This Is Interesting
+
+- SQLite becomes a live backend for browser state.
+- The browser never sends SQL.
+- Auth stays in your app.
+- The sync endpoint is just a normal `Request -> Response` handler.
+- It is small enough to read.
+
+## What Works Now
+
+- The server defines what rows a browser may see.
+- The server checks auth before SQLite is touched.
+- The browser asks for a named row set, not arbitrary SQL.
+- The browser gets current rows first.
+- Then the browser long-polls for inserts, updates, and deletes.
+- Writes through the embedded TypeScript API wake only affected live
+  requests.
+- Browser rows can persist in IndexedDB and resume after reload.
+- Explicit write batches keep replay from publishing half a batch.
+
+## Tiny Example
+
+You define a server-owned row set:
+
+```ts
+projectTodos: shape({
+  table: "todos",
+  columns: ["id", "project_id", "title", "done"],
+  params: ["projectId"],
+  where: ({ params }) => eq("project_id", params.projectId),
+  authorize: ({ params, context }) => {
+    return context.user.projects.has(params.projectId);
+  },
+})
+```
+
+Then a browser can subscribe to:
+
+```text
+/electrolite/v1/projectTodos/p1
+```
+
+Meaning:
+
+```text
+Give me todos for project p1, if this user is allowed to see p1.
+Then keep me updated.
+```
+
+## Try It In 30 Seconds
+
+Electrolite is not published to npm yet. For now, the easiest path is to
+use this repository directly. You need Node 24 or newer.
 
 ```sh
-cd packages/electrolite-node
-npm run build:native
-cd ../..
-node examples/basic-todos/demo.mjs
+git clone https://github.com/russellromney/electrolite.git
+cd electrolite
+npm run demo:web
 ```
 
-The demo creates a temporary SQLite database, defines a `projectTodos`
-Shape, materializes it with the browser client, writes a new row through
-the TypeScript API, and shows the browser-side rows updating. It also
-shows that an unauthorized Shape request returns `404`.
+Then open:
 
-## Shape Definition
+```text
+http://localhost:3000
+```
 
-A Shape is a client-consumable subset of a database, delivered as an HTTP
-log that starts with current rows and then continues with inserts,
-updates, and deletes.
+That starts a tiny two-column web app: the left side writes todos to
+SQLite, and the right side subscribes to the live Shape. Add, rename,
+delete, and batch-write todos; the subscriber updates through
+Electrolite.
+
+Console demo:
+
+```sh
+npm run demo:console
+```
+
+The demo creates a temporary SQLite database, defines `projectTodos`,
+loads it with the browser client, writes a new row through the
+TypeScript API, and shows the browser-side rows updating. It also shows
+that an unauthorized request returns `404`.
+
+Tiny web app:
+
+```sh
+npm run demo:web
+```
+
+The page subscribes to `projectTodos/launch`. When you add a todo, the
+backend writes to SQLite and the browser updates from the live
+Electrolite Shape.
+
+## Semantic Coverage
+
+The Node implementation was checked against the previous reference
+implementation before the project went Node-only. The current test suite
+keeps those guarantees at the TypeScript API level:
+
+| Area | Covered behavior |
+|---|---|
+| Snapshot | rows, `log_id`, `shape_handle`, key metadata, and offset |
+| Replay | inserts, updates, deletes, bounded pages, and resync |
+| Live | long-poll waits wake only for Shapes affected by a write |
+| Predicates | `all`, `eq`, `in`, `and`, `null`, booleans, and type checks |
+| Keys | non-`id` keys, composite keys, and primary-key updates |
+| Retention | per-table lower bounds and `409 resync_required` |
+| Batches | explicit Electrolite batches keep a shared `batch_id` |
+| Browser | IndexedDB cache validation, retry, catch-up, and multi-tab state |
+
+## Use It Before npm
+
+Until packages are published, treat Electrolite like a vendored library:
+
+1. Add this repository to your app as a git submodule, subtree, or copied
+   `vendor/electrolite` folder.
+2. Import the TypeScript-facing backend API by path:
+
+```ts
+import {
+  createElectrolite,
+  eq,
+  shape,
+} from "./vendor/electrolite/packages/electrolite-node/electrolite-node.js";
+```
+
+3. Serve the browser client from your app, or copy
+   `clients/browser/electrolite.js` into your frontend bundle.
+
+The examples in this repo use the same path-import setup. There is no
+registry account, install token, or sidecar service involved.
+
+Electrolite uses Node's built-in SQLite engine:
+
+```ts
+const electrolite = createElectrolite({ dbPath: "./app.db" });
+```
+
+Run the main test suite:
+
+```sh
+npm test
+```
+
+Run every package test:
+
+```sh
+npm run test:all
+```
+
+## What Is A Shape?
+
+Electrolite exposes selected subsets of database rows called Shapes.
+
+A Shape is just:
+
+```text
+table + columns + filter + auth scope
+```
+
+Example Shapes:
+
+- todos for one project
+- photos owned by one user
+- events for one account
+- likes on photos this user may see
 
 In Electrolite today, a Shape is server-defined and contains:
 
@@ -69,23 +210,24 @@ In Electrolite today, a Shape is server-defined and contains:
 Browsers do not send arbitrary SQL. They request named Shapes that the
 host application has already defined and authorized.
 
-Plain-English examples:
-
-- `projectTodos/project-123`: todos for one project
-- `userPhotos/user-456`: photos owned by one user
-- `accountEvents/account-789`: event rows for one account
+That is the point. The browser can say "I want `projectTodos/p1`." It
+cannot say "run this SQL I made up."
 
 Applications can also register dynamic, server-owned Shape routes such
 as `/projects/:project_id/todos`. The route turns request path/auth
-context into a concrete Shape, and the normal authorizer still checks
-the generated authorization scope before SQLite is touched. TypeScript
-app servers define those routes directly with `@electrolite/node`, so
-browsers get Electric-style sync without being allowed to send SQL.
+context into a concrete Shape, and the normal authorizer checks the
+generated authorization scope before SQLite is touched.
 
 ## TypeScript Quick Start
 
+Backend:
+
 ```ts
-import { createElectrolite, eq, shape } from "@electrolite/node";
+import {
+  createElectrolite,
+  eq,
+  shape,
+} from "./vendor/electrolite/packages/electrolite-node/electrolite-node.js";
 
 const electrolite = createElectrolite<{ user: { projects: Set<string> } }>({
   dbPath: "./app.db",
@@ -121,40 +263,67 @@ export async function GET(request: Request) {
 }
 ```
 
-The browser requests `/electrolite/v1/projectTodos/project-123?offset=-1`
-for the initial Shape snapshot, then continues from the returned offset
-with ordinary replay or `live=true` long-polling.
+Browser:
+
+```ts
+import { ShapeClient } from "./vendor/electrolite/clients/browser/electrolite.js";
+
+const todos = new ShapeClient("/electrolite/v1/projectTodos/project-123");
+
+todos.subscribe((rows) => {
+  renderTodos(rows);
+});
+
+todos.start();
+```
+
+What happens:
+
+1. Browser asks for `/electrolite/v1/projectTodos/project-123?offset=-1`.
+2. Your TypeScript app checks the user can see `project-123`.
+3. Electrolite returns the current matching rows.
+4. Browser asks again with the returned offset and `live=true`.
+5. When matching SQLite rows change, the browser receives the change.
 
 Under the hood, Electrolite installs SQLite triggers, records a durable
 logical change log, normalizes Shape handles against the SQLite schema,
 and uses replay boundaries so browsers do not publish half-applied
 batches.
 
+You do not need to run a separate sync service for this path.
+
 ## Workspace
 
-- `crates/electrolite-core` - Shape definitions, handles, log rows, and
-  membership transition logic.
-- `crates/electrolite-sqlite` - SQLite metadata tables, trigger
-  generation, and log reads.
-- `crates/electrolite-server` - embedded authorized HTTP snapshot and
-  replay routes.
-- `packages/electrolite-node` - Node/Bun native binding that exposes the
-  Rust core as a TypeScript-friendly embedded backend package.
+- `packages/electrolite-node` - TypeScript-friendly embedded backend
+  package using Node's built-in SQLite API.
 - `clients/browser` - dependency-free browser materializer for Shape
   snapshots and live replay messages.
-- `clients/typescript-backend` - dependency-free Web Fetch proxy helper
-  for the older internal-origin bridge. New TypeScript apps should start
-  with `packages/electrolite-node`.
+- `clients/python` - dependency-free synchronous Python materializer for
+  consuming Electrolite HTTP Shapes from scripts, tests, or Python
+  services.
 
 ## Goals
 
 - Electric-like initial snapshot plus live offset replay for SQLite.
 - Named server-side Shapes instead of arbitrary browser SQL.
 - Browser delivery over cache-friendly HTTP long-polling.
-- Strong security defaults: app-authorized Shapes, column allowlists,
-  private raw logs, and short-lived signed Shape URLs when needed.
-- Honest fanout economics: excellent for shared team/workspace/document
-  Shapes, explicit tradeoffs for per-user private Shapes.
+- Strong security defaults: app-authorized Shapes, column allowlists, and
+  private raw logs.
+- Good enough fanout for small and medium apps first. Shared team,
+  workspace, and document Shapes should be cheap. Huge per-user-private
+  fanout can come later.
+
+## Future Direction
+
+- React hooks and tiny framework examples.
+- Benchmark numbers for snapshot, replay, and live fanout.
+- Shape diagnostics that explain predicates, key columns, trigger status,
+  and suggested SQLite indexes.
+- Retention auto-compaction with safe defaults.
+- Better fanout for shared Shapes through wait coalescing and cacheable
+  response chunks.
+- Optional object-storage mode for immutable authorized Shape chunks.
+- Offline writes and conflict handling as a separate later track.
 
 ## Non-goals
 
@@ -166,29 +335,44 @@ batches.
 ## Roadmap
 
 See [ROADMAP.md](ROADMAP.md).
+Completed work is tracked in [CHANGELOG.md](CHANGELOG.md).
 
 For the user-facing TypeScript API, start with
-[docs/node-native.md](docs/node-native.md). The older internal-origin
-bridge is documented separately in
-[docs/typescript-backend.md](docs/typescript-backend.md).
+[packages/electrolite-node/README.md](packages/electrolite-node/README.md).
 
 ## Status
 
-Early scaffold. The implemented slice is trigger-backed logical change
-capture for primary-keyed SQLite tables, plus embedded HTTP routes for
-authorized initial snapshots, bounded replay, and `live=true`
-long-polling. Rust apps can use `electrolite-server` directly;
-TypeScript apps can use `@electrolite/node`, which loads the Rust core
-through a native Node-API binding and exposes a Web Fetch route handler.
-The Node package and Rust server both use bounded SQLite connection
-pools. Live waits coalesce in-process, retained-offset errors return
-`409 resync_required`, and a benchmark harness exists for fanout work.
-Dynamic Shape factories and a table/equality predicate index are in
-place for the next fanout broker layer. Embedded write helpers can wake
-live requests automatically, retention compaction records durable
-retained offsets, and optional Electrolite change batches avoid
-splitting app-controlled transactions across bounded replay responses.
-Responses include key-column metadata and an explicit `up_to_date`
-boundary; Shape handles are canonicalized and schema-normalized against
-SQLite declared types; and SQLite predicate values are normalized against
-declared column types to avoid snapshot/replay drift.
+This is still early, but the main TypeScript path works end to end:
+
+- embedded Node package
+- pure JS engine using Node's built-in SQLite API
+- SQLite trigger install
+- initial snapshots
+- bounded replay
+- `live=true` long-polling
+- app-owned authorization
+- retained-log `409 resync_required`
+- durable `log_id` validation so cached browser offsets cannot be reused
+  against a different SQLite log history
+- durable `shape_handle` validation so cached browser rows cannot be
+  reused after a Shape definition changes
+- key-column metadata for the browser
+- schema-normalized Shape handles
+- targeted live wakeups for affected Shapes
+- browser IndexedDB persistence
+- browser multi-tab coordination
+- browser replay draining before live long-polling
+- low-level browser replay events
+- replay messages include `batch_id` for real batch grouping
+- explicit TypeScript write batches for consistency boundaries
+- E2E tests for the browser/client/backend flow
+- basic Python client for consuming Shape HTTP endpoints
+- basic real web app example
+
+Still rough:
+
+- not on npm yet
+- no React hooks yet
+- predicate language is small on purpose
+- no offline writes or conflict resolution
+- no required sidecar mode

@@ -214,3 +214,480 @@ test("stages replay messages until up_to_date", () => {
   ]);
   assert.equal(seen.length, 3);
 });
+
+test("emits low-level snapshot, replay, message, and offset events", () => {
+  const client = new ShapeClient("http://app.test/electrolite/v1/shape/activeUsers", {
+    keyColumns: ["id"],
+    fetch: async () => {
+      throw new Error("unused");
+    },
+  });
+  const events = [];
+  client.subscribeEvents((event) => events.push(event.type));
+
+  client.apply({
+    type: "snapshot",
+    key_columns: ["id"],
+    rows: [{ id: 1, name: "Ada", active: 1 }],
+    offset: 1,
+    up_to_date: true,
+  });
+  client.apply({
+    type: "replay",
+    messages: [
+      {
+        type: "update",
+        key: { id: 1 },
+        value: { id: 1, name: "Ada Lovelace", active: 1 },
+        offset: 2,
+      },
+    ],
+    offset: 2,
+    up_to_date: true,
+  });
+
+  assert.deepEqual(events, ["snapshot", "offset", "update", "replay", "offset"]);
+});
+
+test("hydrates from and persists to a storage adapter", async () => {
+  let saved = {
+    keyColumns: ["id"],
+    logId: "log-a",
+    shapeHandle: "shape-a",
+    offset: 9,
+    rows: [{ id: 1, name: "Cached", active: 1 }],
+  };
+  const storage = {
+    load: async () => saved,
+    save: async (state) => {
+      saved = state;
+    },
+    clear: async () => {
+      saved = null;
+    },
+  };
+  const client = new ShapeClient("http://app.test/electrolite/v1/shape/activeUsers", {
+    persist: storage,
+    fetch: async () => ({ status: 204, ok: true }),
+  });
+
+  assert.equal(await client.hydrate(), true);
+  assert.equal(client.logId, "log-a");
+  assert.equal(client.shapeHandle, "shape-a");
+  assert.equal(client.offset, 9);
+  assert.deepEqual(client.currentRows(), []);
+
+  client.apply({
+    type: "replay",
+    messages: [
+      {
+        type: "insert",
+        key: { id: 2 },
+        value: { id: 2, name: "Grace", active: 1 },
+        offset: 10,
+      },
+    ],
+    offset: 10,
+    up_to_date: true,
+  });
+  await Promise.resolve();
+
+  assert.equal(saved.offset, 10);
+  assert.equal(saved.logId, "log-a");
+  assert.equal(saved.shapeHandle, "shape-a");
+  assert.deepEqual(saved.rows, [
+    { id: 1, name: "Cached", active: 1 },
+    { id: 2, name: "Grace", active: 1 },
+  ]);
+});
+
+test("does not publish persisted rows until the shape cache is validated", async () => {
+  const storage = {
+    load: async () => ({
+      keyColumns: ["id"],
+      logId: "log-a",
+      shapeHandle: "shape-a",
+      offset: 9,
+      rows: [{ id: 1, name: "Cached", active: 1 }],
+    }),
+    save: async () => {},
+    clear: async () => {},
+  };
+  const client = new ShapeClient("http://app.test/electrolite/v1/shape/activeUsers", {
+    persist: storage,
+    fetch: async () => {
+      throw new Error("unused");
+    },
+  });
+  const seen = [];
+  client.subscribe((rows) => seen.push(rows));
+
+  assert.equal(await client.hydrate(), true);
+  assert.deepEqual(seen, [[]]);
+  assert.deepEqual(client.currentRows(), []);
+
+  client.apply({
+    type: "replay",
+    log_id: "log-a",
+    shape_handle: "shape-a",
+    messages: [],
+    offset: 9,
+    up_to_date: true,
+  });
+
+  assert.deepEqual(client.currentRows(), [{ id: 1, name: "Cached", active: 1 }]);
+});
+
+test("clears persisted rows that predate shape_handle support", async () => {
+  let cleared = false;
+  const storage = {
+    load: async () => ({
+      keyColumns: ["id"],
+      logId: "log-a",
+      offset: 9,
+      rows: [{ id: 1, name: "Old", active: 1 }],
+    }),
+    save: async () => {},
+    clear: async () => {
+      cleared = true;
+    },
+  };
+  const client = new ShapeClient("http://app.test/electrolite/v1/shape/activeUsers", {
+    persist: storage,
+    fetch: async () => {
+      throw new Error("unused");
+    },
+  });
+
+  assert.equal(await client.hydrate(), false);
+  assert.equal(cleared, true);
+  assert.equal(client.offset, -1);
+  assert.deepEqual(client.currentRows(), []);
+});
+
+test("requires a fresh snapshot when the persisted shape_handle no longer matches", () => {
+  const client = new ShapeClient("http://app.test/electrolite/v1/shape/activeUsers", {
+    keyColumns: ["id"],
+    fetch: async () => {
+      throw new Error("unused");
+    },
+  });
+  client.apply({
+    type: "snapshot",
+    log_id: "log-a",
+    shape_handle: "shape-a",
+    key_columns: ["id"],
+    rows: [{ id: 1, name: "Ada", active: 1 }],
+    offset: 2,
+    up_to_date: true,
+  });
+
+  assert.equal(
+    client.apply({
+      type: "replay",
+      log_id: "log-a",
+      shape_handle: "shape-b",
+      messages: [
+        {
+          type: "insert",
+          key: { id: 2 },
+          value: { id: 2, name: "Grace", active: 1 },
+          offset: 3,
+        },
+      ],
+      offset: 3,
+      up_to_date: true,
+    }),
+    false,
+  );
+  assert.equal(client.offset, -1);
+  assert.deepEqual(client.currentRows(), []);
+});
+
+test("awaits cache clearing before fetching a resync snapshot from request", async () => {
+  const calls = [];
+  const storage = {
+    load: async () => null,
+    save: async (state) => calls.push(["save", state.offset]),
+    clear: async () => {
+      await Promise.resolve();
+      calls.push(["clear"]);
+    },
+  };
+  const responses = [
+    {
+      status: 200,
+      ok: true,
+      json: async () => ({
+        type: "replay",
+        log_id: "log-a",
+        shape_handle: "shape-b",
+        messages: [],
+        offset: 3,
+        up_to_date: true,
+      }),
+    },
+    {
+      status: 200,
+      ok: true,
+      json: async () => ({
+        type: "snapshot",
+        log_id: "log-a",
+        shape_handle: "shape-b",
+        key_columns: ["id"],
+        rows: [{ id: 2, name: "Grace", active: 1 }],
+        offset: 3,
+        up_to_date: true,
+      }),
+    },
+  ];
+  const client = new ShapeClient("http://app.test/electrolite/v1/shape/activeUsers", {
+    persist: storage,
+    keyColumns: ["id"],
+    fetch: async () => responses.shift(),
+  });
+  client.logId = "log-a";
+  client.shapeHandle = "shape-a";
+  client.offset = 2;
+
+  assert.equal(await client.request({ offset: 2 }), true);
+  assert.deepEqual(calls, [["clear"], ["save", 3]]);
+  assert.deepEqual(client.currentRows(), [{ id: 2, name: "Grace", active: 1 }]);
+});
+
+test("sends cached log_id with replay and live requests", async () => {
+  const requested = [];
+  const client = new ShapeClient("http://app.test/electrolite/v1/shape/activeUsers", {
+    keyColumns: ["id"],
+    fetch: async (url) => {
+      requested.push(String(url));
+      return { status: 204, ok: true };
+    },
+  });
+  client.logId = "abc123";
+
+  assert.equal(await client.request({ offset: 10, live: true }), false);
+  assert.equal(
+    requested[0],
+    "http://app.test/electrolite/v1/shape/activeUsers?offset=10&live=true&log_id=abc123",
+  );
+});
+
+test("drains replay pages before switching back to live requests", async () => {
+  const requested = [];
+  const responses = [
+    {
+      type: "snapshot",
+      log_id: "log-a",
+      shape_handle: "shape-a",
+      key_columns: ["id"],
+      rows: [],
+      offset: 1,
+      up_to_date: true,
+    },
+    {
+      type: "replay",
+      log_id: "log-a",
+      shape_handle: "shape-a",
+      messages: [
+        {
+          type: "insert",
+          key: { id: 1 },
+          value: { id: 1, name: "Ada", active: 1 },
+          offset: 2,
+        },
+      ],
+      offset: 2,
+      up_to_date: false,
+    },
+    {
+      type: "replay",
+      log_id: "log-a",
+      shape_handle: "shape-a",
+      messages: [],
+      offset: 2,
+      up_to_date: true,
+    },
+    null,
+  ];
+  const client = new ShapeClient("http://app.test/electrolite/v1/shape/activeUsers", {
+    fetch: async (url) => {
+      requested.push(String(url));
+      const body = responses.shift();
+      if (!body) {
+        client.stop();
+        return { status: 204, ok: true };
+      }
+      return { status: 200, ok: true, json: async () => body };
+    },
+  });
+
+  await client.start();
+
+  assert.deepEqual(requested, [
+    "http://app.test/electrolite/v1/shape/activeUsers?offset=-1",
+    "http://app.test/electrolite/v1/shape/activeUsers?offset=1&live=true&log_id=log-a",
+    "http://app.test/electrolite/v1/shape/activeUsers?offset=2&log_id=log-a",
+    "http://app.test/electrolite/v1/shape/activeUsers?offset=2&live=true&log_id=log-a",
+  ]);
+});
+
+test("ignores persisted offsets that predate log_id support", async () => {
+  let cleared = false;
+  const storage = {
+    load: async () => ({
+      keyColumns: ["id"],
+      offset: 9,
+      rows: [{ id: 1, name: "Old", active: 1 }],
+    }),
+    save: async () => {},
+    clear: async () => {
+      cleared = true;
+    },
+  };
+  const client = new ShapeClient("http://app.test/electrolite/v1/shape/activeUsers", {
+    persist: storage,
+    fetch: async () => {
+      throw new Error("unused");
+    },
+  });
+
+  assert.equal(await client.hydrate(), false);
+  assert.equal(cleared, true);
+  assert.equal(client.offset, -1);
+  assert.deepEqual(client.currentRows(), []);
+});
+
+test("broadcasts applied state to another tab client", () => {
+  const bus = new TestChannelBus();
+  const leader = new ShapeClient("http://app.test/electrolite/v1/shape/activeUsers", {
+    keyColumns: ["id"],
+    multiTab: true,
+    channelFactory: (name) => bus.channel(name),
+    fetch: async () => {
+      throw new Error("unused");
+    },
+  });
+  const follower = new ShapeClient("http://app.test/electrolite/v1/shape/activeUsers", {
+    keyColumns: ["id"],
+    multiTab: true,
+    channelFactory: (name) => bus.channel(name),
+    fetch: async () => {
+      throw new Error("unused");
+    },
+  });
+
+  leader.apply({
+    type: "snapshot",
+    key_columns: ["id"],
+    rows: [{ id: 1, name: "Ada", active: 1 }],
+    offset: 2,
+    up_to_date: true,
+  });
+
+  assert.deepEqual(follower.currentRows(), [{ id: 1, name: "Ada", active: 1 }]);
+  assert.equal(follower.offset, 2);
+  leader.stop();
+  follower.stop();
+});
+
+test("multi-tab clients release leadership on pagehide", () => {
+  const previousLocalStorage = globalThis.localStorage;
+  const previousAddEventListener = globalThis.addEventListener;
+  const previousRemoveEventListener = globalThis.removeEventListener;
+  const storage = new Map();
+  const listeners = new Map();
+  globalThis.localStorage = {
+    getItem: (key) => storage.get(key) ?? null,
+    setItem: (key, value) => storage.set(key, value),
+    removeItem: (key) => storage.delete(key),
+  };
+  globalThis.addEventListener = (type, listener) => listeners.set(type, listener);
+  globalThis.removeEventListener = (type, listener) => {
+    if (listeners.get(type) === listener) {
+      listeners.delete(type);
+    }
+  };
+
+  const client = new ShapeClient("http://app.test/electrolite/v1/shape/activeUsers", {
+    keyColumns: ["id"],
+    multiTab: true,
+    channelFactory: () => ({
+      addEventListener() {},
+      removeEventListener() {},
+      close() {},
+      postMessage() {},
+    }),
+    fetch: async () => {
+      throw new Error("unused");
+    },
+  });
+  try {
+    assert.equal(client.canUseNetwork(), true);
+    assert.equal(storage.size, 1);
+    listeners.get("pagehide")();
+    assert.equal(storage.size, 0);
+  } finally {
+    client.stop();
+    if (previousLocalStorage === undefined) {
+      delete globalThis.localStorage;
+    } else {
+      globalThis.localStorage = previousLocalStorage;
+    }
+    if (previousAddEventListener === undefined) {
+      delete globalThis.addEventListener;
+    } else {
+      globalThis.addEventListener = previousAddEventListener;
+    }
+    if (previousRemoveEventListener === undefined) {
+      delete globalThis.removeEventListener;
+    } else {
+      globalThis.removeEventListener = previousRemoveEventListener;
+    }
+  }
+});
+
+class TestChannelBus {
+  constructor() {
+    this.channels = new Map();
+  }
+
+  channel(name) {
+    const bus = this;
+    const channel = {
+      name,
+      onmessage: null,
+      listeners: new Set(),
+      addEventListener(type, listener) {
+        if (type === "message") {
+          this.listeners.add(listener);
+        }
+      },
+      removeEventListener(type, listener) {
+        if (type === "message") {
+          this.listeners.delete(listener);
+        }
+      },
+      postMessage(message) {
+        for (const peer of bus.channels.get(name) ?? []) {
+          if (peer === this) {
+            continue;
+          }
+          const event = { data: message };
+          peer.onmessage?.(event);
+          for (const listener of peer.listeners) {
+            listener(event);
+          }
+        }
+      },
+      close() {
+        bus.channels.get(name)?.delete(this);
+      },
+    };
+    if (!this.channels.has(name)) {
+      this.channels.set(name, new Set());
+    }
+    this.channels.get(name).add(channel);
+    return channel;
+  }
+}

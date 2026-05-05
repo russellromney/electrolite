@@ -2,7 +2,7 @@
 
 Electrolite should default to app-authorized named shapes.
 
-## Default: App-Authorized Shape Proxy
+## Default: App-Authorized Embedded Route
 
 ```text
 browser
@@ -14,33 +14,17 @@ browser
 The browser never sends arbitrary SQL. It asks for named shapes that the
 app has already defined.
 
-TypeScript app servers can use the helper in
-`clients/typescript-backend` to make the same pattern explicit: the app
-checks its session/RBAC, then forwards to an internal Electrolite origin
-with only scoped Electrolite headers. Browser cookies and bearer tokens
-are not forwarded by default. When the internal origin enables
-`TrustedHeaderShapeFactory`, those scoped headers can include the
-server-constructed Shape spec; this mode should only be exposed behind
-the TypeScript app, never directly to browsers.
+TypeScript app servers define Shapes with an `authorize` hook. The hook
+receives the request, route params, and app context, then returns whether
+the current user may see that Shape. Unauthorized requests are denied
+before SQLite is read. Denied Shapes return the same public response as
+missing Shapes, so callers cannot distinguish private Shape names from
+missing Shape names.
 
-In the embedded server, the host app passes an explicit `Authorizer` when
-constructing `ServerState`. The authorizer receives request headers,
-request extensions, the named Shape, the requested offset, and whether the
-request is a live long-poll.
-
-```rust
-let state = ServerState::new(db_path, registry, AppAuthorizer);
-```
-
-The route denies unauthorized requests before opening SQLite or reading
-the Electrolite log. Denied Shapes return `404 Not Found` by default so
-callers cannot distinguish private Shape names from missing Shape names.
-`AllowAll` exists for tests and local demos, but it must be selected
-explicitly.
-
-Host apps should authenticate before the Electrolite route runs, then put
-their session/user object into request extensions. The authorizer maps
-that app-specific identity to `shape.auth_scope`.
+Host apps should authenticate before the Electrolite route runs, then
+pass the session/user object as the handler context. The Shape definition
+maps that app-specific identity to an `auth_scope`, which is included in
+the Shape handle.
 
 ## Signed Shape URLs
 

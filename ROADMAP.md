@@ -1,301 +1,101 @@
 # ROADMAP
 
-Roadmap items are future work. This file captures the intended product
-shape before implementation starts.
+Roadmap items are future work. Completed work lives in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## North Star
 
-Electrolite is a Rust-first embeddable SQLite sync layer that gives
-browser clients Electric-style shape subscriptions without a separate sync
-daemon.
+Electrolite is a TypeScript-first embedded SQLite sync layer. A Node app
+owns SQLite, auth, writes, and an Electrolite HTTP endpoint; browsers get
+an initial authorized Shape snapshot and then live logical changes.
 
 ```text
 SQLite + generated triggers
   -> durable logical change log
-  -> app-embedded shape endpoint
-  -> browser client consumes snapshot + offset log
+  -> app-embedded Shape endpoint
+  -> browser client consumes snapshot + offset replay
 ```
 
-## Phase Spark - Tiny Honest MVP
+## Near-Term: Make The Demo Feel Real
 
-Prove the semantics before optimizing.
+These are the highest-leverage items before showing this widely.
 
-### Scope
+- React hooks over `ShapeClient`.
+- A tiny npm-free starter template with server route, browser client, and
+  SQLite setup in one folder.
+- A visible unauthorized panel in the demo showing denied Shapes return
+  `404 shape_not_found`.
+- Composite-primary-key demo row so people see it is not toy-key-only.
+- README benchmark numbers for snapshot, replay, and live fanout.
 
-- Create Electrolite metadata tables:
-  - `_electrolite_log`
-  - `_electrolite_meta`
-- Generate `AFTER INSERT`, `AFTER UPDATE`, and `AFTER DELETE` triggers
-  for watched tables.
-- Append logical changes with:
-  - `seq`
-  - `table_name`
-  - `op`
-  - `pk_json`
-  - `old_json`
-  - `new_json`
-  - `created_at`
-- Expose an embedded HTTP route from the host app:
-  - `GET /electrolite/v1/shape/:name?offset=-1`
-  - `GET /electrolite/v1/shape/:name?offset=123&live=true`
-- Support named shapes only.
-- Start with simple polling of `_electrolite_log` for live waits.
+## Internals: Keep Semantics Sharp
 
-### First Commit Shape
+- Add `explainShape(...)` diagnostics:
+  - table
+  - selected columns
+  - key columns
+  - original predicate
+  - normalized predicate
+  - trigger installation status
+  - suggested SQLite indexes
+- Add retention auto-compaction with safe per-table defaults.
+- Add a public benchmark harness for:
+  - snapshot 1k rows
+  - replay one change
+  - live fanout across 100 waiting clients
+  - mixed shared/private Shapes
+- Add server-side stats:
+  - active live subscribers
+  - active shape handles
+  - wakeups
+  - replay rows scanned
+  - replay messages emitted
 
-- `electrolite-core` owns shape handles, predicates, log rows, and
-  membership transition messages.
-- `electrolite-sqlite` owns bootstrap DDL, trigger generation, and log
-  reads.
-- `electrolite-server` exists as a placeholder for the embedded HTTP
-  route layer.
+## Predicate And Shape Scale
 
-### Non-goals
-
-- No arbitrary browser-provided SQL.
-- No CDN/object-store chunking yet.
-- No Honker or Walrust dependency yet.
-
-## Phase Shape - Electric-ish Semantics
-
-Make snapshot and replay behavior precise.
-
-### Scope
-
-- Initial snapshot high-water mark:
-  1. read current max log `seq`
-  2. run the shape query
-  3. return rows plus `up-to-date` with the continuation offset
-- Replay from offset by scanning `_electrolite_log`.
-- Replay scans should filter by `table_name` before evaluating Shape
-  membership.
-- Keep a retained-log lower bound and return `409 resync_required` when
-  the requested offset is older than retained history.
-- Compact `_electrolite_log` with a durable retained-offset marker so
-  resync still works even after all older rows are deleted.
-- Record per-table retained offsets during compaction so unrelated table
-  churn does not force quiet Shapes to resync.
-- Evaluate membership transitions:
-
-```text
-old no,  new yes -> insert
-old yes, new yes -> update
-old yes, new no  -> delete
-old no,  new no  -> ignore
-```
-
-- Define stable shape handles:
-
-```text
-hash(table + canonical columns + canonical predicate + auth_scope + schema_version)
-```
-
-- Shape handles ignore human route names. Equivalent column sets and
-  equivalent `AND`/`IN` predicate orderings share handles.
-- Return `409 resync_required` when the requested offset is older than
-  retained history.
-- Treat ordinary trigger rows as committed row-level changes. For
-  app-controlled multi-row writes, support explicit Electrolite change
-  batches so bounded replay does not split the batch.
-- Return key-column metadata and an explicit `up_to_date` boundary in
-  snapshot/replay envelopes.
-- Normalize Shape predicate values and logged row JSON using SQLite
-  declared column types. Reject ambiguous predicate values instead of
-  letting snapshot SQL and replay JSON diverge.
-- Support composite primary keys by emitting JSON keys with all primary
-  key columns and including all key columns in snapshot metadata.
-
-## Phase Node - TypeScript Native Embedding
-
-Make the intended TypeScript consumer path feel like a normal Node/Bun
-library, with Rust kept behind the package boundary.
-
-### Implemented Slice
-
-- `@electrolite/node` loads the Rust core through Node-API.
-- TypeScript apps can register server-owned dynamic Shapes, authorize
-  requests in app code, and serve snapshot/replay/live responses from a
-  Web Fetch handler.
-- The package exposes trigger installation, ordinary writes, explicit
-  Electrolite write batches, retention compaction, and live wakeups.
-- The package owns a bounded native SQLite connection pool, defaulting
-  to one connection for SQLite-friendly embedded operation.
-- End-to-end tests exercise the user-facing flow: TypeScript route,
-  dynamic authorized Shape, native SQLite triggers/log replay, browser
-  `ShapeClient`, and live long-poll delivery.
-
-### Remaining Work
-
-- Publish prebuilt native artifacts for the main Node/Bun platforms.
-- Add IndexedDB persistence, React hooks, and multi-tab support in the
-  browser package.
-
-## Phase Guard - Security Model
-
-Make the default safe for real applications.
-
-### Scope
-
-- Require server-defined named shapes.
-- Require column allowlists.
-- Run authorization in host app code before serving a shape.
-- Support TypeScript app servers as the authorization boundary through
-  the native Node/Bun package. The older proxy-to-internal-origin bridge
-  remains a fallback deployment model.
-- Keep sidecar deployment optional. The protocol is embedded-first.
-- Include auth scope in shape handles.
-- Keep raw `_electrolite_log` private.
-- Add optional signed shape URLs for proxy/CDN/object-store delivery.
-- Ensure delete messages only reveal rows previously visible to that
-  authorized shape.
-
-### Dynamic Authorization Gap
-
-The server supports static named Shapes with an auth hook and dynamic
-Shape factories for app routes such as:
-
-```text
-/users/:user_id/photos
-/photos/:photo_id/friend-likes
-```
-
-Factories still build server-side Shapes; browsers still must not send
-arbitrary SQL. A factory can reject a request before the Shape exists,
-and the normal authorizer still checks the generated `auth_scope`.
-
-Relationship-shaped data such as "your friends' likes on your photos"
-still needs richer predicate/index support than the first `Eq`/`And`
-predicate set.
-
-### TypeScript Ergonomics Gap
-
-Trusted Shape specs in headers are good enough for small dynamic Shapes.
-Large `IN` lists and richer predicates should move to registered
-server-side factories, signed Shape tokens, or a POST-based internal
-factory route.
-
-## Phase Crowd - Fanout And Caching
-
-Support 10,000 concurrent clients when most clients share a small number
-of shape instances.
-
-### Scope
-
-- Materialize immutable response chunks by shape handle and offset.
-- Make historical chunks cacheable:
-
-```http
-Cache-Control: public, max-age=31536000, immutable
-ETag: ...
-```
-
-- Keep live delivery as HTTP long-polling, not WebSockets.
-- Design live URLs so CDN request collapsing can coalesce identical
-  `shape_handle + offset` waits.
-- Origin should do one wait per `shape_handle + offset`, not one wait per
-  browser.
-- The embedded server should use a bounded SQLite connection pool with a
-  default size of 1, configurable by the host app.
-- Add a benchmark harness that measures snapshot latency, replay latency,
-  live fanout latency, SQLite reads, and origin work across client counts.
-
-### Target
-
-- 10,000 concurrent clients.
-- 10 to 100 active shared shape instances.
-- Origin work scales with writes times affected shapes, not users.
-
-## Phase Wake - Efficient Commit Notification
-
-Remove dumb polling without changing semantics.
-
-### Options
-
-1. In-process condition variables when the host app owns writes.
-2. SQLite update/preupdate hooks for controlled connections.
-3. Honker integration for cross-process commit wakes.
-4. Polling remains as the fallback.
-
-Honker is an accelerant here, not the semantic core.
-
-## Phase Index - Shape Evaluation Scale
-
-Avoid evaluating every shape on every write.
-
-### Scope
-
-- Restrict fast-path predicates to:
+- Keep the fast path focused on simple, indexable predicates:
   - `column = value`
   - `column IN (...)`
   - simple ranges later
-- Maintain shape registry indexes:
+- Add a Shape predicate index in the Node implementation so writes can
+  find candidate Shapes before exact membership evaluation.
+- Keep arbitrary SQL out of the browser protocol.
+- Add diagnostics that tell users which SQLite indexes their Shapes want.
+- Add a strategy for large `IN` lists: registered server helpers, signed
+  Shape tokens, or POST-based app routes.
 
-```text
-table=todos, project_id=p1 -> [shapeA, shapeB]
-table=todos, done=false    -> [shapeA, shapeC]
-```
+## Browser Client
 
-- On each log row, find candidate shapes first, then evaluate membership
-  exactly.
-- Mark arbitrary predicates as slow path.
+- React hooks.
+- IndexedDB schema versioning and cache eviction policy.
+- Multi-tab leadership hardening for backgrounded tabs.
+- Dedicated browser package publishing when npm packaging starts.
+- Adapters for Solid, Svelte, and vanilla stores later.
 
-### Implemented Slice
+## Fanout And Caching
 
-- `ShapeIndex` indexes Shapes by table and equality predicate terms.
-- `IN` predicates expand into equality terms for index candidate lookup.
-- Candidate lookup considers both old and new row images so inserts,
-  updates, deletes, and membership transitions are all eligible for exact
-  evaluation.
-- `Predicate::All` and predicates without equality terms remain table
-  scan candidates.
+This only matters once shared Shapes have real traffic.
 
-## Phase Store - S3/Cinch Object Mode
+- Coalesce identical in-process waits by `shape_handle + offset`.
+- Materialize immutable response chunks by Shape handle and offset.
+- Make historical chunks cacheable with immutable cache headers and ETags.
+- Keep live delivery as HTTP long-polling; WebSockets can be an adapter.
+- Explore CDN request collapsing for identical shared Shape waits.
 
-Use object storage for immutable authorized shape chunks.
+## Optional Object Storage Mode
 
-### Scope
+S3/Cinch-style object storage may be useful for immutable authorized Shape
+chunks.
 
-- Store chunks under opaque shape handles.
+- Store chunks under opaque Shape handles.
 - Keep raw logs private.
-- Serve chunks through private proxy or signed URLs.
-- Keep dynamic live waits in the app server or an edge worker.
+- Serve chunks through the app, a private proxy, or signed URLs.
+- Do not infer Shape semantics from SQLite pages; Shape semantics come
+  from the trigger log and server-defined predicates.
 
-## Phase Replica - Walrust Mode
+## Later
 
-Run shape servers near users on physical SQLite replicas.
-
-```text
-primary SQLite
-  -> Electrolite trigger log
-  -> Walrust physical replication
-  -> replica SQLite
-  -> Electrolite shape endpoint near users
-```
-
-Walrust provides physical replication, PITR, and remote read replicas.
-Electrolite semantics still come from trigger logs.
-
-## hadb Format Notes
-
-hadb's `.hadbp` physical changesets are useful for moving SQLite pages to
-replicas or object storage. They can help decide where an Electrolite
-Shape endpoint runs, but they do not define Shape semantics.
-
-hadb's planned `.hadbj` journal changesets are closer in spirit: a
-logical journal with sequence, checksum chain, and deterministic replay.
-Electrolite's trigger log is the local SQLite version of that semantic
-journal. If Electrolite later exports chunks to S3/Cinch, borrowing the
-hadb generation/key/checksum discipline would be more useful than trying
-to infer Shapes from physical pages.
-
-## Phase Later - Fancy Things
-
-- WAL page invalidation to reduce shape evaluation work.
-- Precomputed per-shape logs.
-- Browser client adapters for React, Solid, Svelte, and vanilla stores.
-- Native TypeScript backend ergonomics through Node/Bun bindings, so a
-  TypeScript server can embed Electrolite without a separate process.
-- IndexedDB persistence.
-- Multi-tab coordination.
-- Browser client retry/backoff/status reporting.
+- Precomputed per-Shape logs.
 - Offline writes and conflict handling as a separate track.
+- Replica placement for read-heavy apps, if the simple embedded model is
+  no longer enough.

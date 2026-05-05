@@ -13,7 +13,6 @@ const dbPath = join(dir, "demo.db");
 
 const electrolite = createElectrolite({
   dbPath,
-  connectionPoolSize: 1,
   shapes: {
     projectTodos: shape({
       table: "todos",
