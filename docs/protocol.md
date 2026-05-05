@@ -11,25 +11,44 @@ GET /electrolite/v1/shape/:name?offset=-1
 The server:
 
 1. authorizes the named shape for the current user
-2. records the current log high-water mark
-3. queries current rows for the shape
-4. returns insert messages for the rows
-5. returns an `up-to-date` control message with the continuation offset
+2. pins a SQLite read snapshot
+3. records the current log high-water mark
+4. queries current rows for the shape
+5. returns rows with the continuation offset
 
 Example response:
 
 ```json
-[
-  {
-    "headers": { "operation": "insert" },
-    "key": "[7]",
-    "value": { "id": 7, "title": "ship electrolite", "done": false }
-  },
-  {
-    "headers": { "control": "up-to-date" },
-    "offset": 124
-  }
-]
+{
+  "type": "snapshot",
+  "rows": [
+    { "id": 7, "title": "ship electrolite", "done": false }
+  ],
+  "offset": 124
+}
+```
+
+## Replay
+
+```http
+GET /electrolite/v1/shape/:name?offset=124
+```
+
+Example response:
+
+```json
+{
+  "type": "replay",
+  "messages": [
+    {
+      "type": "update",
+      "key": { "id": 7 },
+      "value": { "id": 7, "title": "ship electrolite", "done": true },
+      "offset": 125
+    }
+  ],
+  "offset": 125
+}
 ```
 
 ## Live Long-Poll

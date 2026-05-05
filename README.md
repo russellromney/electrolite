@@ -22,7 +22,7 @@ useful accelerants, but not required for the first version.
   membership transition logic.
 - `crates/electrolite-sqlite` - SQLite metadata tables, trigger
   generation, and log reads.
-- `crates/electrolite-server` - future embedded HTTP long-poll service.
+- `crates/electrolite-server` - embedded HTTP snapshot and replay routes.
 
 ## Goals
 
@@ -47,5 +47,6 @@ See [ROADMAP.md](ROADMAP.md).
 
 ## Status
 
-Early scaffold. The first implemented slice is trigger-backed logical
-change capture for simple primary-key tables.
+Early scaffold. The implemented slice is trigger-backed logical change
+capture for simple primary-key tables, plus an embedded HTTP route for
+initial snapshots and bounded replay.
