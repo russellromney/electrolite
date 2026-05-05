@@ -1,6 +1,6 @@
-use electrolite_core::{LogOp, LogRow};
-use rusqlite::Connection;
-use serde_json::Value;
+use electrolite_core::{LogOp, LogRow, Predicate, Replay, Shape, Snapshot};
+use rusqlite::{Connection, ToSql};
+use serde_json::{Number, Value};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -15,6 +15,14 @@ pub enum Error {
     EmptyTable { table: String },
     #[error("unknown electrolite log operation {0:?}")]
     InvalidLogOp(String),
+    #[error("shape {shape:?} references table {table:?}, which is not watched")]
+    ShapeTableMismatch { shape: String, table: String },
+    #[error("shape {shape:?} references missing column {column:?}")]
+    MissingShapeColumn { shape: String, column: String },
+    #[error("unsupported predicate in shape {shape:?}")]
+    UnsupportedPredicate { shape: String },
+    #[error("unsupported predicate value {value:?} in shape {shape:?}")]
+    UnsupportedPredicateValue { shape: String, value: Value },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -179,12 +187,193 @@ pub fn read_log_since(conn: &Connection, offset: i64, limit: i64) -> Result<Vec<
     Ok(out)
 }
 
+pub fn initial_snapshot(conn: &Connection, shape: &Shape) -> Result<Snapshot> {
+    let watched = inspect_table(conn, &shape.table, "id")?;
+    validate_shape_columns(&watched, shape)?;
+
+    let offset = high_water_mark(conn)?;
+    let (where_sql, params) = compile_predicate(shape, &shape.predicate)?;
+    let row_expr = row_json_expr("", &shape.columns);
+    let mut sql = format!(
+        "SELECT {row_expr} FROM {}",
+        quote_ident(&shape.table),
+        row_expr = row_expr
+    );
+    if !where_sql.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_sql);
+    }
+    sql.push_str(" ORDER BY ");
+    sql.push_str(&quote_ident(&watched.pk_column));
+
+    let params_ref: Vec<&dyn ToSql> = params.iter().map(|p| p as &dyn ToSql).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_ref.as_slice(), |row| row.get::<_, String>(0))?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(serde_json::from_str::<Value>(&row?)?);
+    }
+    Ok(Snapshot { rows: out, offset })
+}
+
+pub fn replay(conn: &Connection, shape: &Shape, offset: i64, limit: i64) -> Result<Replay> {
+    let rows = read_log_since(conn, offset, limit)?;
+    let mut messages = Vec::new();
+    let mut latest = offset;
+
+    for row in rows {
+        latest = latest.max(row.seq);
+        if let Some(message) = electrolite_core::message_for_log(shape, &row) {
+            messages.push(message);
+        }
+    }
+
+    Ok(Replay {
+        messages,
+        offset: latest,
+    })
+}
+
+pub fn high_water_mark(conn: &Connection) -> Result<i64> {
+    bootstrap(conn)?;
+    Ok(conn.query_row(
+        "SELECT COALESCE(MAX(seq), 0) FROM _electrolite_log",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+fn validate_shape_columns(watched: &WatchedTable, shape: &Shape) -> Result<()> {
+    if watched.table != shape.table {
+        return Err(Error::ShapeTableMismatch {
+            shape: shape.name.clone(),
+            table: shape.table.clone(),
+        });
+    }
+
+    for column in &shape.columns {
+        if !watched.columns.contains(column) {
+            return Err(Error::MissingShapeColumn {
+                shape: shape.name.clone(),
+                column: column.clone(),
+            });
+        }
+    }
+
+    validate_predicate_columns(watched, shape, &shape.predicate)
+}
+
+fn validate_predicate_columns(
+    watched: &WatchedTable,
+    shape: &Shape,
+    predicate: &Predicate,
+) -> Result<()> {
+    match predicate {
+        Predicate::All => Ok(()),
+        Predicate::Eq { column, .. } => {
+            if watched.columns.contains(column) {
+                Ok(())
+            } else {
+                Err(Error::MissingShapeColumn {
+                    shape: shape.name.clone(),
+                    column: column.clone(),
+                })
+            }
+        }
+        Predicate::And { predicates } => {
+            for predicate in predicates {
+                validate_predicate_columns(watched, shape, predicate)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn compile_predicate(shape: &Shape, predicate: &Predicate) -> Result<(String, Vec<SqlParam>)> {
+    match predicate {
+        Predicate::All => Ok((String::new(), Vec::new())),
+        Predicate::Eq { column, value } => {
+            let param = SqlParam::try_from_value(shape, value)?;
+            Ok((format!("{} = ?", quote_ident(column)), vec![param]))
+        }
+        Predicate::And { predicates } => {
+            let mut sql = Vec::new();
+            let mut params = Vec::new();
+            for predicate in predicates {
+                let (part, mut part_params) = compile_predicate(shape, predicate)?;
+                if part.is_empty() {
+                    continue;
+                }
+                sql.push(format!("({part})"));
+                params.append(&mut part_params);
+            }
+            Ok((sql.join(" AND "), params))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum SqlParam {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Bool(bool),
+}
+
+impl SqlParam {
+    fn try_from_value(shape: &Shape, value: &Value) -> Result<Self> {
+        Ok(match value {
+            Value::Null => Self::Null,
+            Value::Bool(v) => Self::Bool(*v),
+            Value::Number(n) => number_to_sql_param(shape, n)?,
+            Value::String(s) => Self::Text(s.clone()),
+            Value::Array(_) | Value::Object(_) => {
+                return Err(Error::UnsupportedPredicateValue {
+                    shape: shape.name.clone(),
+                    value: value.clone(),
+                });
+            }
+        })
+    }
+}
+
+impl ToSql for SqlParam {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        match self {
+            Self::Null => Ok(rusqlite::types::Null.into()),
+            Self::Integer(v) => Ok((*v).into()),
+            Self::Real(v) => Ok((*v).into()),
+            Self::Text(v) => Ok(v.as_str().into()),
+            Self::Bool(v) => Ok((*v as i64).into()),
+        }
+    }
+}
+
+fn number_to_sql_param(shape: &Shape, n: &Number) -> Result<SqlParam> {
+    if let Some(v) = n.as_i64() {
+        Ok(SqlParam::Integer(v))
+    } else if let Some(v) = n.as_u64().and_then(|v| i64::try_from(v).ok()) {
+        Ok(SqlParam::Integer(v))
+    } else if let Some(v) = n.as_f64() {
+        Ok(SqlParam::Real(v))
+    } else {
+        Err(Error::UnsupportedPredicateValue {
+            shape: shape.name.clone(),
+            value: Value::Number(n.clone()),
+        })
+    }
+}
+
 fn row_json_expr(prefix: &str, columns: &[String]) -> String {
     let parts = columns.iter().flat_map(|column| {
-        [
-            quote_string(column),
-            format!("{prefix}.{}", quote_ident(column)),
-        ]
+        let value = if prefix.is_empty() {
+            quote_ident(column)
+        } else {
+            format!("{prefix}.{}", quote_ident(column))
+        };
+        [quote_string(column), value]
     });
     format!("json_object({})", parts.collect::<Vec<_>>().join(", "))
 }
@@ -212,6 +401,7 @@ fn trigger_prefix(table: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use electrolite_core::{Predicate, Shape, ShapeMessage};
     use serde_json::json;
 
     fn setup(conn: &Connection) {
@@ -226,6 +416,20 @@ mod tests {
         )
         .unwrap();
         install_triggers(conn, "users", "id").unwrap();
+    }
+
+    fn active_users_shape() -> Shape {
+        Shape {
+            name: "activeUsers".to_string(),
+            table: "users".to_string(),
+            columns: vec!["id".to_string(), "name".to_string(), "active".to_string()],
+            predicate: Predicate::Eq {
+                column: "active".to_string(),
+                value: json!(1),
+            },
+            auth_scope: "public".to_string(),
+            schema_version: 1,
+        }
     }
 
     #[test]
@@ -307,5 +511,64 @@ mod tests {
             rows[0].new_json,
             Some(json!({"id": 1, "name": "Ada", "active": 1}))
         );
+    }
+
+    #[test]
+    fn snapshot_and_replay_shape_lifecycle() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let shape = active_users_shape();
+
+        conn.execute(
+            "INSERT INTO users (id, name, active) VALUES (1, 'Ada', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO users (id, name, active) VALUES (2, 'Grace', 0)",
+            [],
+        )
+        .unwrap();
+
+        let snapshot = initial_snapshot(&conn, &shape).unwrap();
+        assert_eq!(snapshot.offset, 2);
+        assert_eq!(
+            snapshot.rows,
+            vec![json!({"id": 1, "name": "Ada", "active": 1})]
+        );
+
+        conn.execute("UPDATE users SET active=1 WHERE id=2", [])
+            .unwrap();
+        let replayed = replay(&conn, &shape, snapshot.offset, 10).unwrap();
+        assert_eq!(replayed.offset, 3);
+        assert_eq!(replayed.messages.len(), 1);
+        assert!(matches!(
+            replayed.messages[0],
+            ShapeMessage::Insert { ref key, ref value, offset: 3 }
+                if *key == json!({"id": 2})
+                    && *value == json!({"id": 2, "name": "Grace", "active": 1})
+        ));
+
+        conn.execute("UPDATE users SET name='Grace Hopper' WHERE id=2", [])
+            .unwrap();
+        let replayed = replay(&conn, &shape, replayed.offset, 10).unwrap();
+        assert_eq!(replayed.offset, 4);
+        assert_eq!(replayed.messages.len(), 1);
+        assert!(matches!(
+            replayed.messages[0],
+            ShapeMessage::Update { ref key, ref value, offset: 4 }
+                if *key == json!({"id": 2})
+                    && *value == json!({"id": 2, "name": "Grace Hopper", "active": 1})
+        ));
+
+        conn.execute("UPDATE users SET active=0 WHERE id=2", [])
+            .unwrap();
+        let replayed = replay(&conn, &shape, replayed.offset, 10).unwrap();
+        assert_eq!(replayed.offset, 5);
+        assert_eq!(replayed.messages.len(), 1);
+        assert!(matches!(
+            replayed.messages[0],
+            ShapeMessage::Delete { ref key, offset: 5 } if *key == json!({"id": 2})
+        ));
     }
 }

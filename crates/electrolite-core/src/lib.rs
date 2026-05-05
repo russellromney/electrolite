@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Shape {
@@ -17,6 +18,29 @@ impl Shape {
         let bytes = serde_json::to_vec(self).expect("shape handle serialization is infallible");
         let digest = Sha256::digest(bytes);
         format!("{digest:x}")
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ShapeRegistry {
+    shapes: HashMap<String, Shape>,
+}
+
+impl ShapeRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&mut self, shape: Shape) -> Option<Shape> {
+        self.shapes.insert(shape.name.clone(), shape)
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Shape> {
+        self.shapes.get(name)
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.shapes.contains_key(name)
     }
 }
 
@@ -83,6 +107,18 @@ pub enum ShapeMessage {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub rows: Vec<Value>,
+    pub offset: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Replay {
+    pub messages: Vec<ShapeMessage>,
+    pub offset: i64,
+}
+
 pub fn message_for_log(shape: &Shape, row: &LogRow) -> Option<ShapeMessage> {
     if row.table_name != shape.table {
         return None;
@@ -132,6 +168,18 @@ mod tests {
     #[test]
     fn handles_are_stable() {
         assert_eq!(shape().handle(), shape().handle());
+    }
+
+    #[test]
+    fn registry_stores_shapes_by_name() {
+        let shape = shape();
+        let mut registry = ShapeRegistry::new();
+        assert!(!registry.contains("activeUsers"));
+
+        registry.add(shape.clone());
+
+        assert!(registry.contains("activeUsers"));
+        assert_eq!(registry.get("activeUsers"), Some(&shape));
     }
 
     #[test]
