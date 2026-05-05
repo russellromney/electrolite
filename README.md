@@ -3,10 +3,11 @@
 Embeddable Electric-style Shape sync for SQLite.
 
 Electrolite is a Rust-first experiment inspired directly by
-[Electric Sync](https://electric.ax/docs/sync/). Electric is a Postgres
-read-path sync engine: it consumes Postgres logical replication, exposes
-Shapes over HTTP, and lets clients materialize those Shapes with an
-initial sync followed by live logical updates.
+[ElectricSQL](https://electric-sql.com/) and its
+[Electric Sync](https://electric.ax/docs/sync/) engine. Electric Sync is
+a Postgres read-path sync engine: it consumes Postgres logical
+replication, exposes Shapes over HTTP, and lets clients materialize those
+Shapes with an initial sync followed by live logical updates.
 
 Electrolite tries to preserve that lifecycle for SQLite without requiring
 a separate sync daemon. The intended architecture:
