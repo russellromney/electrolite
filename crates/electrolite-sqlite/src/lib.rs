@@ -21,6 +21,8 @@ pub enum Error {
     ShapeTableMismatch { shape: String, table: String },
     #[error("shape {shape:?} references missing column {column:?}")]
     MissingShapeColumn { shape: String, column: String },
+    #[error("shape {shape:?} must include primary-key column {column:?}")]
+    MissingShapePrimaryKey { shape: String, column: String },
     #[error("unsupported predicate in shape {shape:?}")]
     UnsupportedPredicate { shape: String },
     #[error("unsupported predicate value {value:?} in shape {shape:?}")]
@@ -366,6 +368,13 @@ fn validate_shape_columns(watched: &WatchedTable, shape: &Shape) -> Result<()> {
                 column: column.clone(),
             });
         }
+    }
+
+    if !shape.columns.contains(&watched.pk_column) {
+        return Err(Error::MissingShapePrimaryKey {
+            shape: shape.name.clone(),
+            column: watched.pk_column.clone(),
+        });
     }
 
     validate_predicate_columns(watched, shape, &shape.predicate)
@@ -820,6 +829,30 @@ mod tests {
                 offset: 1,
             }]
         );
+    }
+
+    #[test]
+    fn shape_columns_must_include_primary_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let shape = Shape {
+            name: "activeUserNames".to_string(),
+            table: "users".to_string(),
+            columns: vec!["name".to_string(), "active".to_string()],
+            predicate: Predicate::Eq {
+                column: "active".to_string(),
+                value: json!(1),
+            },
+            auth_scope: "public".to_string(),
+            schema_version: 1,
+        };
+
+        let err = initial_snapshot(&conn, &shape).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MissingShapePrimaryKey { ref shape, ref column }
+                if shape == "activeUserNames" && column == "id"
+        ));
     }
 
     #[test]
