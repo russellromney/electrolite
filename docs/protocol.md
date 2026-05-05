@@ -56,6 +56,27 @@ Example response:
 }
 ```
 
+## Dynamic Shape Factories
+
+Static Shapes use:
+
+```http
+GET /electrolite/v1/shape/:name?offset=-1
+```
+
+Dynamic Shapes use a server-registered factory:
+
+```http
+GET /electrolite/v1/factory/:factory/:path?offset=-1
+```
+
+For example, `/electrolite/v1/factory/projectTodos/p1?offset=-1`
+can build a concrete Shape whose predicate is `project_id = "p1"` and
+whose authorization scope is `project:p1`. The browser still sends no
+SQL. The factory sees request headers/extensions and can deny malformed
+or unauthorized route parameters before a Shape is served; then the
+normal authorizer checks the generated Shape.
+
 ## Live Long-Poll
 
 ```http
@@ -104,6 +125,13 @@ true  -> true   update
 true  -> false  delete
 false -> false  ignore
 ```
+
+## Predicate Index
+
+The core crate has a `ShapeIndex` that narrows fanout work before exact
+membership evaluation. It indexes by table and equality predicate terms,
+then checks both old and new row images for candidate matches. That keeps
+rows entering and leaving a Shape visible to the exact transition logic.
 
 ## Resync
 

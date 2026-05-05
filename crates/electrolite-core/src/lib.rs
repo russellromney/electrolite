@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Shape {
@@ -60,6 +60,12 @@ impl Predicate {
         self.matches_object(row)
     }
 
+    pub fn eq_terms(&self) -> Vec<PredicateEqTerm> {
+        let mut terms = Vec::new();
+        self.collect_eq_terms(&mut terms);
+        terms
+    }
+
     fn matches_object(&self, row: &serde_json::Map<String, Value>) -> bool {
         match self {
             Predicate::All => true,
@@ -67,6 +73,141 @@ impl Predicate {
             Predicate::And { predicates } => predicates.iter().all(|p| p.matches_object(row)),
         }
     }
+
+    fn collect_eq_terms(&self, terms: &mut Vec<PredicateEqTerm>) {
+        match self {
+            Predicate::All => {}
+            Predicate::Eq { column, value } => terms.push(PredicateEqTerm {
+                column: column.clone(),
+                value: value.clone(),
+            }),
+            Predicate::And { predicates } => {
+                for predicate in predicates {
+                    predicate.collect_eq_terms(terms);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredicateEqTerm {
+    pub column: String,
+    pub value: Value,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ShapeIndex {
+    shapes: HashMap<String, Shape>,
+    handles_by_name: HashMap<String, String>,
+    table_scans: HashMap<String, Vec<String>>,
+    equality: HashMap<EqIndexKey, Vec<String>>,
+}
+
+impl ShapeIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&mut self, shape: Shape) -> Option<Shape> {
+        let handle = shape.handle();
+        let previous_handle = self
+            .handles_by_name
+            .insert(shape.name.clone(), handle.clone());
+        let previous = previous_handle
+            .as_ref()
+            .and_then(|handle| self.shapes.remove(handle));
+        if let Some(previous_handle) = previous_handle {
+            self.remove_from_indexes(&previous_handle);
+        }
+
+        self.shapes.insert(handle.clone(), shape.clone());
+        let terms = shape.predicate.eq_terms();
+        if terms.is_empty() {
+            self.table_scans
+                .entry(shape.table.clone())
+                .or_default()
+                .push(handle);
+            return previous;
+        }
+
+        let mut seen_terms = HashSet::new();
+        for term in terms {
+            let key = EqIndexKey::new(&shape.table, &term.column, &term.value);
+            if seen_terms.insert(key.clone()) {
+                self.equality.entry(key).or_default().push(handle.clone());
+            }
+        }
+
+        previous
+    }
+
+    pub fn candidates_for_log(&self, row: &LogRow) -> Vec<&Shape> {
+        let mut handles = HashSet::new();
+        if let Some(table_scan_handles) = self.table_scans.get(&row.table_name) {
+            handles.extend(table_scan_handles.iter().cloned());
+        }
+
+        for key in row_equality_keys(&row.table_name, row.old_json.as_ref())
+            .into_iter()
+            .chain(row_equality_keys(&row.table_name, row.new_json.as_ref()))
+        {
+            if let Some(indexed_handles) = self.equality.get(&key) {
+                handles.extend(indexed_handles.iter().cloned());
+            }
+        }
+
+        let mut shapes = handles
+            .iter()
+            .filter_map(|handle| self.shapes.get(handle))
+            .collect::<Vec<_>>();
+        shapes.sort_by(|a, b| a.handle().cmp(&b.handle()));
+        shapes
+    }
+
+    pub fn len(&self) -> usize {
+        self.shapes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.shapes.is_empty()
+    }
+
+    fn remove_from_indexes(&mut self, handle: &str) {
+        for handles in self.table_scans.values_mut() {
+            handles.retain(|candidate| candidate != handle);
+        }
+        for handles in self.equality.values_mut() {
+            handles.retain(|candidate| candidate != handle);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EqIndexKey {
+    table: String,
+    column: String,
+    value_json: String,
+}
+
+impl EqIndexKey {
+    fn new(table: &str, column: &str, value: &Value) -> Self {
+        Self {
+            table: table.to_string(),
+            column: column.to_string(),
+            value_json: serde_json::to_string(value)
+                .expect("predicate values serialize to canonical JSON"),
+        }
+    }
+}
+
+fn row_equality_keys(table: &str, row: Option<&Value>) -> Vec<EqIndexKey> {
+    let Some(Value::Object(row)) = row else {
+        return Vec::new();
+    };
+    row.iter()
+        .map(|(column, value)| EqIndexKey::new(table, column, value))
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,5 +445,216 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn predicate_eq_terms_collect_nested_and_terms() {
+        let predicate = Predicate::And {
+            predicates: vec![
+                Predicate::Eq {
+                    column: "project_id".to_string(),
+                    value: json!("p1"),
+                },
+                Predicate::Eq {
+                    column: "done".to_string(),
+                    value: json!(0),
+                },
+            ],
+        };
+
+        assert_eq!(
+            predicate.eq_terms(),
+            vec![
+                PredicateEqTerm {
+                    column: "project_id".to_string(),
+                    value: json!("p1"),
+                },
+                PredicateEqTerm {
+                    column: "done".to_string(),
+                    value: json!(0),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn shape_index_finds_equality_candidates_from_old_and_new_rows() {
+        let mut index = ShapeIndex::new();
+        index.add(shape());
+
+        let inactive_insert = LogRow {
+            seq: 1,
+            table_name: "users".to_string(),
+            op: LogOp::Insert,
+            pk_json: json!({"id": 1}),
+            old_pk_json: None,
+            new_pk_json: Some(json!({"id": 1})),
+            old_json: None,
+            new_json: Some(json!({"id": 1, "name": "Ada", "active": 0})),
+            created_at: 0,
+        };
+        assert!(index.candidates_for_log(&inactive_insert).is_empty());
+
+        let active_insert = LogRow {
+            new_json: Some(json!({"id": 1, "name": "Ada", "active": 1})),
+            ..inactive_insert.clone()
+        };
+        assert_eq!(
+            index
+                .candidates_for_log(&active_insert)
+                .into_iter()
+                .map(|shape| shape.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["activeUsers"]
+        );
+
+        let leaving_shape = LogRow {
+            seq: 2,
+            table_name: "users".to_string(),
+            op: LogOp::Update,
+            pk_json: json!({"id": 1}),
+            old_pk_json: Some(json!({"id": 1})),
+            new_pk_json: Some(json!({"id": 1})),
+            old_json: Some(json!({"id": 1, "name": "Ada", "active": 1})),
+            new_json: Some(json!({"id": 1, "name": "Ada", "active": 0})),
+            created_at: 0,
+        };
+        assert_eq!(
+            index
+                .candidates_for_log(&leaving_shape)
+                .into_iter()
+                .map(|shape| shape.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["activeUsers"]
+        );
+    }
+
+    #[test]
+    fn shape_index_includes_table_scan_shapes_and_filters_other_tables() {
+        let mut all_users = shape();
+        all_users.name = "allUsers".to_string();
+        all_users.predicate = Predicate::All;
+
+        let mut index = ShapeIndex::new();
+        index.add(all_users);
+
+        let users_row = LogRow {
+            seq: 1,
+            table_name: "users".to_string(),
+            op: LogOp::Insert,
+            pk_json: json!({"id": 1}),
+            old_pk_json: None,
+            new_pk_json: Some(json!({"id": 1})),
+            old_json: None,
+            new_json: Some(json!({"id": 1, "name": "Ada", "active": 0})),
+            created_at: 0,
+        };
+        assert_eq!(
+            index
+                .candidates_for_log(&users_row)
+                .into_iter()
+                .map(|shape| shape.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["allUsers"]
+        );
+
+        let posts_row = LogRow {
+            table_name: "posts".to_string(),
+            ..users_row
+        };
+        assert!(index.candidates_for_log(&posts_row).is_empty());
+    }
+
+    #[test]
+    fn shape_index_uses_any_equality_term_as_a_candidate_gate() {
+        let mut project_shape = shape();
+        project_shape.name = "openProjectTodos".to_string();
+        project_shape.table = "todos".to_string();
+        project_shape.predicate = Predicate::And {
+            predicates: vec![
+                Predicate::Eq {
+                    column: "project_id".to_string(),
+                    value: json!("p1"),
+                },
+                Predicate::Eq {
+                    column: "done".to_string(),
+                    value: json!(0),
+                },
+            ],
+        };
+
+        let mut index = ShapeIndex::new();
+        index.add(project_shape);
+
+        let row = LogRow {
+            seq: 1,
+            table_name: "todos".to_string(),
+            op: LogOp::Update,
+            pk_json: json!({"id": 1}),
+            old_pk_json: Some(json!({"id": 1})),
+            new_pk_json: Some(json!({"id": 1})),
+            old_json: Some(json!({"id": 1, "project_id": "p1", "done": 1})),
+            new_json: Some(json!({"id": 1, "project_id": "p1", "done": 0})),
+            created_at: 0,
+        };
+
+        assert_eq!(
+            index
+                .candidates_for_log(&row)
+                .into_iter()
+                .map(|shape| shape.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["openProjectTodos"]
+        );
+    }
+
+    #[test]
+    fn shape_index_replaces_shapes_by_name_without_stale_candidates() {
+        let mut index = ShapeIndex::new();
+        let mut indexed_shape = shape();
+        indexed_shape.name = "usersByStatus".to_string();
+        index.add(indexed_shape.clone());
+
+        indexed_shape.predicate = Predicate::Eq {
+            column: "active".to_string(),
+            value: json!(0),
+        };
+        assert_eq!(
+            index.add(indexed_shape),
+            Some(shape_with_name("usersByStatus"))
+        );
+        assert_eq!(index.len(), 1);
+
+        let active_row = LogRow {
+            seq: 1,
+            table_name: "users".to_string(),
+            op: LogOp::Insert,
+            pk_json: json!({"id": 1}),
+            old_pk_json: None,
+            new_pk_json: Some(json!({"id": 1})),
+            old_json: None,
+            new_json: Some(json!({"id": 1, "name": "Ada", "active": 1})),
+            created_at: 0,
+        };
+        assert!(index.candidates_for_log(&active_row).is_empty());
+
+        let inactive_row = LogRow {
+            new_json: Some(json!({"id": 1, "name": "Ada", "active": 0})),
+            ..active_row
+        };
+        assert_eq!(
+            index
+                .candidates_for_log(&inactive_row)
+                .into_iter()
+                .map(|shape| shape.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["usersByStatus"]
+        );
+    }
+
+    fn shape_with_name(name: &str) -> Shape {
+        let mut out = shape();
+        out.name = name.to_string();
+        out
     }
 }

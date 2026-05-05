@@ -41,6 +41,11 @@ In Electrolite today, a Shape is server-defined and contains:
 Browsers do not send arbitrary SQL. They request named Shapes that the
 host application has already defined and authorized.
 
+Applications can also register Shape factories for dynamic, server-owned
+routes such as `/projects/:project_id/todos`. A factory turns request
+path/auth context into a concrete Shape, and the normal authorizer still
+checks the generated authorization scope before SQLite is touched.
+
 ## Workspace
 
 - `crates/electrolite-core` - Shape definitions, handles, log rows, and
@@ -80,4 +85,5 @@ capture for simple primary-key tables, plus an embedded HTTP route for
 authorized initial snapshots, bounded replay, and `live=true`
 long-polling. The server now has a SQLite connection pool, in-process
 live wait coalescing, retained-offset resync errors, and a basic fanout
-benchmark harness.
+benchmark harness. Dynamic Shape factories and a table/equality predicate
+index are in place for the next fanout broker layer.

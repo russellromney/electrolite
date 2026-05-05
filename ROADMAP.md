@@ -106,9 +106,7 @@ Make the default safe for real applications.
 
 ### Dynamic Authorization Gap
 
-The first server supports static named Shapes with an auth hook. Apps can
-model "this user's photos" by registering a named Shape whose predicate
-and `auth_scope` are already user-specific. A later phase should add
+The server supports static named Shapes with an auth hook and dynamic
 Shape factories for app routes such as:
 
 ```text
@@ -116,10 +114,13 @@ Shape factories for app routes such as:
 /photos/:photo_id/friend-likes
 ```
 
-Factories must still build server-side Shapes; browsers still must not
-send arbitrary SQL. Relationship-shaped data such as "your friends' likes
-on your photos" also needs richer predicate/index support than the first
-`Eq`/`And` predicate set.
+Factories still build server-side Shapes; browsers still must not send
+arbitrary SQL. A factory can reject a request before the Shape exists,
+and the normal authorizer still checks the generated `auth_scope`.
+
+Relationship-shaped data such as "your friends' likes on your photos"
+still needs richer predicate/index support than the first `Eq`/`And`
+predicate set.
 
 ## Phase Crowd - Fanout And Caching
 
@@ -185,6 +186,15 @@ table=todos, done=false    -> [shapeA, shapeC]
 - On each log row, find candidate shapes first, then evaluate membership
   exactly.
 - Mark arbitrary predicates as slow path.
+
+### Implemented Slice
+
+- `ShapeIndex` indexes Shapes by table and equality predicate terms.
+- Candidate lookup considers both old and new row images so inserts,
+  updates, deletes, and membership transitions are all eligible for exact
+  evaluation.
+- `Predicate::All` and predicates without equality terms remain table
+  scan candidates.
 
 ## Phase Store - S3/Cinch Object Mode
 
