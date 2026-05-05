@@ -1,9 +1,14 @@
-# Node/Bun Native Package
+# TypeScript Backend API
 
-`@electrolite/node` is the intended TypeScript backend interface. It
-loads Electrolite's Rust core through a native Node-API module, so a
-Node or Bun app can own SQLite writes, authorization, and the sync HTTP
-route without running a separate Electrolite server.
+`@electrolite/node` is the main Electrolite API. It is designed for
+TypeScript backends first: a Node or Bun app owns SQLite writes,
+authorization, and the sync HTTP route without running a separate
+Electrolite server.
+
+The package is fast because the SQLite sync engine, trigger installer,
+snapshot reader, and replay logic run in Rust underneath through a
+native Node-API module. TypeScript code defines Shapes and authorization;
+Rust does the tight database work.
 
 ```text
 browser ShapeClient
