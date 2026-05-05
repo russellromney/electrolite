@@ -47,7 +47,8 @@ host application has already defined and authorized.
   membership transition logic.
 - `crates/electrolite-sqlite` - SQLite metadata tables, trigger
   generation, and log reads.
-- `crates/electrolite-server` - embedded HTTP snapshot and replay routes.
+- `crates/electrolite-server` - embedded authorized HTTP snapshot and
+  replay routes.
 - `clients/browser` - dependency-free browser materializer for Shape
   snapshots and live replay messages.
 
@@ -76,4 +77,5 @@ See [ROADMAP.md](ROADMAP.md).
 
 Early scaffold. The implemented slice is trigger-backed logical change
 capture for simple primary-key tables, plus an embedded HTTP route for
-initial snapshots, bounded replay, and `live=true` long-polling.
+authorized initial snapshots, bounded replay, and `live=true`
+long-polling.

@@ -1,8 +1,9 @@
 use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, request::Parts};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use electrolite_core::{Replay, ShapeMessage, ShapeRegistry, Snapshot};
+use electrolite_core::{Replay, Shape, ShapeMessage, ShapeRegistry, Snapshot};
 use http::StatusCode;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -15,10 +16,11 @@ use tokio::time::{Instant, sleep_until};
 
 pub const DEFAULT_ROUTE_PREFIX: &str = "/electrolite/v1";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServerState {
     db_path: Arc<PathBuf>,
     registry: Arc<ShapeRegistry>,
+    authorizer: Arc<dyn Authorizer>,
     notify: Arc<Notify>,
     replay_limit: i64,
     live_timeout: Duration,
@@ -26,10 +28,15 @@ pub struct ServerState {
 }
 
 impl ServerState {
-    pub fn new(db_path: impl Into<PathBuf>, registry: ShapeRegistry) -> Self {
+    pub fn new(
+        db_path: impl Into<PathBuf>,
+        registry: ShapeRegistry,
+        authorizer: impl Authorizer,
+    ) -> Self {
         Self {
             db_path: Arc::new(db_path.into()),
             registry: Arc::new(registry),
+            authorizer: Arc::new(authorizer),
             notify: Arc::new(Notify::new()),
             replay_limit: 1000,
             live_timeout: Duration::from_secs(20),
@@ -54,6 +61,35 @@ impl ServerState {
 
     pub fn notify_changed(&self) {
         self.notify.notify_waiters();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthDecision {
+    Allow,
+    Deny,
+}
+
+pub trait Authorizer: Send + Sync + 'static {
+    fn authorize(&self, context: &AuthContext<'_>) -> AuthDecision;
+}
+
+#[derive(Debug)]
+pub struct AuthContext<'a> {
+    pub headers: &'a HeaderMap,
+    pub extensions: &'a http::Extensions,
+    pub shape: &'a Shape,
+    pub shape_name: &'a str,
+    pub offset: i64,
+    pub live: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AllowAll;
+
+impl Authorizer for AllowAll {
+    fn authorize(&self, _context: &AuthContext<'_>) -> AuthDecision {
+        AuthDecision::Allow
     }
 }
 
@@ -108,6 +144,7 @@ pub struct ErrorBody {
 
 enum ServerError {
     ShapeNotFound(String),
+    Forbidden(String),
     Sqlite(rusqlite::Error),
     Electrolite(electrolite_sqlite::Error),
 }
@@ -118,6 +155,7 @@ impl IntoResponse for ServerError {
             Self::ShapeNotFound(name) => {
                 (StatusCode::NOT_FOUND, format!("shape not found: {name}"))
             }
+            Self::Forbidden(name) => (StatusCode::FORBIDDEN, format!("shape forbidden: {name}")),
             Self::Sqlite(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             Self::Electrolite(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
@@ -138,6 +176,7 @@ impl From<electrolite_sqlite::Error> for ServerError {
 }
 
 async fn get_shape(
+    parts: Parts,
     State(state): State<ServerState>,
     Path(name): Path<String>,
     Query(query): Query<ShapeQuery>,
@@ -147,6 +186,7 @@ async fn get_shape(
         .get(&name)
         .cloned()
         .ok_or_else(|| ServerError::ShapeNotFound(name.clone()))?;
+    authorize_shape(&state, &parts, &name, &shape, &query)?;
     let conn = Connection::open(state.db_path.as_ref())?;
 
     if query.offset < 0 {
@@ -158,6 +198,27 @@ async fn get_shape(
     } else {
         let replay = electrolite_sqlite::replay(&conn, &shape, query.offset, state.replay_limit)?;
         Ok(Json(ShapeResponse::from(replay)).into_response())
+    }
+}
+
+fn authorize_shape(
+    state: &ServerState,
+    parts: &Parts,
+    name: &str,
+    shape: &Shape,
+    query: &ShapeQuery,
+) -> Result<(), ServerError> {
+    let context = AuthContext {
+        headers: &parts.headers,
+        extensions: &parts.extensions,
+        shape,
+        shape_name: name,
+        offset: query.offset,
+        live: query.live,
+    };
+    match state.authorizer.authorize(&context) {
+        AuthDecision::Allow => Ok(()),
+        AuthDecision::Deny => Err(ServerError::Forbidden(name.to_string())),
     }
 }
 
@@ -194,7 +255,67 @@ mod tests {
     use electrolite_core::{Predicate, Shape};
     use http::{Request, StatusCode};
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
+
+    #[derive(Debug, Clone)]
+    struct Session {
+        scope: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedAuth {
+        shape_name: String,
+        auth_scope: String,
+        header_scope: Option<String>,
+        session_scope: Option<String>,
+        offset: i64,
+        live: bool,
+    }
+
+    #[derive(Debug)]
+    struct DenyAll;
+
+    impl Authorizer for DenyAll {
+        fn authorize(&self, _context: &AuthContext<'_>) -> AuthDecision {
+            AuthDecision::Deny
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScopeAuthorizer {
+        seen: Arc<Mutex<Vec<RecordedAuth>>>,
+    }
+
+    impl Authorizer for ScopeAuthorizer {
+        fn authorize(&self, context: &AuthContext<'_>) -> AuthDecision {
+            let header_scope = context
+                .headers
+                .get("x-electrolite-scope")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let session_scope = context
+                .extensions
+                .get::<Session>()
+                .map(|session| session.scope.clone());
+            self.seen.lock().unwrap().push(RecordedAuth {
+                shape_name: context.shape_name.to_string(),
+                auth_scope: context.shape.auth_scope.clone(),
+                header_scope: header_scope.clone(),
+                session_scope: session_scope.clone(),
+                offset: context.offset,
+                live: context.live,
+            });
+
+            if header_scope.as_deref() == Some(context.shape.auth_scope.as_str())
+                && session_scope.as_deref() == Some(context.shape.auth_scope.as_str())
+            {
+                AuthDecision::Allow
+            } else {
+                AuthDecision::Deny
+            }
+        }
+    }
 
     fn active_users_shape() -> Shape {
         Shape {
@@ -238,7 +359,7 @@ mod tests {
 
         let mut registry = ShapeRegistry::new();
         registry.add(active_users_shape());
-        let state = ServerState::new(path.clone(), registry)
+        let state = ServerState::new(path.clone(), registry, AllowAll)
             .with_live_timeout(Duration::from_millis(500))
             .with_poll_interval(Duration::from_millis(25));
         let app = router(state.clone());
@@ -316,6 +437,104 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn denied_shape_returns_403_before_opening_sqlite() {
+        let mut registry = ShapeRegistry::new();
+        registry.add(active_users_shape());
+        let app = router(ServerState::new("/missing/app.db", registry, DenyAll));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/electrolite/v1/shape/activeUsers?offset=-1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn authorizer_receives_headers_extensions_shape_and_query() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let authorizer = ScopeAuthorizer { seen: seen.clone() };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE users (
+              id INTEGER PRIMARY KEY,
+              name TEXT NOT NULL,
+              active INTEGER NOT NULL DEFAULT 0
+            );
+            ",
+        )
+        .unwrap();
+        electrolite_sqlite::install_triggers(&conn, "users", "id").unwrap();
+        let mut registry = ShapeRegistry::new();
+        registry.add(active_users_shape());
+        let app = router(
+            ServerState::new(path, registry, authorizer)
+                .with_live_timeout(Duration::from_millis(1))
+                .with_poll_interval(Duration::from_millis(1)),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/electrolite/v1/shape/activeUsers?offset=7&live=true")
+                    .header("x-electrolite-scope", "public")
+                    .extension(Session {
+                        scope: "public".to_string(),
+                    })
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![RecordedAuth {
+                shape_name: "activeUsers".to_string(),
+                auth_scope: "public".to_string(),
+                header_scope: Some("public".to_string()),
+                session_scope: Some("public".to_string()),
+                offset: 7,
+                live: true,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn authorizer_denies_when_scope_does_not_match() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let authorizer = ScopeAuthorizer { seen };
+        let mut registry = ShapeRegistry::new();
+        registry.add(active_users_shape());
+        let app = router(ServerState::new("/missing/app.db", registry, authorizer));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/electrolite/v1/shape/activeUsers?offset=-1")
+                    .header("x-electrolite-scope", "private")
+                    .extension(Session {
+                        scope: "public".to_string(),
+                    })
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
