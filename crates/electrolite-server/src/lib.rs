@@ -143,35 +143,36 @@ pub struct ErrorBody {
 }
 
 enum ServerError {
-    ShapeNotFound(String),
-    Forbidden(String),
-    Sqlite(rusqlite::Error),
-    Electrolite(electrolite_sqlite::Error),
+    ShapeNotFound,
+    ShapeDenied,
+    Sqlite,
+    Electrolite,
 }
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
         let (status, error) = match self {
-            Self::ShapeNotFound(name) => {
-                (StatusCode::NOT_FOUND, format!("shape not found: {name}"))
+            Self::ShapeNotFound | Self::ShapeDenied => {
+                (StatusCode::NOT_FOUND, "shape_not_found".to_string())
             }
-            Self::Forbidden(name) => (StatusCode::FORBIDDEN, format!("shape forbidden: {name}")),
-            Self::Sqlite(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-            Self::Electrolite(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Self::Sqlite | Self::Electrolite => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_server_error".to_string(),
+            ),
         };
         (status, Json(ErrorBody { error })).into_response()
     }
 }
 
 impl From<rusqlite::Error> for ServerError {
-    fn from(e: rusqlite::Error) -> Self {
-        Self::Sqlite(e)
+    fn from(_e: rusqlite::Error) -> Self {
+        Self::Sqlite
     }
 }
 
 impl From<electrolite_sqlite::Error> for ServerError {
-    fn from(e: electrolite_sqlite::Error) -> Self {
-        Self::Electrolite(e)
+    fn from(_e: electrolite_sqlite::Error) -> Self {
+        Self::Electrolite
     }
 }
 
@@ -185,7 +186,7 @@ async fn get_shape(
         .registry
         .get(&name)
         .cloned()
-        .ok_or_else(|| ServerError::ShapeNotFound(name.clone()))?;
+        .ok_or(ServerError::ShapeNotFound)?;
     authorize_shape(&state, &parts, &name, &shape, &query)?;
     let conn = Connection::open(state.db_path.as_ref())?;
 
@@ -218,7 +219,7 @@ fn authorize_shape(
     };
     match state.authorizer.authorize(&context) {
         AuthDecision::Allow => Ok(()),
-        AuthDecision::Deny => Err(ServerError::Forbidden(name.to_string())),
+        AuthDecision::Deny => Err(ServerError::ShapeDenied),
     }
 }
 
@@ -255,6 +256,7 @@ mod tests {
     use electrolite_core::{Predicate, Shape};
     use http::{Request, StatusCode};
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
 
@@ -314,6 +316,86 @@ mod tests {
             } else {
                 AuthDecision::Deny
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct HeaderScopeAuthorizer;
+
+    impl Authorizer for HeaderScopeAuthorizer {
+        fn authorize(&self, context: &AuthContext<'_>) -> AuthDecision {
+            if context
+                .headers
+                .get("x-electrolite-scope")
+                .and_then(|value| value.to_str().ok())
+                == Some(context.shape.auth_scope.as_str())
+            {
+                AuthDecision::Allow
+            } else {
+                AuthDecision::Deny
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct MaterializedShape {
+        key_columns: Vec<String>,
+        offset: i64,
+        rows: BTreeMap<String, Value>,
+    }
+
+    impl MaterializedShape {
+        fn new(key_columns: &[&str]) -> Self {
+            Self {
+                key_columns: key_columns
+                    .iter()
+                    .map(|column| column.to_string())
+                    .collect(),
+                offset: -1,
+                rows: BTreeMap::new(),
+            }
+        }
+
+        fn apply(&mut self, response: ShapeResponse) {
+            match response {
+                ShapeResponse::Snapshot { rows, offset } => {
+                    self.rows.clear();
+                    for row in rows {
+                        self.rows.insert(self.key_for_row(&row), row);
+                    }
+                    self.offset = offset;
+                }
+                ShapeResponse::Replay { messages, offset } => {
+                    for message in messages {
+                        match message {
+                            ShapeMessage::Insert { key, value, .. }
+                            | ShapeMessage::Update { key, value, .. } => {
+                                self.rows.insert(Self::key_to_string(&key), value);
+                            }
+                            ShapeMessage::Delete { key, .. } => {
+                                self.rows.remove(&Self::key_to_string(&key));
+                            }
+                        }
+                    }
+                    self.offset = offset;
+                }
+            }
+        }
+
+        fn values(&self) -> Vec<Value> {
+            self.rows.values().cloned().collect()
+        }
+
+        fn key_for_row(&self, row: &Value) -> String {
+            let mut key = serde_json::Map::new();
+            for column in &self.key_columns {
+                key.insert(column.clone(), row[column].clone());
+            }
+            Self::key_to_string(&Value::Object(key))
+        }
+
+        fn key_to_string(key: &Value) -> String {
+            serde_json::to_string(key).unwrap()
         }
     }
 
@@ -382,6 +464,22 @@ mod tests {
         (status, parsed)
     }
 
+    async fn error_response(app: Router, uri: &str) -> (StatusCode, ErrorBody) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed = serde_json::from_slice::<ErrorBody>(&body).unwrap();
+        (status, parsed)
+    }
+
     #[tokio::test]
     async fn serves_initial_snapshot() {
         let (_dir, _path, _state, app) = setup();
@@ -440,22 +538,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn denied_shape_returns_403_before_opening_sqlite() {
+    async fn denied_shape_returns_404_before_opening_sqlite() {
         let mut registry = ShapeRegistry::new();
         registry.add(active_users_shape());
         let app = router(ServerState::new("/missing/app.db", registry, DenyAll));
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/electrolite/v1/shape/activeUsers?offset=-1")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let (status, body) =
+            error_response(app, "/electrolite/v1/shape/activeUsers?offset=-1").await;
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            body,
+            ErrorBody {
+                error: "shape_not_found".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_errors_use_stable_public_body() {
+        let mut registry = ShapeRegistry::new();
+        registry.add(active_users_shape());
+        let app = router(ServerState::new(
+            "/missing/private/app.db",
+            registry,
+            AllowAll,
+        ));
+
+        let (status, body) =
+            error_response(app, "/electrolite/v1/shape/activeUsers?offset=-1").await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body,
+            ErrorBody {
+                error: "internal_server_error".to_string(),
+            }
+        );
     }
 
     #[tokio::test]
@@ -534,7 +653,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -642,6 +761,219 @@ mod tests {
                 offset: 3,
             }
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn e2e_user_flow_materializes_authorized_live_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE todos (
+              id INTEGER PRIMARY KEY,
+              project_id TEXT NOT NULL,
+              title TEXT NOT NULL,
+              done INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO todos (id, project_id, title, done) VALUES
+              (1, 'p1', 'ship electrolite', 0),
+              (2, 'p2', 'other project', 0),
+              (3, 'p1', 'hidden done item', 1);
+            ",
+        )
+        .unwrap();
+        electrolite_sqlite::install_triggers(&conn, "todos", "id").unwrap();
+
+        let shape = Shape {
+            name: "openProjectTodos".to_string(),
+            table: "todos".to_string(),
+            columns: vec![
+                "id".to_string(),
+                "project_id".to_string(),
+                "title".to_string(),
+                "done".to_string(),
+            ],
+            predicate: Predicate::And {
+                predicates: vec![
+                    Predicate::Eq {
+                        column: "project_id".to_string(),
+                        value: json!("p1"),
+                    },
+                    Predicate::Eq {
+                        column: "done".to_string(),
+                        value: json!(0),
+                    },
+                ],
+            },
+            auth_scope: "project:p1".to_string(),
+            schema_version: 1,
+        };
+        let mut registry = ShapeRegistry::new();
+        registry.add(shape);
+        let state = ServerState::new(path.clone(), registry, HeaderScopeAuthorizer)
+            .with_live_timeout(Duration::from_secs(2))
+            .with_poll_interval(Duration::from_millis(10));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}/electrolite/v1/shape/openProjectTodos");
+
+        let denied = client
+            .get(&base)
+            .query(&[("offset", "-1")])
+            .header("x-electrolite-scope", "project:p2")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+
+        let mut materialized = MaterializedShape::new(&["id"]);
+        let snapshot = client
+            .get(&base)
+            .query(&[("offset", "-1")])
+            .header("x-electrolite-scope", "project:p1")
+            .send()
+            .await
+            .unwrap()
+            .json::<ShapeResponse>()
+            .await
+            .unwrap();
+        materialized.apply(snapshot);
+        assert_eq!(
+            materialized.values(),
+            vec![json!({"id": 1, "project_id": "p1", "title": "ship electrolite", "done": 0})]
+        );
+
+        async fn live_after_write(
+            client: &reqwest::Client,
+            base: &str,
+            offset: i64,
+            state: &ServerState,
+            path: &std::path::Path,
+            sql: &str,
+        ) -> ShapeResponse {
+            let live = {
+                let client = client.clone();
+                let base = base.to_string();
+                tokio::spawn(async move {
+                    client
+                        .get(base)
+                        .query(&[("offset", offset.to_string()), ("live", "true".to_string())])
+                        .header("x-electrolite-scope", "project:p1")
+                        .send()
+                        .await
+                        .unwrap()
+                        .json::<ShapeResponse>()
+                        .await
+                        .unwrap()
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let conn = Connection::open(path).unwrap();
+            conn.execute(sql, []).unwrap();
+            state.notify_changed();
+            live.await.unwrap()
+        }
+
+        let replay = live_after_write(
+            &client,
+            &base,
+            materialized.offset,
+            &state,
+            &path,
+            "UPDATE todos SET done=0 WHERE id=3",
+        )
+        .await;
+        materialized.apply(replay);
+        assert_eq!(
+            materialized.values(),
+            vec![
+                json!({"id": 1, "project_id": "p1", "title": "ship electrolite", "done": 0}),
+                json!({"id": 3, "project_id": "p1", "title": "hidden done item", "done": 0}),
+            ]
+        );
+
+        let replay = live_after_write(
+            &client,
+            &base,
+            materialized.offset,
+            &state,
+            &path,
+            "UPDATE todos SET title='visible now' WHERE id=3",
+        )
+        .await;
+        materialized.apply(replay);
+        assert_eq!(
+            materialized.values(),
+            vec![
+                json!({"id": 1, "project_id": "p1", "title": "ship electrolite", "done": 0}),
+                json!({"id": 3, "project_id": "p1", "title": "visible now", "done": 0}),
+            ]
+        );
+
+        let replay = live_after_write(
+            &client,
+            &base,
+            materialized.offset,
+            &state,
+            &path,
+            "UPDATE todos SET done=1 WHERE id=3",
+        )
+        .await;
+        materialized.apply(replay);
+        assert_eq!(
+            materialized.values(),
+            vec![json!({"id": 1, "project_id": "p1", "title": "ship electrolite", "done": 0})]
+        );
+
+        let replay = live_after_write(
+            &client,
+            &base,
+            materialized.offset,
+            &state,
+            &path,
+            "DELETE FROM todos WHERE id=1",
+        )
+        .await;
+        materialized.apply(replay);
+        assert_eq!(materialized.values(), Vec::<Value>::new());
+
+        let replay = live_after_write(
+            &client,
+            &base,
+            materialized.offset,
+            &state,
+            &path,
+            "INSERT INTO todos (id, project_id, title, done) VALUES (4, 'p1', 'new visible', 0)",
+        )
+        .await;
+        materialized.apply(replay);
+        assert_eq!(
+            materialized.values(),
+            vec![json!({"id": 4, "project_id": "p1", "title": "new visible", "done": 0})]
+        );
+
+        let replay = live_after_write(
+            &client,
+            &base,
+            materialized.offset,
+            &state,
+            &path,
+            "UPDATE todos SET id=40 WHERE id=4",
+        )
+        .await;
+        materialized.apply(replay);
+        assert_eq!(
+            materialized.values(),
+            vec![json!({"id": 40, "project_id": "p1", "title": "new visible", "done": 0})]
+        );
+
         server.abort();
     }
 }

@@ -1,5 +1,5 @@
 use electrolite_core::{LogOp, LogRow, Predicate, Replay, Shape, Snapshot};
-use rusqlite::{Connection, ToSql};
+use rusqlite::{Connection, OptionalExtension, ToSql, params};
 use serde_json::{Number, Value};
 use thiserror::Error;
 
@@ -19,6 +19,10 @@ pub enum Error {
     InvalidLogOp(String),
     #[error("shape {shape:?} references table {table:?}, which is not watched")]
     ShapeTableMismatch { shape: String, table: String },
+    #[error(
+        "shape {shape:?} references table {table:?}, but Electrolite triggers are not installed"
+    )]
+    UnwatchedTable { shape: String, table: String },
     #[error("shape {shape:?} references missing column {column:?}")]
     MissingShapeColumn { shape: String, column: String },
     #[error("shape {shape:?} must include primary-key column {column:?}")]
@@ -187,8 +191,26 @@ fn install_triggers_for_watched(conn: &Connection, watched: WatchedTable) -> Res
         update_trigger = quote_ident(&format!("{trigger_prefix}_au")),
         delete_trigger = quote_ident(&format!("{trigger_prefix}_ad")),
     ))?;
+    record_watched_table(conn, &watched)?;
 
     Ok(watched)
+}
+
+fn record_watched_table(conn: &Connection, watched: &WatchedTable) -> Result<()> {
+    let value = serde_json::json!({
+        "table": watched.table,
+        "pk_column": watched.pk_column,
+        "columns": watched.columns,
+    })
+    .to_string();
+    conn.execute(
+        "
+        INSERT OR REPLACE INTO _electrolite_meta (key, value)
+        VALUES (?1, ?2)
+        ",
+        params![watched_table_key(&watched.table), value],
+    )?;
+    Ok(())
 }
 
 pub fn read_log_since(conn: &Connection, offset: i64, limit: i64) -> Result<Vec<LogRow>> {
@@ -270,6 +292,7 @@ pub fn initial_snapshot(conn: &Connection, shape: &Shape) -> Result<Snapshot> {
     bootstrap(conn)?;
     let watched = inspect_table_primary_key(conn, &shape.table)?;
     validate_shape_columns(&watched, shape)?;
+    require_watched_table(conn, shape, &watched)?;
 
     let (where_sql, params) = compile_predicate(shape, &shape.predicate)?;
     let row_expr = row_json_expr("", &shape.columns);
@@ -329,6 +352,11 @@ fn add_column_if_missing(
 }
 
 pub fn replay(conn: &Connection, shape: &Shape, offset: i64, limit: i64) -> Result<Replay> {
+    bootstrap(conn)?;
+    let watched = inspect_table_primary_key(conn, &shape.table)?;
+    validate_shape_columns(&watched, shape)?;
+    require_watched_table(conn, shape, &watched)?;
+
     let rows = read_log_since(conn, offset, limit)?;
     let mut messages = Vec::new();
     let mut latest = offset;
@@ -342,6 +370,33 @@ pub fn replay(conn: &Connection, shape: &Shape, offset: i64, limit: i64) -> Resu
         messages,
         offset: latest,
     })
+}
+
+fn require_watched_table(conn: &Connection, shape: &Shape, watched: &WatchedTable) -> Result<()> {
+    let value = conn
+        .query_row(
+            "SELECT value FROM _electrolite_meta WHERE key = ?1",
+            params![watched_table_key(&watched.table)],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(value) = value else {
+        return Err(Error::UnwatchedTable {
+            shape: shape.name.clone(),
+            table: watched.table.clone(),
+        });
+    };
+
+    let value = serde_json::from_str::<Value>(&value)?;
+    let installed_pk = value.get("pk_column").and_then(Value::as_str);
+    if installed_pk != Some(watched.pk_column.as_str()) {
+        return Err(Error::UnwatchedTable {
+            shape: shape.name.clone(),
+            table: watched.table.clone(),
+        });
+    }
+
+    Ok(())
 }
 
 pub fn high_water_mark(conn: &Connection) -> Result<i64> {
@@ -517,6 +572,10 @@ fn trigger_prefix(table: &str) -> String {
     out
 }
 
+fn watched_table_key(table: &str) -> String {
+    format!("watched_table:{table}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,6 +747,53 @@ mod tests {
         assert!(matches!(
             replayed.messages[0],
             ShapeMessage::Delete { ref key, offset: 5 } if *key == json!({"id": 2})
+        ));
+    }
+
+    #[test]
+    fn snapshot_requires_triggers_to_be_installed() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE users (
+              id INTEGER PRIMARY KEY,
+              name TEXT NOT NULL,
+              active INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO users (id, name, active) VALUES (1, 'Ada', 1);
+            ",
+        )
+        .unwrap();
+        let shape = active_users_shape();
+
+        let err = initial_snapshot(&conn, &shape).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::UnwatchedTable { ref shape, ref table }
+                if shape == "activeUsers" && table == "users"
+        ));
+    }
+
+    #[test]
+    fn replay_requires_triggers_to_be_installed() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE users (
+              id INTEGER PRIMARY KEY,
+              name TEXT NOT NULL,
+              active INTEGER NOT NULL DEFAULT 0
+            );
+            ",
+        )
+        .unwrap();
+        let shape = active_users_shape();
+
+        let err = replay(&conn, &shape, 0, 10).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::UnwatchedTable { ref shape, ref table }
+                if shape == "activeUsers" && table == "users"
         ));
     }
 

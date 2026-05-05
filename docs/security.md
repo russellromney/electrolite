@@ -23,9 +23,11 @@ request is a live long-poll.
 let state = ServerState::new(db_path, registry, AppAuthorizer);
 ```
 
-The route denies unauthorized requests with `403 Forbidden` before
-opening SQLite or reading the Electrolite log. `AllowAll` exists for
-tests and local demos, but it must be selected explicitly.
+The route denies unauthorized requests before opening SQLite or reading
+the Electrolite log. Denied Shapes return `404 Not Found` by default so
+callers cannot distinguish private Shape names from missing Shape names.
+`AllowAll` exists for tests and local demos, but it must be selected
+explicitly.
 
 Host apps should authenticate before the Electrolite route runs, then put
 their session/user object into request extensions. The authorizer maps
@@ -48,6 +50,8 @@ app can mint signed shape URLs. The signature covers:
 
 - Raw `_electrolite_log` is private.
 - Authorization happens before SQLite is opened.
+- SQLite and Electrolite internals are not serialized into HTTP error
+  bodies.
 - Public/object-store data must be authorized shape output, not global
   database changes.
 - Shape handles include auth scope.

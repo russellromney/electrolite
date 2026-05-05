@@ -107,3 +107,18 @@ If a client asks for an offset older than retained history:
 ```
 
 The client restarts with `offset=-1`.
+
+## Public Errors
+
+The HTTP server returns stable public error bodies. Internal SQLite and
+Electrolite details are not serialized to clients.
+
+```json
+{ "error": "internal_server_error" }
+```
+
+Denied Shapes return the same public response as missing Shapes:
+
+```json
+{ "error": "shape_not_found" }
+```
