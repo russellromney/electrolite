@@ -378,7 +378,7 @@ fn read_log_page_since(
     offset: i64,
     limit: i64,
 ) -> Result<LogPage> {
-    let limit = limit.max(0);
+    let limit = limit.max(1);
     let mut rows = read_log_since_limited(conn, table_name, offset, limit)?;
     if limit > 0 && rows.len() == limit as usize {
         if let Some(last) = rows.last() {
@@ -606,16 +606,18 @@ pub fn replay(conn: &Connection, shape: &Shape, offset: i64, limit: i64) -> Resu
     Ok(replay_page(conn, shape, offset, limit)?.replay())
 }
 
+pub fn shape_handle(conn: &Connection, shape: &Shape) -> Result<String> {
+    let watched = validated_watched_table(conn, shape)?;
+    Ok(normalize_shape_predicate(&watched, shape)?.handle())
+}
+
 pub fn replay_page(
     conn: &Connection,
     shape: &Shape,
     offset: i64,
     limit: i64,
 ) -> Result<ShapeReplayPage> {
-    bootstrap(conn)?;
-    let watched = inspect_table_primary_key(conn, &shape.table)?;
-    validate_shape_columns(&watched, shape)?;
-    require_watched_table(conn, shape, &watched)?;
+    let watched = validated_watched_table(conn, shape)?;
     let normalized_shape = normalize_shape_predicate(&watched, shape)?;
 
     read_transaction(conn, |conn| {
@@ -644,6 +646,14 @@ pub fn replay_page(
             up_to_date: page.up_to_date,
         })
     })
+}
+
+fn validated_watched_table(conn: &Connection, shape: &Shape) -> Result<WatchedTable> {
+    bootstrap(conn)?;
+    let watched = inspect_table_primary_key(conn, &shape.table)?;
+    validate_shape_columns(&watched, shape)?;
+    require_watched_table(conn, shape, &watched)?;
+    Ok(watched)
 }
 
 fn read_transaction<T>(
@@ -1652,6 +1662,76 @@ mod tests {
         assert_eq!(public_replay.offset, 1);
         assert_eq!(public_replay.up_to_date, false);
         assert_eq!(public_replay.messages.len(), 1);
+    }
+
+    #[test]
+    fn replay_limit_zero_still_advances() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let shape = active_users_shape();
+
+        conn.execute(
+            "INSERT INTO users (id, name, active) VALUES (1, 'Ada', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO users (id, name, active) VALUES (2, 'Grace', 1)",
+            [],
+        )
+        .unwrap();
+
+        let replayed = replay(&conn, &shape, 0, 0).unwrap();
+        assert_eq!(replayed.offset, 1);
+        assert!(!replayed.up_to_date);
+        assert_eq!(replayed.messages.len(), 1);
+    }
+
+    #[test]
+    fn shape_handles_are_schema_normalized() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE flags (
+              id INTEGER PRIMARY KEY,
+              enabled BOOLEAN NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+        install_triggers_auto(&conn, "flags").unwrap();
+        let boolean_shape = Shape {
+            name: "enabledFlagsBool".to_string(),
+            table: "flags".to_string(),
+            columns: vec!["id".to_string(), "enabled".to_string()],
+            predicate: Predicate::Eq {
+                column: "enabled".to_string(),
+                value: json!(true),
+            },
+            auth_scope: "public".to_string(),
+            schema_version: 1,
+        };
+        let integer_shape = Shape {
+            name: "enabledFlagsInt".to_string(),
+            predicate: Predicate::Eq {
+                column: "enabled".to_string(),
+                value: json!(1),
+            },
+            ..boolean_shape.clone()
+        };
+
+        assert_ne!(boolean_shape.handle(), integer_shape.handle());
+        assert_eq!(
+            shape_handle(&conn, &boolean_shape).unwrap(),
+            shape_handle(&conn, &integer_shape).unwrap()
+        );
+        assert_eq!(
+            replay_page(&conn, &boolean_shape, 0, 10)
+                .unwrap()
+                .cursor
+                .shape_handle,
+            shape_handle(&conn, &boolean_shape).unwrap()
+        );
     }
 
     #[test]

@@ -554,8 +554,11 @@ async fn live_replay(
     shape: electrolite_core::Shape,
     offset: i64,
 ) -> Result<Response, ServerError> {
+    let conn = state.pool.get().await?;
+    let shape_handle = electrolite_sqlite::shape_handle(&conn, &shape)?;
+    drop(conn);
     let key = LiveWaitKey {
-        shape_handle: shape.handle(),
+        shape_handle,
         offset,
     };
     match state.waiters.subscribe_or_create(key.clone()) {

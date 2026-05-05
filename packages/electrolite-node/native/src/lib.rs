@@ -68,7 +68,9 @@ impl NativeElectrolite {
 
     #[napi]
     pub fn shape_handle(&self, shape_json: String) -> Result<String> {
-        Ok(parse_shape(&shape_json)?.handle())
+        let conn = self.pool.get()?;
+        let shape = parse_shape(&shape_json)?;
+        electrolite_sqlite::shape_handle(&conn, &shape).map_err(to_napi)
     }
 
     #[napi]

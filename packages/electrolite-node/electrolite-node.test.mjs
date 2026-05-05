@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { ShapeClient } from "../../clients/browser/electrolite.js";
-import { createElectrolite, eq, inList, shape } from "./electrolite-node.js";
+import { createElectrolite, all, eq, inList, shape } from "./electrolite-node.js";
 
 test("serves an authorized dynamic Shape through the native Rust binding", async () => {
   const { dir, electrolite } = setup();
@@ -160,6 +160,54 @@ test("returns resync_required after retained history is compacted", async () => 
     );
     assert.equal(response.status, 409);
     assert.deepEqual(await response.json(), { error: "resync_required" });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("shape handles are normalized against SQLite schema", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "electrolite-node-"));
+  const dbPath = join(dir, "app.db");
+  const electrolite = createElectrolite({
+    dbPath,
+    shapes: {
+      enabledFlags: shape({
+        table: "flags",
+        columns: ["id", "enabled"],
+        params: ["value"],
+        where: ({ params }) => eq("enabled", params.value === "true" ? true : 1),
+        authorize: () => true,
+      }),
+      allFlags: shape({
+        table: "flags",
+        columns: ["id", "enabled"],
+        where: () => all(),
+      }),
+    },
+  });
+  try {
+    electrolite.executeBatch(`
+      CREATE TABLE flags (
+        id INTEGER PRIMARY KEY,
+        enabled BOOLEAN NOT NULL
+      );
+    `);
+    electrolite.installTriggers("flags");
+
+    const boolResponse = await electrolite.handle(
+      new Request("https://app.test/electrolite/v1/enabledFlags/true?offset=-1"),
+      {},
+    );
+    const intResponse = await electrolite.handle(
+      new Request("https://app.test/electrolite/v1/enabledFlags/one?offset=-1"),
+      {},
+    );
+    assert.equal(boolResponse.status, 200);
+    assert.equal(intResponse.status, 200);
+    assert.equal(
+      (await boolResponse.json()).shape_handle,
+      (await intResponse.json()).shape_handle,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
