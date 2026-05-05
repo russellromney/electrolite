@@ -78,7 +78,7 @@ async fn main() {
         .await
         .expect("snapshot json");
     let snapshot_elapsed = started.elapsed();
-    let ShapeResponse::Snapshot { offset, rows } = snapshot else {
+    let ShapeResponse::Snapshot { offset, rows, .. } = snapshot else {
         panic!("expected snapshot");
     };
 

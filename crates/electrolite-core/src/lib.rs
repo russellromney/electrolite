@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Shape {
@@ -15,10 +15,33 @@ pub struct Shape {
 
 impl Shape {
     pub fn handle(&self) -> String {
-        let bytes = serde_json::to_vec(self).expect("shape handle serialization is infallible");
+        let bytes = serde_json::to_vec(&self.canonical_handle_input())
+            .expect("shape handle serialization is infallible");
         let digest = Sha256::digest(bytes);
         format!("{digest:x}")
     }
+
+    fn canonical_handle_input(&self) -> CanonicalShape<'_> {
+        let mut columns = self.columns.clone();
+        columns.sort();
+        columns.dedup();
+        CanonicalShape {
+            table: &self.table,
+            columns,
+            predicate: self.predicate.canonical(),
+            auth_scope: &self.auth_scope,
+            schema_version: self.schema_version,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CanonicalShape<'a> {
+    table: &'a str,
+    columns: Vec<String>,
+    predicate: Predicate,
+    auth_scope: &'a str,
+    schema_version: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -101,6 +124,63 @@ impl Predicate {
             }
         }
     }
+
+    pub fn canonical(&self) -> Predicate {
+        match self {
+            Predicate::All => Predicate::All,
+            Predicate::Eq { column, value } => Predicate::Eq {
+                column: column.clone(),
+                value: value.clone(),
+            },
+            Predicate::In { column, values } => {
+                let mut seen = BTreeSet::new();
+                let mut values = values
+                    .iter()
+                    .filter(|value| {
+                        seen.insert(
+                            serde_json::to_string(value)
+                                .expect("predicate values serialize to canonical JSON"),
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                values.sort_by_key(|value| {
+                    serde_json::to_string(value)
+                        .expect("predicate values serialize to canonical JSON")
+                });
+                if let [value] = values.as_slice() {
+                    Predicate::Eq {
+                        column: column.clone(),
+                        value: value.clone(),
+                    }
+                } else {
+                    Predicate::In {
+                        column: column.clone(),
+                        values,
+                    }
+                }
+            }
+            Predicate::And { predicates } => {
+                let mut predicates = predicates
+                    .iter()
+                    .flat_map(|predicate| match predicate.canonical() {
+                        Predicate::And { predicates } => predicates,
+                        predicate => vec![predicate],
+                    })
+                    .collect::<Vec<_>>();
+                predicates.sort_by_key(|predicate| {
+                    serde_json::to_string(predicate)
+                        .expect("predicates serialize to canonical JSON")
+                });
+                predicates.dedup();
+                match predicates.as_slice() {
+                    [] => Predicate::All,
+                    [predicate] => predicate.clone(),
+                    _ => Predicate::And { predicates },
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,10 +209,15 @@ impl ShapeIndex {
             .insert(shape.name.clone(), handle.clone());
         let previous = previous_handle
             .as_ref()
-            .and_then(|handle| self.shapes.remove(handle));
-        if let Some(previous_handle) = previous_handle {
-            self.remove_from_indexes(&previous_handle);
+            .and_then(|handle| self.shapes.get(handle))
+            .cloned();
+        if let Some(previous_handle) = previous_handle.as_ref() {
+            if previous_handle != &handle && !self.handle_has_name(previous_handle) {
+                self.shapes.remove(previous_handle);
+                self.remove_from_indexes(previous_handle);
+            }
         }
+        self.remove_from_indexes(&handle);
 
         self.shapes.insert(handle.clone(), shape.clone());
         let terms = shape.predicate.eq_terms();
@@ -193,6 +278,12 @@ impl ShapeIndex {
         for handles in self.equality.values_mut() {
             handles.retain(|candidate| candidate != handle);
         }
+    }
+
+    fn handle_has_name(&self, handle: &str) -> bool {
+        self.handles_by_name
+            .values()
+            .any(|candidate| candidate == handle)
     }
 }
 
@@ -266,14 +357,17 @@ pub enum ShapeMessage {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
+    pub key_columns: Vec<String>,
     pub rows: Vec<Value>,
     pub offset: i64,
+    pub up_to_date: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Replay {
     pub messages: Vec<ShapeMessage>,
     pub offset: i64,
+    pub up_to_date: bool,
 }
 
 pub fn message_for_log(shape: &Shape, row: &LogRow) -> Option<ShapeMessage> {
@@ -363,6 +457,59 @@ mod tests {
     #[test]
     fn handles_are_stable() {
         assert_eq!(shape().handle(), shape().handle());
+    }
+
+    #[test]
+    fn handles_ignore_name_and_canonicalize_columns_and_predicates() {
+        let shape_a = Shape {
+            name: "projectTodos/p1-p2".to_string(),
+            table: "todos".to_string(),
+            columns: vec![
+                "title".to_string(),
+                "id".to_string(),
+                "project_id".to_string(),
+                "id".to_string(),
+            ],
+            predicate: Predicate::And {
+                predicates: vec![
+                    Predicate::Eq {
+                        column: "done".to_string(),
+                        value: json!(0),
+                    },
+                    Predicate::In {
+                        column: "project_id".to_string(),
+                        values: vec![json!("p2"), json!("p1"), json!("p1")],
+                    },
+                ],
+            },
+            auth_scope: "projects:p1,p2".to_string(),
+            schema_version: 1,
+        };
+        let shape_b = Shape {
+            name: "anotherName".to_string(),
+            table: "todos".to_string(),
+            columns: vec![
+                "project_id".to_string(),
+                "id".to_string(),
+                "title".to_string(),
+            ],
+            predicate: Predicate::And {
+                predicates: vec![
+                    Predicate::In {
+                        column: "project_id".to_string(),
+                        values: vec![json!("p1"), json!("p2")],
+                    },
+                    Predicate::Eq {
+                        column: "done".to_string(),
+                        value: json!(0),
+                    },
+                ],
+            },
+            auth_scope: "projects:p1,p2".to_string(),
+            schema_version: 1,
+        };
+
+        assert_eq!(shape_a.handle(), shape_b.handle());
     }
 
     #[test]
@@ -697,6 +844,39 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["usersByStatus"]
         );
+    }
+
+    #[test]
+    fn shape_index_allows_multiple_names_for_same_canonical_handle() {
+        let mut index = ShapeIndex::new();
+        let mut alias = shape();
+        alias.name = "alias".to_string();
+
+        index.add(shape());
+        index.add(alias.clone());
+
+        assert_eq!(index.len(), 1);
+        let row = LogRow {
+            seq: 1,
+            batch_id: "batch".to_string(),
+            table_name: "users".to_string(),
+            op: LogOp::Insert,
+            pk_json: json!({"id": 1}),
+            old_pk_json: None,
+            new_pk_json: Some(json!({"id": 1})),
+            old_json: None,
+            new_json: Some(json!({"id": 1, "name": "Ada", "active": 1})),
+            created_at: 0,
+        };
+        let candidates = index.candidates_for_log(&row);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].handle(), alias.handle());
+
+        let mut alias_private = alias;
+        alias_private.auth_scope = "private".to_string();
+        index.add(alias_private);
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.candidates_for_log(&row).len(), 2);
     }
 
     fn shape_with_name(name: &str) -> Shape {

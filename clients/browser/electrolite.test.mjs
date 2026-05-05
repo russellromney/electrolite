@@ -15,10 +15,12 @@ test("materializes snapshots and replay messages", () => {
   assert.equal(
     client.apply({
       type: "snapshot",
+      key_columns: ["id"],
       rows: [
         { id: 1, name: "Ada", active: 1 },
       ],
       offset: 2,
+      up_to_date: true,
     }),
     true,
   );
@@ -43,6 +45,7 @@ test("materializes snapshots and replay messages", () => {
         },
       ],
       offset: 4,
+      up_to_date: true,
     }),
     true,
   );
@@ -62,6 +65,7 @@ test("materializes snapshots and replay messages", () => {
         },
       ],
       offset: 5,
+      up_to_date: true,
     }),
     true,
   );
@@ -95,8 +99,10 @@ test("handles resync_required by clearing rows and fetching a new snapshot", asy
       ok: true,
       json: async () => ({
         type: "snapshot",
+        key_columns: ["id"],
         rows: [{ id: 7, name: "Ada", active: 1 }],
         offset: 42,
+        up_to_date: true,
       }),
     },
   ];
@@ -106,8 +112,10 @@ test("handles resync_required by clearing rows and fetching a new snapshot", asy
   });
   client.apply({
     type: "snapshot",
+    key_columns: ["id"],
     rows: [{ id: 1, name: "Old", active: 1 }],
     offset: 10,
+    up_to_date: true,
   });
 
   assert.equal(await client.request({ offset: 10, live: true }), true);
@@ -123,8 +131,10 @@ test("emits status updates", async () => {
       ok: true,
       json: async () => ({
         type: "snapshot",
+        key_columns: ["id"],
         rows: [],
         offset: 0,
+        up_to_date: true,
       }),
     }),
   });
@@ -134,4 +144,73 @@ test("emits status updates", async () => {
   await client.request({ offset: -1 });
 
   assert.deepEqual(statuses, ["idle", "snapshot", "ready"]);
+});
+
+test("infers key columns from snapshots", () => {
+  const client = new ShapeClient("http://app.test/electrolite/v1/shape/activeUsers", {
+    fetch: async () => {
+      throw new Error("unused");
+    },
+  });
+
+  client.apply({
+    type: "snapshot",
+    key_columns: ["id"],
+    rows: [{ id: 1, name: "Ada", active: 1 }],
+    offset: 2,
+    up_to_date: true,
+  });
+
+  assert.deepEqual(client.currentRows(), [{ id: 1, name: "Ada", active: 1 }]);
+  assert.deepEqual(client.keyColumns, ["id"]);
+});
+
+test("stages replay messages until up_to_date", () => {
+  const client = new ShapeClient("http://app.test/electrolite/v1/shape/activeUsers", {
+    keyColumns: ["id"],
+    fetch: async () => {
+      throw new Error("unused");
+    },
+  });
+  const seen = [];
+  client.subscribe((rows) => seen.push(rows));
+  client.apply({
+    type: "snapshot",
+    key_columns: ["id"],
+    rows: [{ id: 1, name: "Ada", active: 1 }],
+    offset: 1,
+    up_to_date: true,
+  });
+
+  assert.equal(
+    client.apply({
+      type: "replay",
+      messages: [
+        {
+          type: "update",
+          key: { id: 1 },
+          value: { id: 1, name: "Ada Lovelace", active: 1 },
+          offset: 2,
+        },
+      ],
+      offset: 2,
+      up_to_date: false,
+    }),
+    false,
+  );
+  assert.deepEqual(client.currentRows(), [{ id: 1, name: "Ada", active: 1 }]);
+
+  assert.equal(
+    client.apply({
+      type: "replay",
+      messages: [],
+      offset: 2,
+      up_to_date: true,
+    }),
+    true,
+  );
+  assert.deepEqual(client.currentRows(), [
+    { id: 1, name: "Ada Lovelace", active: 1 },
+  ]);
+  assert.equal(seen.length, 3);
 });

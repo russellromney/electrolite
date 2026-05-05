@@ -1,6 +1,7 @@
 use electrolite_core::{LogOp, LogRow, Predicate, Replay, Shape, Snapshot};
 use rusqlite::{Connection, OptionalExtension, ToSql, params};
 use serde_json::{Number, Value};
+use std::collections::HashMap;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -11,8 +12,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("table {table:?} has no primary-key column {pk_column:?}")]
     MissingPrimaryKey { table: String, pk_column: String },
-    #[error("table {table:?} must have exactly one primary-key column, found {columns:?}")]
-    UnsupportedPrimaryKey { table: String, columns: Vec<String> },
+    #[error("table {table:?} has no primary-key columns")]
+    MissingPrimaryKeys { table: String },
     #[error("table {table:?} has no columns")]
     EmptyTable { table: String },
     #[error("unknown electrolite log operation {0:?}")]
@@ -36,6 +37,14 @@ pub enum Error {
     UnsupportedPredicate { shape: String },
     #[error("unsupported predicate value {value:?} in shape {shape:?}")]
     UnsupportedPredicateValue { shape: String, value: Value },
+    #[error(
+        "unsupported shape column type {declared_type:?} for column {column:?} in shape {shape:?}"
+    )]
+    UnsupportedShapeColumnType {
+        shape: String,
+        column: String,
+        declared_type: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -43,8 +52,41 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchedTable {
     pub table: String,
-    pub pk_column: String,
+    pub pk_columns: Vec<String>,
     pub columns: Vec<String>,
+    column_types: HashMap<String, ColumnType>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ColumnInfo {
+    name: String,
+    declared_type: String,
+    affinity: ColumnAffinity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ColumnType {
+    declared_type: String,
+    affinity: ColumnAffinity,
+}
+
+impl ColumnType {
+    fn is_booleanish(&self) -> bool {
+        self.declared_type.to_ascii_uppercase().contains("BOOL")
+    }
+
+    fn is_blob(&self) -> bool {
+        self.affinity == ColumnAffinity::Blob && !self.declared_type.trim().is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnAffinity {
+    Integer,
+    Real,
+    Text,
+    Blob,
+    Numeric,
 }
 
 pub fn bootstrap(conn: &Connection) -> Result<()> {
@@ -87,15 +129,8 @@ pub fn bootstrap(conn: &Connection) -> Result<()> {
 }
 
 pub fn inspect_table(conn: &Connection, table: &str, pk_column: &str) -> Result<WatchedTable> {
-    let (columns, primary_keys) = table_columns(conn, table)?;
-    if primary_keys.len() != 1 {
-        return Err(Error::UnsupportedPrimaryKey {
-            table: table.to_string(),
-            columns: primary_keys,
-        });
-    }
-    let has_pk = primary_keys[0] == pk_column;
-    if !has_pk {
+    let (column_infos, primary_keys) = table_columns(conn, table)?;
+    if primary_keys != [pk_column.to_string()] {
         return Err(Error::MissingPrimaryKey {
             table: table.to_string(),
             pk_column: pk_column.to_string(),
@@ -104,28 +139,35 @@ pub fn inspect_table(conn: &Connection, table: &str, pk_column: &str) -> Result<
 
     Ok(WatchedTable {
         table: table.to_string(),
-        pk_column: pk_column.to_string(),
-        columns,
+        pk_columns: vec![pk_column.to_string()],
+        columns: column_infos
+            .iter()
+            .map(|column| column.name.clone())
+            .collect(),
+        column_types: column_types(column_infos),
     })
 }
 
 pub fn inspect_table_primary_key(conn: &Connection, table: &str) -> Result<WatchedTable> {
-    let (columns, primary_keys) = table_columns(conn, table)?;
-    let [pk_column] = primary_keys.as_slice() else {
-        return Err(Error::UnsupportedPrimaryKey {
+    let (column_infos, primary_keys) = table_columns(conn, table)?;
+    if primary_keys.is_empty() {
+        return Err(Error::MissingPrimaryKeys {
             table: table.to_string(),
-            columns: primary_keys,
         });
-    };
+    }
 
     Ok(WatchedTable {
         table: table.to_string(),
-        pk_column: pk_column.clone(),
-        columns,
+        pk_columns: primary_keys,
+        columns: column_infos
+            .iter()
+            .map(|column| column.name.clone())
+            .collect(),
+        column_types: column_types(column_infos),
     })
 }
 
-fn table_columns(conn: &Connection, table: &str) -> Result<(Vec<String>, Vec<String>)> {
+fn table_columns(conn: &Connection, table: &str) -> Result<(Vec<ColumnInfo>, Vec<String>)> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", quote_string(table)))?;
     let mut rows = stmt.query([])?;
     let mut columns = Vec::new();
@@ -133,11 +175,16 @@ fn table_columns(conn: &Connection, table: &str) -> Result<(Vec<String>, Vec<Str
 
     while let Some(row) = rows.next()? {
         let name: String = row.get(1)?;
+        let declared_type: String = row.get(2)?;
         let pk: i64 = row.get(5)?;
         if pk > 0 {
-            primary_keys.push(name.clone());
+            primary_keys.push((pk, name.clone()));
         }
-        columns.push(name);
+        columns.push(ColumnInfo {
+            name,
+            affinity: column_affinity(&declared_type),
+            declared_type,
+        });
     }
 
     if columns.is_empty() {
@@ -146,7 +193,47 @@ fn table_columns(conn: &Connection, table: &str) -> Result<(Vec<String>, Vec<Str
         });
     }
 
-    Ok((columns, primary_keys))
+    primary_keys.sort_by_key(|(pk_order, _)| *pk_order);
+    Ok((
+        columns,
+        primary_keys.into_iter().map(|(_, column)| column).collect(),
+    ))
+}
+
+fn column_types(columns: Vec<ColumnInfo>) -> HashMap<String, ColumnType> {
+    columns
+        .into_iter()
+        .map(|column| {
+            (
+                column.name,
+                ColumnType {
+                    declared_type: column.declared_type,
+                    affinity: column.affinity,
+                },
+            )
+        })
+        .collect()
+}
+
+fn column_affinity(declared_type: &str) -> ColumnAffinity {
+    let declared_type = declared_type.to_ascii_uppercase();
+    if declared_type.contains("INT") {
+        ColumnAffinity::Integer
+    } else if declared_type.contains("CHAR")
+        || declared_type.contains("CLOB")
+        || declared_type.contains("TEXT")
+    {
+        ColumnAffinity::Text
+    } else if declared_type.contains("BLOB") || declared_type.trim().is_empty() {
+        ColumnAffinity::Blob
+    } else if declared_type.contains("REAL")
+        || declared_type.contains("FLOA")
+        || declared_type.contains("DOUB")
+    {
+        ColumnAffinity::Real
+    } else {
+        ColumnAffinity::Numeric
+    }
 }
 
 pub fn install_triggers(conn: &Connection, table: &str, pk_column: &str) -> Result<WatchedTable> {
@@ -193,10 +280,10 @@ pub fn change_batch<T>(
 fn install_triggers_for_watched(conn: &Connection, watched: WatchedTable) -> Result<WatchedTable> {
     let table_ident = quote_ident(&watched.table);
     let trigger_prefix = trigger_prefix(&watched.table);
-    let pk_new = row_json_expr("NEW", &[watched.pk_column.clone()]);
-    let pk_old = row_json_expr("OLD", &[watched.pk_column.clone()]);
-    let new_row = row_json_expr("NEW", &watched.columns);
-    let old_row = row_json_expr("OLD", &watched.columns);
+    let pk_new = row_json_expr("NEW", &watched.pk_columns, &watched.column_types);
+    let pk_old = row_json_expr("OLD", &watched.pk_columns, &watched.column_types);
+    let new_row = row_json_expr("NEW", &watched.columns, &watched.column_types);
+    let old_row = row_json_expr("OLD", &watched.columns, &watched.column_types);
     let table_lit = quote_string(&watched.table);
     let batch_id = batch_id_expr();
 
@@ -245,8 +332,17 @@ fn install_triggers_for_watched(conn: &Connection, watched: WatchedTable) -> Res
 fn record_watched_table(conn: &Connection, watched: &WatchedTable) -> Result<()> {
     let value = serde_json::json!({
         "table": watched.table,
-        "pk_column": watched.pk_column,
+        "pk_columns": watched.pk_columns,
         "columns": watched.columns,
+        "column_types": watched.column_types.iter().map(|(column, column_type)| {
+            (
+                column.clone(),
+                serde_json::json!({
+                    "declared_type": column_type.declared_type,
+                    "affinity": format!("{:?}", column_type.affinity),
+                }),
+            )
+        }).collect::<serde_json::Map<_, _>>(),
     })
     .to_string();
     conn.execute(
@@ -402,8 +498,8 @@ pub fn initial_snapshot(conn: &Connection, shape: &Shape) -> Result<Snapshot> {
     validate_shape_columns(&watched, shape)?;
     require_watched_table(conn, shape, &watched)?;
 
-    let (where_sql, params) = compile_predicate(shape, &shape.predicate)?;
-    let row_expr = row_json_expr("", &shape.columns);
+    let (where_sql, params) = compile_predicate(&watched, shape, &shape.predicate)?;
+    let row_expr = row_json_expr("", &shape.columns, &watched.column_types);
     let mut sql = format!(
         "SELECT {row_expr} FROM {}",
         quote_ident(&shape.table),
@@ -414,7 +510,14 @@ pub fn initial_snapshot(conn: &Connection, shape: &Shape) -> Result<Snapshot> {
         sql.push_str(&where_sql);
     }
     sql.push_str(" ORDER BY ");
-    sql.push_str(&quote_ident(&watched.pk_column));
+    sql.push_str(
+        &watched
+            .pk_columns
+            .iter()
+            .map(|column| quote_ident(column))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
 
     let tx = conn.unchecked_transaction()?;
     let offset = tx.query_row(
@@ -434,7 +537,12 @@ pub fn initial_snapshot(conn: &Connection, shape: &Shape) -> Result<Snapshot> {
         out
     };
     tx.commit()?;
-    Ok(Snapshot { rows: out, offset })
+    Ok(Snapshot {
+        key_columns: watched.pk_columns,
+        rows: out,
+        offset,
+        up_to_date: true,
+    })
 }
 
 fn add_column_if_missing(
@@ -464,7 +572,7 @@ pub fn replay(conn: &Connection, shape: &Shape, offset: i64, limit: i64) -> Resu
     let watched = inspect_table_primary_key(conn, &shape.table)?;
     validate_shape_columns(&watched, shape)?;
     require_watched_table(conn, shape, &watched)?;
-    let retained_offset = retained_lower_bound(conn)?;
+    let retained_offset = retained_lower_bound_for_table(conn, &shape.table)?;
     if offset < retained_offset {
         return Err(Error::ResyncRequired {
             requested_offset: offset,
@@ -473,17 +581,72 @@ pub fn replay(conn: &Connection, shape: &Shape, offset: i64, limit: i64) -> Resu
     }
 
     let rows = read_log_since(conn, &shape.table, offset, limit)?;
+    let normalized_shape = normalize_shape_predicate(&watched, shape)?;
     let mut messages = Vec::new();
     let mut latest = offset;
 
     for row in rows {
         latest = latest.max(row.seq);
-        messages.extend(electrolite_core::messages_for_log(shape, &row));
+        messages.extend(electrolite_core::messages_for_log(&normalized_shape, &row));
     }
 
     Ok(Replay {
         messages,
         offset: latest,
+        up_to_date: true,
+    })
+}
+
+fn normalize_shape_predicate(watched: &WatchedTable, shape: &Shape) -> Result<Shape> {
+    let mut normalized = shape.clone();
+    normalized.predicate = normalize_predicate(watched, shape, &shape.predicate)?;
+    Ok(normalized)
+}
+
+fn normalize_predicate(
+    watched: &WatchedTable,
+    shape: &Shape,
+    predicate: &Predicate,
+) -> Result<Predicate> {
+    Ok(match predicate {
+        Predicate::All => Predicate::All,
+        Predicate::Eq { column, value } => Predicate::Eq {
+            column: column.clone(),
+            value: normalize_predicate_value(shape, column_type(watched, shape, column)?, value)?,
+        },
+        Predicate::In { column, values } => Predicate::In {
+            column: column.clone(),
+            values: values
+                .iter()
+                .map(|value| {
+                    normalize_predicate_value(shape, column_type(watched, shape, column)?, value)
+                })
+                .collect::<Result<Vec<_>>>()?,
+        },
+        Predicate::And { predicates } => Predicate::And {
+            predicates: predicates
+                .iter()
+                .map(|predicate| normalize_predicate(watched, shape, predicate))
+                .collect::<Result<Vec<_>>>()?,
+        },
+    })
+}
+
+fn normalize_predicate_value(
+    shape: &Shape,
+    column_type: &ColumnType,
+    value: &Value,
+) -> Result<Value> {
+    Ok(match SqlParam::try_from_value(shape, column_type, value)? {
+        SqlParam::Null => Value::Null,
+        SqlParam::Integer(value) => Value::Number(value.into()),
+        SqlParam::Real(value) => serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .ok_or_else(|| Error::UnsupportedPredicateValue {
+                shape: shape.name.clone(),
+                value: value.into(),
+            })?,
+        SqlParam::Text(value) => Value::String(value),
     })
 }
 
@@ -504,18 +667,97 @@ pub fn retained_lower_bound(conn: &Connection) -> Result<i64> {
     Ok(stored_offset.max(min_seq.map(|seq| seq - 1).unwrap_or(0)))
 }
 
+pub fn retained_lower_bound_for_table(conn: &Connection, table_name: &str) -> Result<i64> {
+    bootstrap(conn)?;
+    let stored_offset = conn
+        .query_row(
+            "SELECT value FROM _electrolite_meta WHERE key = ?1",
+            params![retained_offset_table_key(table_name)],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    let min_seq = conn.query_row(
+        "SELECT MIN(seq) FROM _electrolite_log WHERE table_name = ?1",
+        params![table_name],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    Ok(stored_offset.max(min_seq.map(|seq| seq - 1).unwrap_or(0)))
+}
+
 pub fn compact_log_before(conn: &Connection, retained_offset: i64) -> Result<RetentionStats> {
     bootstrap(conn)?;
     let retained_offset = retained_offset.max(retained_lower_bound(conn)?);
+    let table_offsets = retained_table_offsets_before(conn, retained_offset)?;
     let deleted_rows = conn.execute(
         "DELETE FROM _electrolite_log WHERE seq <= ?1",
         params![retained_offset],
     )?;
     record_retained_offset(conn, retained_offset)?;
+    for (table_name, table_offset) in table_offsets {
+        record_retained_offset_for_table(conn, &table_name, table_offset)?;
+    }
     Ok(RetentionStats {
         retained_offset,
         deleted_rows,
     })
+}
+
+fn retained_table_offsets_before(
+    conn: &Connection,
+    retained_offset: i64,
+) -> Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT table_name, MAX(seq)
+        FROM _electrolite_log
+        WHERE seq <= ?1
+        GROUP BY table_name
+        ",
+    )?;
+    let rows = stmt.query_map(params![retained_offset], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn compact_log_before_for_table(
+    conn: &Connection,
+    table_name: &str,
+    retained_offset: i64,
+) -> Result<RetentionStats> {
+    bootstrap(conn)?;
+    let retained_offset = retained_offset.max(retained_lower_bound_for_table(conn, table_name)?);
+    let deleted_rows = conn.execute(
+        "DELETE FROM _electrolite_log WHERE table_name = ?1 AND seq <= ?2",
+        params![table_name, retained_offset],
+    )?;
+    record_retained_offset_for_table(conn, table_name, retained_offset)?;
+    Ok(RetentionStats {
+        retained_offset,
+        deleted_rows,
+    })
+}
+
+pub fn compact_log_to_last_for_table(
+    conn: &Connection,
+    table_name: &str,
+    keep_last: i64,
+) -> Result<RetentionStats> {
+    bootstrap(conn)?;
+    let keep_last = keep_last.max(0);
+    let high_water = conn.query_row(
+        "SELECT COALESCE(MAX(seq), 0) FROM _electrolite_log WHERE table_name = ?1",
+        params![table_name],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let retained_offset = high_water.saturating_sub(keep_last);
+    compact_log_before_for_table(conn, table_name, retained_offset)
 }
 
 pub fn compact_log_to_last(conn: &Connection, keep_last: i64) -> Result<RetentionStats> {
@@ -537,6 +779,24 @@ fn record_retained_offset(conn: &Connection, retained_offset: i64) -> Result<()>
     Ok(())
 }
 
+fn record_retained_offset_for_table(
+    conn: &Connection,
+    table_name: &str,
+    retained_offset: i64,
+) -> Result<()> {
+    conn.execute(
+        "
+        INSERT OR REPLACE INTO _electrolite_meta (key, value)
+        VALUES (?1, ?2)
+        ",
+        params![
+            retained_offset_table_key(table_name),
+            retained_offset.to_string()
+        ],
+    )?;
+    Ok(())
+}
+
 fn require_watched_table(conn: &Connection, shape: &Shape, watched: &WatchedTable) -> Result<()> {
     let value = conn
         .query_row(
@@ -553,8 +813,23 @@ fn require_watched_table(conn: &Connection, shape: &Shape, watched: &WatchedTabl
     };
 
     let value = serde_json::from_str::<Value>(&value)?;
-    let installed_pk = value.get("pk_column").and_then(Value::as_str);
-    if installed_pk != Some(watched.pk_column.as_str()) {
+    let installed_pk_columns = value
+        .get("pk_columns")
+        .and_then(Value::as_array)
+        .map(|columns| {
+            columns
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .or_else(|| {
+            value
+                .get("pk_column")
+                .and_then(Value::as_str)
+                .map(|column| vec![column.to_string()])
+        });
+    if installed_pk_columns.as_deref() != Some(watched.pk_columns.as_slice()) {
         return Err(Error::UnwatchedTable {
             shape: shape.name.clone(),
             table: watched.table.clone(),
@@ -588,13 +863,16 @@ fn validate_shape_columns(watched: &WatchedTable, shape: &Shape) -> Result<()> {
                 column: column.clone(),
             });
         }
+        require_supported_shape_column(watched, shape, column)?;
     }
 
-    if !shape.columns.contains(&watched.pk_column) {
-        return Err(Error::MissingShapePrimaryKey {
-            shape: shape.name.clone(),
-            column: watched.pk_column.clone(),
-        });
+    for pk_column in &watched.pk_columns {
+        if !shape.columns.contains(pk_column) {
+            return Err(Error::MissingShapePrimaryKey {
+                shape: shape.name.clone(),
+                column: pk_column.clone(),
+            });
+        }
     }
 
     validate_predicate_columns(watched, shape, &shape.predicate)
@@ -609,6 +887,7 @@ fn validate_predicate_columns(
         Predicate::All => Ok(()),
         Predicate::Eq { column, .. } | Predicate::In { column, .. } => {
             if watched.columns.contains(column) {
+                require_supported_shape_column(watched, shape, column)?;
                 Ok(())
             } else {
                 Err(Error::MissingShapeColumn {
@@ -626,22 +905,49 @@ fn validate_predicate_columns(
     }
 }
 
-fn compile_predicate(shape: &Shape, predicate: &Predicate) -> Result<(String, Vec<SqlParam>)> {
+fn require_supported_shape_column(
+    watched: &WatchedTable,
+    shape: &Shape,
+    column: &str,
+) -> Result<()> {
+    let Some(column_type) = watched.column_types.get(column) else {
+        return Err(Error::MissingShapeColumn {
+            shape: shape.name.clone(),
+            column: column.to_string(),
+        });
+    };
+    if column_type.is_blob() {
+        Err(Error::UnsupportedShapeColumnType {
+            shape: shape.name.clone(),
+            column: column.to_string(),
+            declared_type: column_type.declared_type.clone(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn compile_predicate(
+    watched: &WatchedTable,
+    shape: &Shape,
+    predicate: &Predicate,
+) -> Result<(String, Vec<SqlParam>)> {
     match predicate {
         Predicate::All => Ok((String::new(), Vec::new())),
         Predicate::Eq { column, value } => {
             if value.is_null() {
                 return Ok((format!("{} IS NULL", quote_ident(column)), Vec::new()));
             }
-            let param = SqlParam::try_from_value(shape, value)?;
+            let column_type = column_type(watched, shape, column)?;
+            let param = SqlParam::try_from_value(shape, column_type, value)?;
             Ok((format!("{} = ?", quote_ident(column)), vec![param]))
         }
-        Predicate::In { column, values } => compile_in_predicate(shape, column, values),
+        Predicate::In { column, values } => compile_in_predicate(watched, shape, column, values),
         Predicate::And { predicates } => {
             let mut sql = Vec::new();
             let mut params = Vec::new();
             for predicate in predicates {
-                let (part, mut part_params) = compile_predicate(shape, predicate)?;
+                let (part, mut part_params) = compile_predicate(watched, shape, predicate)?;
                 if part.is_empty() {
                     continue;
                 }
@@ -654,6 +960,7 @@ fn compile_predicate(shape: &Shape, predicate: &Predicate) -> Result<(String, Ve
 }
 
 fn compile_in_predicate(
+    watched: &WatchedTable,
     shape: &Shape,
     column: &str,
     values: &[Value],
@@ -664,11 +971,12 @@ fn compile_in_predicate(
 
     let mut has_null = false;
     let mut params = Vec::new();
+    let column_type = column_type(watched, shape, column)?;
     for value in values {
         if value.is_null() {
             has_null = true;
         } else {
-            params.push(SqlParam::try_from_value(shape, value)?);
+            params.push(SqlParam::try_from_value(shape, column_type, value)?);
         }
     }
 
@@ -687,23 +995,53 @@ fn compile_in_predicate(
     Ok((parts.join(" OR "), params))
 }
 
+fn column_type<'a>(
+    watched: &'a WatchedTable,
+    shape: &Shape,
+    column: &str,
+) -> Result<&'a ColumnType> {
+    watched
+        .column_types
+        .get(column)
+        .ok_or_else(|| Error::MissingShapeColumn {
+            shape: shape.name.clone(),
+            column: column.to_string(),
+        })
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum SqlParam {
     Null,
     Integer(i64),
     Real(f64),
     Text(String),
-    Bool(bool),
 }
 
 impl SqlParam {
-    fn try_from_value(shape: &Shape, value: &Value) -> Result<Self> {
-        Ok(match value {
-            Value::Null => Self::Null,
-            Value::Bool(v) => Self::Bool(*v),
-            Value::Number(n) => number_to_sql_param(shape, n)?,
-            Value::String(s) => Self::Text(s.clone()),
-            Value::Array(_) | Value::Object(_) => {
+    fn try_from_value(shape: &Shape, column_type: &ColumnType, value: &Value) -> Result<Self> {
+        Ok(match (column_type.affinity, value) {
+            (_, Value::Null) => Self::Null,
+            (_, Value::Bool(v)) if column_type.is_booleanish() => Self::Integer(i64::from(*v)),
+            (ColumnAffinity::Integer, Value::Number(n))
+            | (ColumnAffinity::Numeric, Value::Number(n))
+                if n.as_i64().is_some()
+                    || n.as_u64().and_then(|v| i64::try_from(v).ok()).is_some() =>
+            {
+                number_to_integer_sql_param(shape, n)?
+            }
+            (ColumnAffinity::Real, Value::Number(n))
+            | (ColumnAffinity::Numeric, Value::Number(n)) => number_to_sql_param(shape, n)?,
+            (ColumnAffinity::Text, Value::String(s)) => Self::Text(s.clone()),
+            (ColumnAffinity::Blob, _) if column_type.declared_type.trim().is_empty() => {
+                value_to_untyped_sql_param(shape, value)?
+            }
+            (_, Value::Array(_) | Value::Object(_)) => {
+                return Err(Error::UnsupportedPredicateValue {
+                    shape: shape.name.clone(),
+                    value: value.clone(),
+                });
+            }
+            _ => {
                 return Err(Error::UnsupportedPredicateValue {
                     shape: shape.name.clone(),
                     value: value.clone(),
@@ -720,7 +1058,6 @@ impl ToSql for SqlParam {
             Self::Integer(v) => Ok((*v).into()),
             Self::Real(v) => Ok((*v).into()),
             Self::Text(v) => Ok(v.as_str().into()),
-            Self::Bool(v) => Ok((*v as i64).into()),
         }
     }
 }
@@ -740,16 +1077,69 @@ fn number_to_sql_param(shape: &Shape, n: &Number) -> Result<SqlParam> {
     }
 }
 
-fn row_json_expr(prefix: &str, columns: &[String]) -> String {
+fn number_to_integer_sql_param(shape: &Shape, n: &Number) -> Result<SqlParam> {
+    if let Some(v) = n.as_i64() {
+        Ok(SqlParam::Integer(v))
+    } else if let Some(v) = n.as_u64().and_then(|v| i64::try_from(v).ok()) {
+        Ok(SqlParam::Integer(v))
+    } else {
+        Err(Error::UnsupportedPredicateValue {
+            shape: shape.name.clone(),
+            value: Value::Number(n.clone()),
+        })
+    }
+}
+
+fn value_to_untyped_sql_param(shape: &Shape, value: &Value) -> Result<SqlParam> {
+    Ok(match value {
+        Value::Null => SqlParam::Null,
+        Value::Bool(_) => {
+            return Err(Error::UnsupportedPredicateValue {
+                shape: shape.name.clone(),
+                value: value.clone(),
+            });
+        }
+        Value::Number(n) => number_to_sql_param(shape, n)?,
+        Value::String(s) => SqlParam::Text(s.clone()),
+        Value::Array(_) | Value::Object(_) => {
+            return Err(Error::UnsupportedPredicateValue {
+                shape: shape.name.clone(),
+                value: value.clone(),
+            });
+        }
+    })
+}
+
+fn row_json_expr(
+    prefix: &str,
+    columns: &[String],
+    column_types: &HashMap<String, ColumnType>,
+) -> String {
     let parts = columns.iter().flat_map(|column| {
-        let value = if prefix.is_empty() {
+        let base = if prefix.is_empty() {
             quote_ident(column)
         } else {
             format!("{prefix}.{}", quote_ident(column))
         };
+        let value = normalize_row_value_expr(&base, column_types.get(column));
         [quote_string(column), value]
     });
     format!("json_object({})", parts.collect::<Vec<_>>().join(", "))
+}
+
+fn normalize_row_value_expr(base: &str, column_type: Option<&ColumnType>) -> String {
+    let Some(column_type) = column_type else {
+        return base.to_string();
+    };
+    match column_type.affinity {
+        ColumnAffinity::Integer => format!("CAST({base} AS INTEGER)"),
+        ColumnAffinity::Real => format!("CAST({base} AS REAL)"),
+        ColumnAffinity::Text => format!("CAST({base} AS TEXT)"),
+        ColumnAffinity::Numeric if column_type.is_booleanish() => {
+            format!("CAST({base} AS INTEGER)")
+        }
+        ColumnAffinity::Numeric | ColumnAffinity::Blob => base.to_string(),
+    }
 }
 
 fn quote_ident(value: &str) -> String {
@@ -778,6 +1168,10 @@ fn watched_table_key(table: &str) -> String {
 
 fn retained_offset_key() -> &'static str {
     "retained_offset"
+}
+
+fn retained_offset_table_key(table_name: &str) -> String {
+    format!("retained_offset:{table_name}")
 }
 
 fn current_batch_id_key() -> &'static str {
@@ -1163,6 +1557,135 @@ mod tests {
     }
 
     #[test]
+    fn global_compaction_records_per_table_retention_offsets() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        conn.execute_batch(
+            "
+            CREATE TABLE projects (
+              id INTEGER PRIMARY KEY,
+              name TEXT NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+        install_triggers(&conn, "projects", "id").unwrap();
+        let users_shape = active_users_shape();
+        let projects_shape = Shape {
+            name: "projects".to_string(),
+            table: "projects".to_string(),
+            columns: vec!["id".to_string(), "name".to_string()],
+            predicate: Predicate::All,
+            auth_scope: "public".to_string(),
+            schema_version: 1,
+        };
+
+        conn.execute(
+            "INSERT INTO users (id, name, active) VALUES (1, 'Ada', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO projects (id, name) VALUES (1, 'One')", [])
+            .unwrap();
+        conn.execute("UPDATE users SET name='Ada Lovelace' WHERE id=1", [])
+            .unwrap();
+
+        compact_log_before(&conn, 3).unwrap();
+        assert_eq!(retained_lower_bound_for_table(&conn, "users").unwrap(), 3);
+        assert_eq!(
+            retained_lower_bound_for_table(&conn, "projects").unwrap(),
+            2
+        );
+
+        let users_err = replay(&conn, &users_shape, 2, 10).unwrap_err();
+        assert!(matches!(
+            users_err,
+            Error::ResyncRequired {
+                requested_offset: 2,
+                retained_offset: 3,
+            }
+        ));
+        let projects_err = replay(&conn, &projects_shape, 1, 10).unwrap_err();
+        assert!(matches!(
+            projects_err,
+            Error::ResyncRequired {
+                requested_offset: 1,
+                retained_offset: 2,
+            }
+        ));
+        assert!(replay(&conn, &projects_shape, 2, 10).is_ok());
+    }
+
+    #[test]
+    fn boolean_predicates_are_normalized_for_declared_boolean_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE flags (
+              id INTEGER PRIMARY KEY,
+              enabled BOOLEAN NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+        install_triggers(&conn, "flags", "id").unwrap();
+        let shape = Shape {
+            name: "enabledFlags".to_string(),
+            table: "flags".to_string(),
+            columns: vec!["id".to_string(), "enabled".to_string()],
+            predicate: Predicate::Eq {
+                column: "enabled".to_string(),
+                value: json!(true),
+            },
+            auth_scope: "public".to_string(),
+            schema_version: 1,
+        };
+
+        conn.execute("INSERT INTO flags (id, enabled) VALUES (1, 1)", [])
+            .unwrap();
+        conn.execute("INSERT INTO flags (id, enabled) VALUES (2, 0)", [])
+            .unwrap();
+        let snapshot = initial_snapshot(&conn, &shape).unwrap();
+        assert_eq!(snapshot.rows, vec![json!({"id": 1, "enabled": 1})]);
+
+        conn.execute("UPDATE flags SET enabled=1 WHERE id=2", [])
+            .unwrap();
+        let replayed = replay(&conn, &shape, snapshot.offset, 10).unwrap();
+        assert_eq!(
+            replayed.messages,
+            vec![ShapeMessage::Insert {
+                key: json!({"id": 2}),
+                value: json!({"id": 2, "enabled": 1}),
+                offset: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn boolean_predicates_are_rejected_for_plain_integer_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let shape = Shape {
+            name: "activeUsersBool".to_string(),
+            table: "users".to_string(),
+            columns: vec!["id".to_string(), "name".to_string(), "active".to_string()],
+            predicate: Predicate::Eq {
+                column: "active".to_string(),
+                value: json!(true),
+            },
+            auth_scope: "public".to_string(),
+            schema_version: 1,
+        };
+
+        let err = initial_snapshot(&conn, &shape).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::UnsupportedPredicateValue { ref shape, ref value }
+                if shape == "activeUsersBool" && value == &json!(true)
+        ));
+    }
+
+    #[test]
     fn primary_key_update_replays_delete_then_insert() {
         let conn = Connection::open_in_memory().unwrap();
         setup(&conn);
@@ -1394,7 +1917,7 @@ mod tests {
     }
 
     #[test]
-    fn composite_primary_keys_are_explicitly_unsupported() {
+    fn composite_primary_keys_snapshot_and_replay_with_full_json_key() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "
@@ -1407,13 +1930,48 @@ mod tests {
             ",
         )
         .unwrap();
+        install_triggers_auto(&conn, "memberships").unwrap();
+        let shape = Shape {
+            name: "memberships".to_string(),
+            table: "memberships".to_string(),
+            columns: vec![
+                "account_id".to_string(),
+                "user_id".to_string(),
+                "role".to_string(),
+            ],
+            predicate: Predicate::All,
+            auth_scope: "public".to_string(),
+            schema_version: 1,
+        };
 
-        let err = install_triggers(&conn, "memberships", "account_id").unwrap_err();
-        assert!(matches!(
-            err,
-            Error::UnsupportedPrimaryKey { ref table, ref columns }
-                if table == "memberships"
-                    && columns == &vec!["account_id".to_string(), "user_id".to_string()]
-        ));
+        conn.execute(
+            "INSERT INTO memberships (account_id, user_id, role) VALUES (7, 11, 'admin')",
+            [],
+        )
+        .unwrap();
+        let snapshot = initial_snapshot(&conn, &shape).unwrap();
+        assert_eq!(
+            snapshot.key_columns,
+            vec!["account_id".to_string(), "user_id".to_string()]
+        );
+        assert_eq!(
+            snapshot.rows,
+            vec![json!({"account_id": 7, "user_id": 11, "role": "admin"})]
+        );
+
+        conn.execute(
+            "UPDATE memberships SET role='member' WHERE account_id=7 AND user_id=11",
+            [],
+        )
+        .unwrap();
+        let replayed = replay(&conn, &shape, snapshot.offset, 10).unwrap();
+        assert_eq!(
+            replayed.messages,
+            vec![ShapeMessage::Update {
+                key: json!({"account_id": 7, "user_id": 11}),
+                value: json!({"account_id": 7, "user_id": 11, "role": "member"}),
+                offset: 2,
+            }]
+        );
     }
 }

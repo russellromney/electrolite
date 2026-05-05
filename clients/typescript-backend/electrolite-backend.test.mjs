@@ -285,7 +285,6 @@ test("e2e TypeScript backend proxy materializes a trusted Shape", async (t) => {
   const client = new ShapeClient(
     "https://app.test/electrolite/v1/factory/trusted/projectTodos/p1",
     {
-      keyColumns: ["id"],
       fetch: fetchThroughTypeScriptBackend,
       retry: { minDelayMs: 5, maxDelayMs: 20 },
     },
@@ -320,7 +319,6 @@ test("e2e TypeScript backend proxy materializes a trusted Shape", async (t) => {
   const multiProjectClient = new ShapeClient(
     "https://app.test/electrolite/v1/factory/trusted/projectTodos/p1-p2",
     {
-      keyColumns: ["id"],
       fetch: fetchThroughTypeScriptBackend,
       retry: { minDelayMs: 5, maxDelayMs: 20 },
     },

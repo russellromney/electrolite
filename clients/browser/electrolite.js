@@ -6,21 +6,23 @@ export class ShapeClient {
       live = true,
       retry = {},
     } = options;
-    if (!Array.isArray(keyColumns) || keyColumns.length === 0) {
-      throw new Error("ShapeClient requires keyColumns");
+    if (keyColumns !== undefined && (!Array.isArray(keyColumns) || keyColumns.length === 0)) {
+      throw new Error("ShapeClient keyColumns must be a non-empty array");
     }
     if (typeof fetchFn !== "function") {
       throw new Error("ShapeClient requires fetch");
     }
 
     this.url = url;
-    this.keyColumns = keyColumns;
+    this.keyColumns = keyColumns ?? null;
     this.fetch = fetchFn;
     this.live = live;
     this.retryMinDelayMs = retry.minDelayMs ?? 250;
     this.retryMaxDelayMs = retry.maxDelayMs ?? 5_000;
     this.offset = -1;
     this.rows = new Map();
+    this.pendingRows = null;
+    this.pendingChanged = false;
     this.subscribers = new Set();
     this.statusSubscribers = new Set();
     this.stopped = false;
@@ -117,7 +119,13 @@ export class ShapeClient {
 
   apply(body) {
     if (body.type === "snapshot") {
+      if (Array.isArray(body.key_columns) && body.key_columns.length > 0) {
+        this.keyColumns = body.key_columns;
+      }
+      this.requireKeyColumns();
       this.rows.clear();
+      this.pendingRows = null;
+      this.pendingChanged = false;
       for (const row of body.rows) {
         this.rows.set(this.keyForRow(row), row);
       }
@@ -129,10 +137,22 @@ export class ShapeClient {
 
     if (body.type === "replay") {
       let changed = false;
+      const nextRows = new Map(this.pendingRows ?? this.rows);
       for (const message of body.messages) {
-        changed = this.applyMessage(message) || changed;
+        changed = this.applyMessageTo(nextRows, message) || changed;
       }
       this.offset = body.offset;
+      if (body.up_to_date === false) {
+        this.pendingRows = nextRows;
+        this.pendingChanged = this.pendingChanged || changed;
+        this.notifyStatus({ type: "replay", offset: this.offset });
+        return false;
+      }
+
+      this.rows = nextRows;
+      changed = this.pendingChanged || changed;
+      this.pendingRows = null;
+      this.pendingChanged = false;
       if (changed) {
         this.notify();
       }
@@ -144,23 +164,34 @@ export class ShapeClient {
   }
 
   applyMessage(message) {
+    return this.applyMessageTo(this.rows, message);
+  }
+
+  applyMessageTo(rows, message) {
     const key = JSON.stringify(message.key);
     if (message.type === "delete") {
-      return this.rows.delete(key);
+      return rows.delete(key);
     }
     if (message.type === "insert" || message.type === "update") {
-      this.rows.set(key, message.value);
+      rows.set(key, message.value);
       return true;
     }
     throw new Error(`Unknown Electrolite message type: ${message.type}`);
   }
 
   keyForRow(row) {
+    this.requireKeyColumns();
     const key = {};
     for (const column of this.keyColumns) {
       key[column] = row[column];
     }
     return JSON.stringify(key);
+  }
+
+  requireKeyColumns() {
+    if (!Array.isArray(this.keyColumns) || this.keyColumns.length === 0) {
+      throw new Error("ShapeClient requires key_columns in snapshot or keyColumns option");
+    }
   }
 
   notify() {

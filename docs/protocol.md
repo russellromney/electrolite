@@ -21,10 +21,12 @@ Example response:
 ```json
 {
   "type": "snapshot",
+  "key_columns": ["id"],
   "rows": [
     { "id": 7, "title": "ship electrolite", "done": false }
   ],
-  "offset": 124
+  "offset": 124,
+  "up_to_date": true
 }
 ```
 
@@ -52,7 +54,8 @@ Example response:
       "offset": 125
     }
   ],
-  "offset": 125
+  "offset": 125,
+  "up_to_date": true
 }
 ```
 
@@ -99,16 +102,18 @@ later as an adapter, not the core protocol.
 The tiny browser client:
 
 1. requests `offset=-1`
-2. stores snapshot rows in a `Map`
+2. learns key columns from the snapshot and stores rows in a `Map`
 3. reconnects with `live=true`
 4. applies insert, update, and delete messages
 5. notifies subscribers after materialized rows change
 6. reports connection/status changes
 7. retries transient failures with backoff
 
-The current snapshot response contains rows, while replay messages contain
-keys. The client is configured with the Shape key columns so it can derive
-snapshot keys without asking the browser to inspect SQLite schema.
+The current snapshot response contains rows and `key_columns`, while
+replay messages contain keys. The client can be configured with key
+columns as an override, but the normal path is server-provided metadata.
+Replay responses are staged and published to subscribers only after the
+response reaches its `up_to_date` boundary.
 
 If replay returns `409 resync_required`, the client clears materialized
 rows and restarts from `offset=-1`.
@@ -130,7 +135,8 @@ false -> false  ignore
 
 SQLite triggers only expose committed rows: rollback removes both the app
 write and the Electrolite log rows. Raw writes are therefore safe, but
-they are row-level for replay purposes.
+they are row-level for replay purposes and do not promise transaction
+batch boundaries.
 
 For app-controlled multi-row writes that should not be split by bounded
 replay, hosts can use Electrolite change batches. Rows written inside a
@@ -144,6 +150,21 @@ state.write_batch(|tx| {
 }).await?;
 ```
 
+This is the canonical write path when transaction-like replay boundaries
+matter. Ordinary SQLite writes remain supported, but their semantic
+contract is row-level.
+
+## Type Policy
+
+Electrolite inspects SQLite declared column types for watched tables and
+normalizes logged JSON values and predicate values through the same
+policy. Boolean JSON predicates are accepted for boolean-ish declared
+columns such as `BOOLEAN`, where they normalize to integer `1`/`0`.
+Boolean predicates against plain `INTEGER` columns are rejected so the
+snapshot SQL and replay JSON matcher cannot silently disagree.
+
+Blob columns are not supported in Shapes.
+
 ## Predicate Index
 
 The core crate has a `ShapeIndex` that narrows fanout work before exact
@@ -154,7 +175,8 @@ Shape visible to the exact transition logic.
 
 ## Resync
 
-If a client asks for an offset older than retained history:
+If a client asks for an offset older than retained history for that
+table:
 
 ```http
 409 Conflict
@@ -173,7 +195,15 @@ state.compact_log_to_last(10_000).await?;
 ```
 
 After compaction, offsets older than the durable retained offset return
-`409 resync_required` even if the compacted log table is empty.
+`409 resync_required` even if the compacted log table is empty. Global
+compaction records per-table lower bounds, so unrelated table churn does
+not force a quiet Shape to resync.
+
+For table-local compaction:
+
+```rust
+state.compact_log_to_last_for_table("todos", 10_000).await?;
+```
 
 ## Runtime Notes
 

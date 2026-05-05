@@ -73,6 +73,8 @@ Make snapshot and replay behavior precise.
   the requested offset is older than retained history.
 - Compact `_electrolite_log` with a durable retained-offset marker so
   resync still works even after all older rows are deleted.
+- Record per-table retained offsets during compaction so unrelated table
+  churn does not force quiet Shapes to resync.
 - Evaluate membership transitions:
 
 ```text
@@ -85,14 +87,23 @@ old no,  new no  -> ignore
 - Define stable shape handles:
 
 ```text
-hash(table + columns + where + params + auth_scope + schema_version)
+hash(table + canonical columns + canonical predicate + auth_scope + schema_version)
 ```
 
+- Shape handles ignore human route names. Equivalent column sets and
+  equivalent `AND`/`IN` predicate orderings share handles.
 - Return `409 resync_required` when the requested offset is older than
   retained history.
 - Treat ordinary trigger rows as committed row-level changes. For
   app-controlled multi-row writes, support explicit Electrolite change
   batches so bounded replay does not split the batch.
+- Return key-column metadata and an explicit `up_to_date` boundary in
+  snapshot/replay envelopes.
+- Normalize Shape predicate values and logged row JSON using SQLite
+  declared column types. Reject ambiguous predicate values instead of
+  letting snapshot SQL and replay JSON diverge.
+- Support composite primary keys by emitting JSON keys with all primary
+  key columns and including all key columns in snapshot metadata.
 
 ## Phase Guard - Security Model
 
@@ -132,6 +143,13 @@ and the normal authorizer still checks the generated `auth_scope`.
 Relationship-shaped data such as "your friends' likes on your photos"
 still needs richer predicate/index support than the first `Eq`/`And`
 predicate set.
+
+### TypeScript Ergonomics Gap
+
+Trusted Shape specs in headers are good enough for small dynamic Shapes.
+Large `IN` lists and richer predicates should move to registered
+server-side factories, signed Shape tokens, or a POST-based internal
+factory route.
 
 ## Phase Crowd - Fanout And Caching
 

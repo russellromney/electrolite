@@ -128,6 +128,23 @@ impl ServerState {
         self.notify_changed();
         Ok(stats)
     }
+
+    pub async fn compact_log_to_last_for_table(
+        &self,
+        table_name: &str,
+        keep_last: i64,
+    ) -> electrolite_sqlite::Result<electrolite_sqlite::RetentionStats> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(electrolite_sqlite::Error::from)?;
+        let stats =
+            electrolite_sqlite::compact_log_to_last_for_table(&conn, table_name, keep_last)?;
+        drop(conn);
+        self.notify_changed();
+        Ok(stats)
+    }
 }
 
 #[derive(Clone)]
@@ -349,20 +366,25 @@ pub struct ShapeQuery {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ShapeResponse {
     Snapshot {
+        key_columns: Vec<String>,
         rows: Vec<Value>,
         offset: i64,
+        up_to_date: bool,
     },
     Replay {
         messages: Vec<ShapeMessage>,
         offset: i64,
+        up_to_date: bool,
     },
 }
 
 impl From<Snapshot> for ShapeResponse {
     fn from(snapshot: Snapshot) -> Self {
         Self::Snapshot {
+            key_columns: snapshot.key_columns,
             rows: snapshot.rows,
             offset: snapshot.offset,
+            up_to_date: snapshot.up_to_date,
         }
     }
 }
@@ -372,6 +394,7 @@ impl From<Replay> for ShapeResponse {
         Self::Replay {
             messages: replay.messages,
             offset: replay.offset,
+            up_to_date: replay.up_to_date,
         }
     }
 }
@@ -807,14 +830,22 @@ mod tests {
 
         fn apply(&mut self, response: ShapeResponse) {
             match response {
-                ShapeResponse::Snapshot { rows, offset } => {
+                ShapeResponse::Snapshot {
+                    key_columns,
+                    rows,
+                    offset,
+                    ..
+                } => {
+                    self.key_columns = key_columns;
                     self.rows.clear();
                     for row in rows {
                         self.rows.insert(self.key_for_row(&row), row);
                     }
                     self.offset = offset;
                 }
-                ShapeResponse::Replay { messages, offset } => {
+                ShapeResponse::Replay {
+                    messages, offset, ..
+                } => {
                     for message in messages {
                         match message {
                             ShapeMessage::Insert { key, value, .. }
@@ -940,8 +971,10 @@ mod tests {
         assert_eq!(
             response,
             ShapeResponse::Snapshot {
+                key_columns: vec!["id".to_string()],
                 rows: vec![json!({"id": 1, "name": "Ada", "active": 1})],
                 offset: 2,
+                up_to_date: true,
             }
         );
     }
@@ -966,6 +999,7 @@ mod tests {
                     offset: 3,
                 }],
                 offset: 3,
+                up_to_date: true,
             }
         );
     }
@@ -1129,6 +1163,7 @@ mod tests {
                     offset: 3,
                 }],
                 offset: 3,
+                up_to_date: true,
             }
         );
     }
@@ -1160,6 +1195,7 @@ mod tests {
                     offset: 3,
                 }],
                 offset: 3,
+                up_to_date: true,
             }
         );
     }
@@ -1275,8 +1311,10 @@ mod tests {
         assert_eq!(
             snapshot,
             ShapeResponse::Snapshot {
+                key_columns: vec!["id".to_string()],
                 rows: vec![json!({"id": 1, "name": "Ada", "active": 1})],
                 offset: 2,
+                up_to_date: true,
             }
         );
 
@@ -1311,6 +1349,7 @@ mod tests {
                     offset: 3,
                 }],
                 offset: 3,
+                up_to_date: true,
             }
         );
         server.abort();
@@ -1745,10 +1784,12 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<ShapeResponse>(&body).unwrap(),
             ShapeResponse::Snapshot {
+                key_columns: vec!["id".to_string()],
                 rows: vec![
                     json!({"id": 1, "project_id": "p1", "title": "ship electrolite", "done": 0})
                 ],
                 offset: 2,
+                up_to_date: true,
             }
         );
     }

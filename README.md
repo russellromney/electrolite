@@ -90,7 +90,7 @@ For TypeScript app-server integration, see
 ## Status
 
 Early scaffold. The implemented slice is trigger-backed logical change
-capture for simple primary-key tables, plus an embedded HTTP route for
+capture for primary-keyed SQLite tables, plus an embedded HTTP route for
 authorized initial snapshots, bounded replay, and `live=true`
 long-polling. The server now has a SQLite connection pool, in-process
 live wait coalescing, retained-offset resync errors, and a basic fanout
@@ -99,3 +99,7 @@ index are in place for the next fanout broker layer. Embedded write
 helpers can wake live requests automatically, retention compaction records
 a durable retained offset, and optional Electrolite change batches avoid
 splitting app-controlled transactions across bounded replay responses.
+Responses now include key-column metadata and an explicit `up_to_date`
+boundary; Shape handles are canonicalized across equivalent definitions;
+and SQLite predicate values are normalized against declared column types
+to avoid snapshot/replay drift.
