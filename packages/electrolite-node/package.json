@@ -10,6 +10,6 @@
     }
   },
   "scripts": {
-    "test": "node --no-warnings --test electrolite-node.test.mjs"
+    "test": "node --no-warnings --test electrolite-node.test.ts"
   }
 }

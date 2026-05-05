@@ -3,9 +3,9 @@
   "type": "module",
   "scripts": {
     "demo": "npm run demo:web",
-    "demo:console": "node --no-warnings examples/basic-todos/demo.mjs",
-    "demo:fanout": "node --no-warnings examples/live-fanout/demo.mjs",
-    "demo:web": "node --no-warnings examples/basic-web-app/server.mjs",
+    "demo:console": "node --no-warnings examples/basic-todos/demo.ts",
+    "demo:fanout": "node --no-warnings examples/live-fanout/demo.ts",
+    "demo:web": "node --no-warnings examples/basic-web-app/server.ts",
     "test": "npm run test:browser && npm run test:node",
     "test:all": "npm test && npm run test:python",
     "test:browser": "npm test --prefix clients/browser",

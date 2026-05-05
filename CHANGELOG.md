@@ -28,6 +28,9 @@ SQLite sync.
   events, low-level replay events, and multi-tab coordination.
 - Python materializer client for consuming Shape HTTP endpoints.
 - Tiny console demo and two-column web app demo.
+- Local live fanout demo, defaulting to 100 in-process Shape clients and
+  configurable with `ELECTROLITE_FANOUT_CLIENTS`.
+- README demo screenshot.
 
 ### Changed
 
@@ -36,6 +39,8 @@ SQLite sync.
 - Removed the older TypeScript-to-internal-origin bridge from the active
   project.
 - Simplified setup to Node 24+ with no native build or sidecar.
+- Converted the Node package implementation from JavaScript plus
+  hand-written declarations to TypeScript source.
 
 ### Verified
 

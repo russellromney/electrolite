@@ -137,6 +137,15 @@ On one local run, a single SQLite write woke `100/100` live Shape clients
 and all 100 materialized the new row in about `13ms`. This is a demo, not
 a benchmark suite, but it is a useful smoke test for shared-Shape fanout.
 
+To try a bigger local smoke test:
+
+```sh
+ELECTROLITE_FANOUT_CLIENTS=1000 npm run demo:fanout
+```
+
+On one local run, that woke `1000/1000` clients and all 1000 materialized
+the new row in about `100ms`.
+
 ## Semantic Coverage
 
 The Node implementation was checked against the previous reference
