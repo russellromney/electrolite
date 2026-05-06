@@ -476,6 +476,10 @@ class Electrolite:
         ]
         if rows:
             last = rows[-1]
+            # Extend until the trailing batch finishes or until we hit
+            # the safety cap. Without the cap, a 10M-row batch would
+            # force replay to load every row in one response.
+            extension_cap = max(limit, 1) * 10
             rows.extend(
                 parse_log_row(row)
                 for row in self.db.execute(
@@ -484,8 +488,9 @@ class Electrolite:
                     FROM _electrolite_log
                     WHERE table_name = ? AND seq > ? AND batch_id = ?
                     ORDER BY seq
+                    LIMIT ?
                     """,
-                    (table, last["seq"], last["batch_id"]),
+                    (table, last["seq"], last["batch_id"], extension_cap),
                 )
             )
         latest = rows[-1]["seq"] if rows else offset

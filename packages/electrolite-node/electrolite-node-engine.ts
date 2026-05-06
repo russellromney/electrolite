@@ -382,12 +382,17 @@ function readLogPage(db, tableName, offset, limit) {
   `).all(tableName, offset, limit).map(parseLogRow);
   if (rows.length > 0) {
     const last = rows[rows.length - 1];
+    // Extend until the trailing batch finishes or until we hit the
+    // safety cap. Without the cap, a 10M-row batch would force
+    // replay to load every row in one response.
+    const extensionCap = Math.max(limit, 1) * 10;
     const rest = db.prepare(`
       SELECT seq, batch_id, table_name, op, pk_json, old_pk_json, new_pk_json, old_json, new_json, created_at
       FROM _electrolite_log
       WHERE table_name = ? AND seq > ? AND batch_id = ?
       ORDER BY seq
-    `).all(tableName, last.seq, last.batch_id).map(parseLogRow);
+      LIMIT ?
+    `).all(tableName, last.seq, last.batch_id, extensionCap).map(parseLogRow);
     rows.push(...rest);
   }
   const latest = rows.at(-1)?.seq ?? offset;

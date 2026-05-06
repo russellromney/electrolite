@@ -23,24 +23,60 @@ import (
 
 // ---------- predicates ----------
 
-// Predicate is "all", "eq", "gt"/"lt"/"gte"/"lte", "in", or "and".
-type Predicate struct {
-	Type       string                 `json:"type"`
-	Column     string                 `json:"column,omitempty"`
-	Value      interface{}            `json:"value,omitempty"`
-	Values     []interface{}          `json:"values,omitempty"`
-	Predicates []Predicate            `json:"predicates,omitempty"`
-	Extra      map[string]interface{} `json:"-"`
+// Predicate is the sealed sum type covering `all`, `eq`, range
+// (gt/lt/gte/lte), `in`, and `and`. Variants are constructed via the
+// All/Eq/Gt/Lt/Gte/Lte/In/And helpers and consumed via type switch.
+type Predicate interface {
+	predicateKind() string
 }
 
-func All() Predicate                              { return Predicate{Type: "all"} }
-func Eq(col string, v interface{}) Predicate      { return Predicate{Type: "eq", Column: col, Value: v} }
-func Gt(col string, v interface{}) Predicate      { return Predicate{Type: "gt", Column: col, Value: v} }
-func Lt(col string, v interface{}) Predicate      { return Predicate{Type: "lt", Column: col, Value: v} }
-func Gte(col string, v interface{}) Predicate     { return Predicate{Type: "gte", Column: col, Value: v} }
-func Lte(col string, v interface{}) Predicate     { return Predicate{Type: "lte", Column: col, Value: v} }
-func In(col string, vs ...interface{}) Predicate  { return Predicate{Type: "in", Column: col, Values: vs} }
-func And(children ...Predicate) Predicate         { return Predicate{Type: "and", Predicates: children} }
+// AllPredicate matches every row.
+type AllPredicate struct{}
+
+func (AllPredicate) predicateKind() string { return "all" }
+
+// EqPredicate is an equality test against a column.
+type EqPredicate struct {
+	Column string
+	Value  interface{}
+}
+
+func (EqPredicate) predicateKind() string { return "eq" }
+
+// RangePredicate is a `>`, `<`, `>=`, or `<=` test against a column.
+// Op is one of "gt", "lt", "gte", "lte".
+type RangePredicate struct {
+	Op     string
+	Column string
+	Value  interface{}
+}
+
+func (RangePredicate) predicateKind() string { return "range" }
+
+// InPredicate matches rows where the column equals any of the values.
+type InPredicate struct {
+	Column string
+	Values []interface{}
+}
+
+func (InPredicate) predicateKind() string { return "in" }
+
+// AndPredicate is the conjunction of its children.
+type AndPredicate struct {
+	Predicates []Predicate
+}
+
+func (AndPredicate) predicateKind() string { return "and" }
+
+// All / Eq / Gt / Lt / Gte / Lte / In / And construct predicates.
+func All() Predicate                              { return AllPredicate{} }
+func Eq(col string, v interface{}) Predicate     { return EqPredicate{Column: col, Value: v} }
+func Gt(col string, v interface{}) Predicate     { return RangePredicate{Op: "gt", Column: col, Value: v} }
+func Lt(col string, v interface{}) Predicate     { return RangePredicate{Op: "lt", Column: col, Value: v} }
+func Gte(col string, v interface{}) Predicate    { return RangePredicate{Op: "gte", Column: col, Value: v} }
+func Lte(col string, v interface{}) Predicate    { return RangePredicate{Op: "lte", Column: col, Value: v} }
+func In(col string, vs ...interface{}) Predicate { return InPredicate{Column: col, Values: vs} }
+func And(children ...Predicate) Predicate        { return AndPredicate{Predicates: children} }
 
 var rangeOps = map[string]string{"gt": ">", "lt": "<", "gte": ">=", "lte": "<="}
 
@@ -750,46 +786,46 @@ func normalizeValue(info *tableInfo, column string, value interface{}) (interfac
 // the table info. Single normalization site; downstream code uses the
 // already-normalized predicate.
 func normalizePredicate(info *tableInfo, p Predicate) (Predicate, error) {
-	switch p.Type {
-	case "all", "":
-		return Predicate{Type: "all"}, nil
-	case "eq":
-		v, err := normalizeValue(info, p.Column, p.Value)
+	switch x := p.(type) {
+	case nil, AllPredicate:
+		return AllPredicate{}, nil
+	case EqPredicate:
+		v, err := normalizeValue(info, x.Column, x.Value)
 		if err != nil {
-			return Predicate{}, err
+			return nil, err
 		}
-		return Predicate{Type: "eq", Column: p.Column, Value: v}, nil
-	case "gt", "lt", "gte", "lte":
-		if p.Value == nil {
-			return Predicate{}, errBadInput{msg: fmt.Sprintf("range predicate %s requires a non-null value", p.Type)}
+		return EqPredicate{Column: x.Column, Value: v}, nil
+	case RangePredicate:
+		if x.Value == nil {
+			return nil, errBadInput{msg: fmt.Sprintf("range predicate %s requires a non-null value", x.Op)}
 		}
-		v, err := normalizeValue(info, p.Column, p.Value)
+		v, err := normalizeValue(info, x.Column, x.Value)
 		if err != nil {
-			return Predicate{}, err
+			return nil, err
 		}
-		return Predicate{Type: p.Type, Column: p.Column, Value: v}, nil
-	case "in":
-		out := make([]interface{}, 0, len(p.Values))
-		for _, v := range p.Values {
-			nv, err := normalizeValue(info, p.Column, v)
+		return RangePredicate{Op: x.Op, Column: x.Column, Value: v}, nil
+	case InPredicate:
+		out := make([]interface{}, 0, len(x.Values))
+		for _, v := range x.Values {
+			nv, err := normalizeValue(info, x.Column, v)
 			if err != nil {
-				return Predicate{}, err
+				return nil, err
 			}
 			out = append(out, nv)
 		}
-		return Predicate{Type: "in", Column: p.Column, Values: out}, nil
-	case "and":
-		children := make([]Predicate, 0, len(p.Predicates))
-		for _, c := range p.Predicates {
+		return InPredicate{Column: x.Column, Values: out}, nil
+	case AndPredicate:
+		children := make([]Predicate, 0, len(x.Predicates))
+		for _, c := range x.Predicates {
 			nc, err := normalizePredicate(info, c)
 			if err != nil {
-				return Predicate{}, err
+				return nil, err
 			}
 			children = append(children, nc)
 		}
-		return Predicate{Type: "and", Predicates: children}, nil
+		return AndPredicate{Predicates: children}, nil
 	}
-	return Predicate{}, fmt.Errorf("unsupported predicate type %s", p.Type)
+	return nil, fmt.Errorf("unsupported predicate type %T", p)
 }
 
 func (e *Electrolite) inspectTable(name string) (*tableInfo, error) {
@@ -887,10 +923,17 @@ func (e *Electrolite) readLogPage(table string, offset, limit int64) ([]logRow, 
 	}
 	if len(out) > 0 {
 		last := out[len(out)-1]
+		// Extend until the trailing batch finishes or until we hit
+		// the safety cap. Without the cap, a 10M-row batch would
+		// force replay to load every row in one response.
+		extensionCap := limit * 10
+		if extensionCap < limit {
+			extensionCap = limit
+		}
 		more, err := e.db.Query(
 			`SELECT seq, batch_id, op, pk_json, old_pk_json, new_pk_json, old_json, new_json
-			 FROM _electrolite_log WHERE table_name = ? AND seq > ? AND batch_id = ? ORDER BY seq`,
-			table, last.Seq, last.BatchID,
+			 FROM _electrolite_log WHERE table_name = ? AND seq > ? AND batch_id = ? ORDER BY seq LIMIT ?`,
+			table, last.Seq, last.BatchID, extensionCap,
 		)
 		if err != nil {
 			return nil, err
@@ -965,22 +1008,22 @@ func predicateMatches(p Predicate, row map[string]interface{}) bool {
 	if row == nil {
 		return false
 	}
-	switch p.Type {
-	case "all", "":
+	switch x := p.(type) {
+	case nil, AllPredicate:
 		return true
-	case "eq":
-		return jsonEqual(row[p.Column], p.Value)
-	case "gt", "lt", "gte", "lte":
-		return compareScalar(row[p.Column], p.Value, p.Type)
-	case "in":
-		for _, v := range p.Values {
-			if jsonEqual(row[p.Column], v) {
+	case EqPredicate:
+		return jsonEqual(row[x.Column], x.Value)
+	case RangePredicate:
+		return compareScalar(row[x.Column], x.Value, x.Op)
+	case InPredicate:
+		for _, v := range x.Values {
+			if jsonEqual(row[x.Column], v) {
 				return true
 			}
 		}
 		return false
-	case "and":
-		for _, c := range p.Predicates {
+	case AndPredicate:
+		for _, c := range x.Predicates {
 			if !predicateMatches(c, row) {
 				return false
 			}
@@ -990,27 +1033,39 @@ func predicateMatches(p Predicate, row map[string]interface{}) bool {
 	return false
 }
 
+// inPlaceholders returns a comma-joined list of `?` placeholders.
+func inPlaceholders(n int) string {
+	if n == 0 {
+		return ""
+	}
+	parts := make([]string, n)
+	for i := range parts {
+		parts[i] = "?"
+	}
+	return strings.Join(parts, ",")
+}
+
 func compilePredicate(p Predicate) (string, []interface{}) {
-	switch p.Type {
-	case "all", "":
+	switch x := p.(type) {
+	case nil, AllPredicate:
 		return "", nil
-	case "eq":
-		if p.Value == nil {
-			return fmt.Sprintf("%s IS NULL", quoteIdent(p.Column)), nil
+	case EqPredicate:
+		if x.Value == nil {
+			return fmt.Sprintf("%s IS NULL", quoteIdent(x.Column)), nil
 		}
-		return fmt.Sprintf("%s = ?", quoteIdent(p.Column)), []interface{}{p.Value}
-	case "gt", "lt", "gte", "lte":
-		if p.Value == nil {
+		return fmt.Sprintf("%s = ?", quoteIdent(x.Column)), []interface{}{x.Value}
+	case RangePredicate:
+		if x.Value == nil {
 			return "0", nil
 		}
-		return fmt.Sprintf("%s %s ?", quoteIdent(p.Column), rangeOps[p.Type]), []interface{}{p.Value}
-	case "in":
-		if len(p.Values) == 0 {
+		return fmt.Sprintf("%s %s ?", quoteIdent(x.Column), rangeOps[x.Op]), []interface{}{x.Value}
+	case InPredicate:
+		if len(x.Values) == 0 {
 			return "0", nil
 		}
 		var nonNull []interface{}
 		hasNull := false
-		for _, v := range p.Values {
+		for _, v := range x.Values {
 			if v == nil {
 				hasNull = true
 			} else {
@@ -1020,21 +1075,21 @@ func compilePredicate(p Predicate) (string, []interface{}) {
 		var parts []string
 		var args []interface{}
 		if len(nonNull) > 0 {
-			parts = append(parts, fmt.Sprintf("%s IN (%s)", quoteIdent(p.Column), strings.Repeat(",?", len(nonNull))[1:]))
+			parts = append(parts, fmt.Sprintf("%s IN (%s)", quoteIdent(x.Column), inPlaceholders(len(nonNull))))
 			args = append(args, nonNull...)
 		}
 		if hasNull {
-			parts = append(parts, fmt.Sprintf("%s IS NULL", quoteIdent(p.Column)))
+			parts = append(parts, fmt.Sprintf("%s IS NULL", quoteIdent(x.Column)))
 		}
 		joined := []string{}
 		for _, p := range parts {
 			joined = append(joined, "("+p+")")
 		}
 		return strings.Join(joined, " OR "), args
-	case "and":
+	case AndPredicate:
 		var parts []string
 		var args []interface{}
-		for _, c := range p.Predicates {
+		for _, c := range x.Predicates {
 			where, a := compilePredicate(c)
 			if where != "" {
 				parts = append(parts, "("+where+")")
@@ -1140,17 +1195,17 @@ func shapeHandle(s Shape) string {
 }
 
 func predicateToJSON(p Predicate) interface{} {
-	switch p.Type {
-	case "", "all":
+	switch x := p.(type) {
+	case nil, AllPredicate:
 		return map[string]interface{}{"type": "all"}
-	case "eq":
-		return map[string]interface{}{"type": "eq", "column": p.Column, "value": p.Value}
-	case "gt", "lt", "gte", "lte":
-		return map[string]interface{}{"type": p.Type, "column": p.Column, "value": p.Value}
-	case "in":
+	case EqPredicate:
+		return map[string]interface{}{"type": "eq", "column": x.Column, "value": x.Value}
+	case RangePredicate:
+		return map[string]interface{}{"type": x.Op, "column": x.Column, "value": x.Value}
+	case InPredicate:
 		// dedupe + sort by JSON encoding for deterministic handle
 		seen := map[string]interface{}{}
-		for _, v := range p.Values {
+		for _, v := range x.Values {
 			b, _ := json.Marshal(v)
 			seen[string(b)] = v
 		}
@@ -1163,10 +1218,10 @@ func predicateToJSON(p Predicate) interface{} {
 		for _, k := range keys {
 			out = append(out, seen[k])
 		}
-		return map[string]interface{}{"type": "in", "column": p.Column, "values": out}
-	case "and":
-		children := make([]interface{}, 0, len(p.Predicates))
-		for _, c := range p.Predicates {
+		return map[string]interface{}{"type": "in", "column": x.Column, "values": out}
+	case AndPredicate:
+		children := make([]interface{}, 0, len(x.Predicates))
+		for _, c := range x.Predicates {
 			children = append(children, predicateToJSON(c))
 		}
 		sort.Slice(children, func(i, j int) bool {
@@ -1176,7 +1231,7 @@ func predicateToJSON(p Predicate) interface{} {
 		})
 		return map[string]interface{}{"type": "and", "predicates": children}
 	}
-	return map[string]interface{}{"type": p.Type}
+	return map[string]interface{}{"type": "all"}
 }
 
 func jsonCanonical(v interface{}) ([]byte, error) {

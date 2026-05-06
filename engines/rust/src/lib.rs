@@ -436,7 +436,7 @@ impl Electrolite {
         let rows: Vec<Json> = stmt
             .query_map(params_from_iter(args.iter()), |r| {
                 let s: String = r.get(0)?;
-                Ok(serde_json::from_str(&s).unwrap())
+                parse_log_json(&s)
             })?
             .collect::<Result<_, _>>()?;
         let offset = high_water(&db)?;
@@ -474,13 +474,17 @@ impl Electrolite {
             .query_map(params![&shape.table, offset, limit.max(1)], parse_log_row)?
             .collect::<Result<_, _>>()?;
         if let Some(last) = rows.last().cloned() {
+            // Extend until the trailing batch finishes or until we hit
+            // the safety cap. Without the cap, a 10M-row batch would
+            // force replay to load every row in one response.
+            let extension_cap = limit.max(1) * 10;
             let mut more = db.prepare(
                 "SELECT seq, batch_id, op, pk_json, old_pk_json, new_pk_json, old_json, new_json \
-                 FROM _electrolite_log WHERE table_name = ? AND seq > ? AND batch_id = ? ORDER BY seq",
+                 FROM _electrolite_log WHERE table_name = ? AND seq > ? AND batch_id = ? ORDER BY seq LIMIT ?",
             )?;
             let extra: Vec<LogRow> = more
                 .query_map(
-                    params![&shape.table, last.seq, last.batch_id],
+                    params![&shape.table, last.seq, last.batch_id, extension_cap],
                     parse_log_row,
                 )?
                 .collect::<Result<_, _>>()?;
@@ -702,7 +706,8 @@ impl Electrolite {
             .optional()?;
         let pk_json = row
             .ok_or_else(|| Error::Bad(format!("table {table} is not watched by Electrolite")))?;
-        let pk: Vec<String> = serde_json::from_str(&pk_json).unwrap();
+        let pk: Vec<String> = serde_json::from_str(&pk_json)
+            .map_err(|e| Error::Bad(format!("corrupt pk_columns row: {e}")))?;
         Ok(TableInfo {
             columns: info.columns,
             pk,
@@ -828,12 +833,29 @@ fn parse_log_row(r: &rusqlite::Row) -> rusqlite::Result<LogRow> {
         seq,
         batch_id,
         op,
-        pk: serde_json::from_str(&pk).unwrap(),
-        old_pk: old_pk.map(|s| serde_json::from_str(&s).unwrap()),
-        new_pk: new_pk.map(|s| serde_json::from_str(&s).unwrap()),
-        old_row: old_row.map(|s| serde_json::from_str(&s).unwrap()),
-        new_row: new_row.map(|s| serde_json::from_str(&s).unwrap()),
+        pk: parse_log_json(&pk)?,
+        old_pk: opt_log_json(old_pk)?,
+        new_pk: opt_log_json(new_pk)?,
+        old_row: opt_log_json(old_row)?,
+        new_row: opt_log_json(new_row)?,
     })
+}
+
+fn parse_log_json(s: &str) -> rusqlite::Result<Json> {
+    serde_json::from_str(s).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(e),
+        )
+    })
+}
+
+fn opt_log_json(s: Option<String>) -> rusqlite::Result<Option<Json>> {
+    match s {
+        Some(s) => Ok(Some(parse_log_json(&s)?)),
+        None => Ok(None),
+    }
 }
 
 fn predicate_matches(p: &Predicate, row: &Option<Json>) -> bool {
@@ -1166,17 +1188,14 @@ fn quote_string(s: &str) -> String {
 }
 
 fn random_hex(bytes: usize) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let mut seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+    let mut buf = vec![0u8; bytes];
+    // log_id and batch_id need to be unique across crashes / restarts.
+    // Panic if the OS RNG is unavailable rather than fall back to a
+    // non-cryptographic seed; collision-free identity is load-bearing.
+    getrandom::getrandom(&mut buf).expect("OS randomness unavailable");
     let mut out = String::with_capacity(bytes * 2);
-    for _ in 0..bytes {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        out.push_str(&format!("{:02x}", (seed & 0xff) as u8));
+    for b in buf {
+        out.push_str(&format!("{:02x}", b));
     }
     out
 }

@@ -620,12 +620,17 @@ defmodule Electrolite do
           rows
 
         last ->
+          # Extend until the trailing batch finishes or until we hit
+          # the safety cap. Without the cap, a 10M-row batch would
+          # force replay to load every row in one response.
+          extension_cap = max(limit, 1) * 10
+
           {:ok, more} =
             query(
               conn,
               "SELECT seq, batch_id, op, pk_json, old_pk_json, new_pk_json, old_json, new_json " <>
-                "FROM _electrolite_log WHERE table_name = ? AND seq > ? AND batch_id = ? ORDER BY seq",
-              [table, last.seq, last.batch_id]
+                "FROM _electrolite_log WHERE table_name = ? AND seq > ? AND batch_id = ? ORDER BY seq LIMIT ?",
+              [table, last.seq, last.batch_id, extension_cap]
             )
 
           rows ++ Enum.map(more, &parse_log_row/1)
