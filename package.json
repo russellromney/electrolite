@@ -14,6 +14,7 @@
     "test:rust": "cargo test --manifest-path engines/rust/Cargo.toml --quiet",
     "test:go": "cd engines/go && go test ./...",
     "test:elixir": "cd engines/elixir && mix deps.get >/dev/null && mix test",
-    "test:matrix": "node --no-warnings --experimental-strip-types --test tests/matrix.test.ts"
+    "test:matrix": "node --no-warnings --experimental-strip-types --test tests/matrix.test.ts",
+    "test:conformance": "node --no-warnings --experimental-strip-types --test engines/conformance/run.ts"
   }
 }

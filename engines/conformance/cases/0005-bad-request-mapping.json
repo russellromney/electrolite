@@ -1,0 +1,7 @@
+{
+  "name": "non-numeric offset returns 400 bad_request on every engine",
+  "operations": [
+    { "kind": "GET", "path": "/electrolite/v1/projectTodos/p1", "query": "offset=banana" }
+  ],
+  "cross_engine": ["0.status", "0.body.error"]
+}

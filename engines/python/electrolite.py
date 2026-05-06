@@ -170,7 +170,10 @@ class Electrolite:
         *,
         context: Any = None,
     ) -> tuple[int, dict[str, Any]]:
-        route = self._parse_route(path, query)
+        try:
+            route = self._parse_route(path, query)
+        except BadInput as e:
+            return 400, {"error": "bad_request", "detail": str(e)}
         if route is None:
             return 404, {"error": "shape_not_found"}
         definition = self.shapes.get(route["name"])

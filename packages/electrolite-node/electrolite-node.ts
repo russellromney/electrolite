@@ -227,6 +227,12 @@ export class Electrolite<TContext = unknown> {
       return jsonError(405, "method_not_allowed");
     }
     const route = this.parseRequest(request.url);
+    if (route && (route as any).badRequest) {
+      return Response.json(
+        { error: "bad_request", detail: (route as any).detail },
+        { status: 400 },
+      );
+    }
     if (!route) {
       return jsonError(404, "shape_not_found");
     }
@@ -393,9 +399,13 @@ export class Electrolite<TContext = unknown> {
     if (segments.some((segment) => segment === null) || segments.length === 0) {
       return null;
     }
-    const offset = Number(parsed.searchParams.get("offset"));
-    if (!Number.isFinite(offset)) {
-      return null;
+    const offsetRaw = parsed.searchParams.get("offset");
+    const offset = offsetRaw === null ? -1 : Number(offsetRaw);
+    if (!Number.isFinite(offset) || !Number.isInteger(offset)) {
+      return {
+        badRequest: true,
+        detail: `offset must be an integer, got ${JSON.stringify(offsetRaw)}`,
+      } as any;
     }
     return {
       name: segments[0],

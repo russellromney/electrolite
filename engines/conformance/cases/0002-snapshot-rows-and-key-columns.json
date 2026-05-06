@@ -1,0 +1,18 @@
+{
+  "name": "snapshot rows and key columns identical across engines",
+  "setup": "INSERT INTO todos (id, project_id, title, done) VALUES (1, 'p1', 'first', 0), (2, 'p1', 'second', 0), (3, 'p2', 'other', 0);",
+  "operations": [
+    {
+      "kind": "GET",
+      "path": "/electrolite/v1/projectTodos/p1",
+      "query": "offset=-1"
+    }
+  ],
+  "cross_engine": [
+    "0.status",
+    "0.body.type",
+    "0.body.key_columns",
+    "0.body.rows",
+    "0.body.up_to_date"
+  ]
+}

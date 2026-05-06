@@ -531,8 +531,11 @@ impl Electrolite {
 
     pub fn handle(&self, path: &str, query: &str, context: &Json) -> (u16, Json) {
         let route = match self.parse_route(path, query) {
-            Some(r) => r,
-            None => return (404, json!({"error": "shape_not_found"})),
+            Ok(Some(r)) => r,
+            Ok(None) => return (404, json!({"error": "shape_not_found"})),
+            Err(msg) => {
+                return (400, json!({"error": "bad_request", "detail": msg}));
+            }
         };
         let def = match self.shapes.get(&route.name) {
             Some(d) => d,
@@ -626,10 +629,10 @@ impl Electrolite {
         (200, replay_to_json(&body))
     }
 
-    fn parse_route(&self, path: &str, query: &str) -> Option<Route> {
+    fn parse_route(&self, path: &str, query: &str) -> Result<Option<Route>, String> {
         let prefix = format!("{}/", self.prefix);
         if !path.starts_with(&prefix) {
-            return None;
+            return Ok(None);
         }
         let rest = &path[prefix.len()..];
         let parts: Vec<String> = rest
@@ -638,22 +641,24 @@ impl Electrolite {
             .map(|s| s.to_string())
             .collect();
         if parts.is_empty() {
-            return None;
+            return Ok(None);
         }
         let qp = parse_query(query);
-        let offset = qp
-            .get("offset")
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(-1);
+        let offset = match qp.get("offset") {
+            None => -1,
+            Some(s) => s
+                .parse::<i64>()
+                .map_err(|_| format!("offset must be an integer, got {s:?}"))?,
+        };
         let live = qp.get("live").map(|s| s == "true").unwrap_or(false);
-        Some(Route {
+        Ok(Some(Route {
             name: parts[0].clone(),
             params: parts[1..].to_vec(),
             offset,
             live,
             log_id: qp.get("log_id").cloned(),
             shape_handle: qp.get("shape_handle").cloned(),
-        })
+        }))
     }
 
     fn current_log_id(&self) -> Result<String, Error> {

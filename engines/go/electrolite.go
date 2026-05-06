@@ -548,7 +548,10 @@ type HandleResponse struct {
 // JSON-encoding to the response. context is opaque to the engine and
 // passed to the shape's where/scope/authorize callbacks.
 func (e *Electrolite) Handle(path, query string, context interface{}) HandleResponse {
-	route, ok := e.parseRoute(path, query)
+	route, ok, err := e.parseRoute(path, query)
+	if err != nil {
+		return HandleResponse{Status: 400, Body: map[string]string{"error": "bad_request", "detail": err.Error()}}
+	}
 	if !ok {
 		return HandleResponse{Status: 404, Body: errBody("shape_not_found")}
 	}
@@ -687,10 +690,13 @@ type route struct {
 	ShapeHandle string
 }
 
-func (e *Electrolite) parseRoute(path, query string) (route, bool) {
+// parseRoute returns (route, ok=true) on success, (zero, ok=false)
+// when path is outside the prefix, and (zero, ok=false) with a
+// non-empty err when an inner validation (e.g. offset) failed.
+func (e *Electrolite) parseRoute(path, query string) (route, bool, error) {
 	prefix := e.prefix + "/"
 	if !strings.HasPrefix(path, prefix) {
-		return route{}, false
+		return route{}, false, nil
 	}
 	rest := path[len(prefix):]
 	parts := []string{}
@@ -700,14 +706,16 @@ func (e *Electrolite) parseRoute(path, query string) (route, bool) {
 		}
 	}
 	if len(parts) == 0 {
-		return route{}, false
+		return route{}, false, nil
 	}
 	values, _ := url.ParseQuery(strings.TrimPrefix(query, "?"))
 	off := int64(-1)
 	if v := values.Get("offset"); v != "" {
-		if x, err := strconv.ParseInt(v, 10, 64); err == nil {
-			off = x
+		x, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return route{}, false, fmt.Errorf("offset must be an integer, got %q", v)
 		}
+		off = x
 	}
 	return route{
 		Name:        parts[0],
@@ -716,7 +724,7 @@ func (e *Electrolite) parseRoute(path, query string) (route, bool) {
 		Live:        values.Get("live") == "true",
 		LogID:       values.Get("log_id"),
 		ShapeHandle: values.Get("shape_handle"),
-	}, true
+	}, true, nil
 }
 
 // LogID returns the current SQLite log identity.
