@@ -1,0 +1,2 @@
+# Commits for phase 0002
+# format: <step> <feature> <commit sha> — <message>
