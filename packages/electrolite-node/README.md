@@ -42,6 +42,23 @@ Browser clients can then subscribe to:
 /electrolite/v1/projectTodos/p1
 ```
 
+## Recommended PRAGMAs
+
+The engine does not issue `PRAGMA` statements; the user owns those.
+For production-shaped apps:
+
+```ts
+import { DatabaseSync } from "node:sqlite";
+const db = new DatabaseSync("./app.db");
+db.exec("PRAGMA journal_mode = WAL");
+db.exec("PRAGMA synchronous = NORMAL");
+db.exec("PRAGMA busy_timeout = 5000");
+db.close();
+```
+
+Set these once before constructing the Electrolite instance against
+the same file.
+
 ## Use Before npm
 
 Electrolite is not published to npm yet. Use this repository directly,

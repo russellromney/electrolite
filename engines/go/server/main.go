@@ -46,10 +46,17 @@ func main() {
 		  title TEXT NOT NULL,
 		  done INTEGER NOT NULL DEFAULT 0
 		);
+		CREATE TABLE IF NOT EXISTS feature_flags (
+		  id INTEGER PRIMARY KEY,
+		  enabled BOOLEAN NOT NULL DEFAULT 0
+		);
 	`); err != nil {
 		log.Fatalf("create: %v", err)
 	}
 	if err := app.InstallTriggers("todos"); err != nil {
+		log.Fatalf("triggers: %v", err)
+	}
+	if err := app.InstallTriggers("feature_flags"); err != nil {
 		log.Fatalf("triggers: %v", err)
 	}
 
@@ -70,6 +77,18 @@ func main() {
 		Table:   "todos",
 		Columns: []string{"id", "project_id", "title", "done"},
 		Where:   func(electrolite.BuildContext) electrolite.Predicate { return electrolite.Gt("id", 1) },
+	})
+	// Boolean coercion proof: BOOLEAN column + true predicate.
+	app.AddShape("enabledFlags", electrolite.ShapeDef{
+		Table:   "feature_flags",
+		Columns: []string{"id", "enabled"},
+		Where:   func(electrolite.BuildContext) electrolite.Predicate { return electrolite.Eq("enabled", true) },
+	})
+	// Range-null proof: every engine must reject with 400.
+	app.AddShape("bogusGt", electrolite.ShapeDef{
+		Table:   "todos",
+		Columns: []string{"id", "project_id", "title", "done"},
+		Where:   func(electrolite.BuildContext) electrolite.Predicate { return electrolite.Gt("id", nil) },
 	})
 
 	mux := http.NewServeMux()

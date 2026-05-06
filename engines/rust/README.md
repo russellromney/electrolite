@@ -46,6 +46,14 @@ SQLite file, live waiters will not be woken — they will time out
 after `live_timeout` and return their normal poll-style replay.
 Single-process embedded use is the supported model.
 
+## Randomness
+
+`log_id` and `batch_id` come from `getrandom` (the OS RNG: `getrandom(2)`
+on Linux, `arc4random_buf` on macOS/BSD, `BCryptGenRandom` on Windows).
+The engine panics at startup if the OS RNG is unavailable — this
+should only happen on bare-metal embedded targets without an entropy
+source.
+
 ## Recommended PRAGMAs
 
 The engine does not issue `PRAGMA` statements; the user owns those.

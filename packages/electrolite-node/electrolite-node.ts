@@ -289,8 +289,11 @@ export class Electrolite<TContext = unknown> {
     }
 
     const scope = callMaybe(definition.scope, { params, request, context });
+    // Default auth_scope to "" when no scope is supplied, matching the
+    // other engines. (Earlier versions used route.name; that diverged
+    // shape_handle bytes for shapes without an explicit scope.)
     const authScope =
-      scope === undefined || scope === null ? route.name : String(await scope);
+      scope === undefined || scope === null ? "" : String(await scope);
     const authorized = definition.authorize
       ? await definition.authorize({ params, request, context, scope: authScope })
       : true;

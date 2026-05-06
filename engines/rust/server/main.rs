@@ -50,10 +50,15 @@ fn main() {
           title TEXT NOT NULL,
           done INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS feature_flags (
+          id INTEGER PRIMARY KEY,
+          enabled BOOLEAN NOT NULL DEFAULT 0
+        );
         "#,
     )
     .unwrap();
     app.install_triggers("todos").unwrap();
+    app.install_triggers("feature_flags").unwrap();
     app.add_shape(
         "projectTodos",
         ShapeDef::new(
@@ -88,6 +93,29 @@ fn main() {
             ],
         )
         .where_fn(|_| gt("id", json!(1))),
+    );
+    // Boolean coercion proof: BOOLEAN column + true predicate.
+    app.add_shape(
+        "enabledFlags",
+        ShapeDef::new(
+            "feature_flags",
+            vec!["id".into(), "enabled".into()],
+        )
+        .where_fn(|_| eq("enabled", json!(true))),
+    );
+    // Range-null proof: every engine must reject with 400.
+    app.add_shape(
+        "bogusGt",
+        ShapeDef::new(
+            "todos",
+            vec![
+                "id".into(),
+                "project_id".into(),
+                "title".into(),
+                "done".into(),
+            ],
+        )
+        .where_fn(|_| gt("id", json!(null))),
     );
 
     let app = Arc::new(app);

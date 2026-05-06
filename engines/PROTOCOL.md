@@ -228,6 +228,19 @@ the watermark and writes the watermark to `retained_offset:<table>`.
 After compaction, any client whose stored `offset` is below the
 watermark must receive `409 resync_required` on its next replay.
 
+`compact` and `shutdown` interact: a compaction in progress when
+`shutdown()` is called runs to completion. `shutdown_timeout_ms`
+bounds live waiters, not compaction.
+
+## Multi-process caveat
+
+The engine is designed for a single writer process per database.
+Bootstrap clears the `current_batch_id` meta row to recover from a
+crashed `write_batch`. **If two processes open the same database
+concurrently, one's bootstrap may invalidate the other's in-flight
+batch.** Use one writer process per database; readers in other
+processes are fine.
+
 ## Conformance test cases
 
 Every engine implements a test suite that exercises these cases:

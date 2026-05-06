@@ -83,6 +83,7 @@ class Electrolite:
         self.live_timeout_ms = live_timeout_ms
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)
+        self._stopped = False
         self.bootstrap()
 
     def install_triggers(self, table: str) -> dict[str, Any]:
@@ -110,11 +111,12 @@ class Electrolite:
     def shutdown(self) -> None:
         """Wake any live waiters then close the SQLite connection.
 
-        Live waiters return whatever replay state they currently have
-        (typically empty; they re-snapshot on reconnect). Subsequent
-        calls to engine methods will fail.
+        Sets `self._stopped` so any in-flight `handle()` call exits
+        cleanly with `200 {messages: [], up_to_date: true,
+        shutdown: true}` instead of touching the closed database.
         """
         with self._changed:
+            self._stopped = True
             self._changed.notify_all()
         self.db.close()
 
@@ -208,6 +210,16 @@ class Electrolite:
                     remaining = deadline - time.monotonic()
                     if remaining > 0:
                         self._changed.wait(remaining)
+                if self._stopped:
+                    return 200, {
+                        "type": "replay",
+                        "log_id": body["log_id"],
+                        "shape_handle": body["shape_handle"],
+                        "messages": [],
+                        "offset": route["offset"],
+                        "up_to_date": True,
+                        "shutdown": True,
+                    }
                 body = self.replay(built, route["offset"], self.replay_limit)
             return 200, body
         except ResyncRequired:

@@ -43,6 +43,22 @@ def electrolite_shape(shape_name, project_id):
     return jsonify(body), status
 ```
 
+## Recommended PRAGMAs
+
+The engine does not issue `PRAGMA` statements; the user owns those.
+For production-shaped apps:
+
+```python
+db = sqlite3.connect("app.db")
+db.execute("PRAGMA journal_mode = WAL")
+db.execute("PRAGMA synchronous = NORMAL")
+db.execute("PRAGMA busy_timeout = 5000")
+db.commit()
+db.close()
+```
+
+Set these once when the file is first created.
+
 Run the engine tests:
 
 ```sh

@@ -35,9 +35,25 @@ http.HandleFunc("/electrolite/v1/projectTodos/p1", func(w http.ResponseWriter, r
 })
 ```
 
-This engine implements the same SQLite trigger log, snapshot, replay,
-and shared-batch shape as the Node and Python engines. Wire `Snapshot`
-and `Replay` into whatever HTTP framework you like.
+This engine implements the conformance contract in
+[`engines/PROTOCOL.md`](../PROTOCOL.md). Wire `Snapshot` / `Replay`
+into whatever HTTP framework you like, or use the included
+`Handle(path, query, context)` for a drop-in shape registry.
+
+## Recommended PRAGMAs
+
+The engine does not issue `PRAGMA` statements; the user owns those.
+For production-shaped apps:
+
+```go
+db, _ := sql.Open("sqlite", "app.db")
+db.Exec("PRAGMA journal_mode = WAL")
+db.Exec("PRAGMA synchronous = NORMAL")
+db.Exec("PRAGMA busy_timeout = 5000")
+db.Close()
+```
+
+Set these once before opening the engine on the same file.
 
 Run the tests:
 

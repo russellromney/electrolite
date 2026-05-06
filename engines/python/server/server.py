@@ -52,6 +52,20 @@ def build_app(db_path: str):
                 columns=["id", "project_id", "title", "done"],
                 where=lambda ctx: gt("id", 1),
             ),
+            # Boolean coercion proof: BOOLEAN column with a true-valued predicate.
+            # Every engine must normalize this to value=1 (and produce the same
+            # shape_handle bytes); otherwise this shape's handle would diverge.
+            "enabledFlags": shape(
+                table="feature_flags",
+                columns=["id", "enabled"],
+                where=lambda ctx: eq("enabled", True),
+            ),
+            # Range-null proof: every engine must reject this with 400.
+            "bogusGt": shape(
+                table="todos",
+                columns=["id", "project_id", "title", "done"],
+                where=lambda ctx: gt("id", None),
+            ),
         },
     )
     app.execute_batch(
@@ -62,9 +76,14 @@ def build_app(db_path: str):
           title TEXT NOT NULL,
           done INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS feature_flags (
+          id INTEGER PRIMARY KEY,
+          enabled BOOLEAN NOT NULL DEFAULT 0
+        );
         """
     )
     app.install_triggers("todos")
+    app.install_triggers("feature_flags")
     return app
 
 

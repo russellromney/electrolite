@@ -34,9 +34,14 @@ pid = Electrolite.TestServer.engine_name()
     title TEXT NOT NULL,
     done INTEGER NOT NULL DEFAULT 0
   );
+  CREATE TABLE IF NOT EXISTS feature_flags (
+    id INTEGER PRIMARY KEY,
+    enabled BOOLEAN NOT NULL DEFAULT 0
+  );
   """)
 
 :ok = Electrolite.install_triggers(pid, "todos")
+:ok = Electrolite.install_triggers(pid, "feature_flags")
 
 :ok =
   Electrolite.add_shape(
@@ -65,6 +70,30 @@ pid = Electrolite.TestServer.engine_name()
       table: "todos",
       columns: ["id", "project_id", "title", "done"],
       where: fn _ -> Electrolite.gt("id", 1) end
+    )
+  )
+
+# Boolean coercion proof: BOOLEAN column + true predicate.
+:ok =
+  Electrolite.add_shape(
+    pid,
+    "enabledFlags",
+    Electrolite.shape_def(
+      table: "feature_flags",
+      columns: ["id", "enabled"],
+      where: fn _ -> Electrolite.eq("enabled", true) end
+    )
+  )
+
+# Range-null proof: every engine must reject with 400.
+:ok =
+  Electrolite.add_shape(
+    pid,
+    "bogusGt",
+    Electrolite.shape_def(
+      table: "todos",
+      columns: ["id", "project_id", "title", "done"],
+      where: fn _ -> Electrolite.gt("id", nil) end
     )
   )
 

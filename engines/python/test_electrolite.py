@@ -311,6 +311,129 @@ class TableConformance(unittest.TestCase):
         self.assertEqual(body["messages"][0]["key"], {"org": "o1", "user": "u1"})
 
 
+class RobustnessConformance(unittest.TestCase):
+    def test_stale_current_batch_id_cleared_on_bootstrap(self):
+        # Simulate a crashed write_batch by writing current_batch_id
+        # directly, then re-bootstrapping. The next ordinary write
+        # must NOT inherit that dead batch_id.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = os.path.join(tmp.name, "app.db")
+        app = create_electrolite(db_path)
+        app.execute_batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);"
+        )
+        app.install_triggers("t")
+
+        # Plant a stale batch_id directly in meta and verify a fresh
+        # connection (re-bootstrap) clears it.
+        app.db.execute(
+            """
+            INSERT INTO _electrolite_meta (key, value) VALUES ('current_batch_id', 'STALE')
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """
+        )
+        app.db.commit()
+        app.shutdown()
+
+        app2 = create_electrolite(db_path)
+        # bootstrap clears current_batch_id; the next insert should
+        # pick a fresh random batch via lower(hex(randomblob(16))).
+        app2.execute("INSERT INTO t (id, v) VALUES (?, ?)", [1, "hello"])
+        row = app2.db.execute(
+            "SELECT batch_id FROM _electrolite_log WHERE table_name = 't' ORDER BY seq DESC LIMIT 1"
+        ).fetchone()
+        self.assertNotEqual(row["batch_id"], "STALE")
+        self.assertRegex(row["batch_id"], r"^[a-f0-9]{32}$")
+
+    def test_replay_batch_cap_signals_more_to_come(self):
+        # Insert a batch larger than 10 * replay_limit and verify the
+        # response page is bounded and signals up_to_date=false.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = os.path.join(tmp.name, "app.db")
+        app = create_electrolite(db_path)
+        app.execute_batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);"
+        )
+        app.install_triggers("t")
+
+        statements = [
+            ("INSERT INTO t (id, v) VALUES (?, ?)", [i, f"row-{i}"])
+            for i in range(1, 25)
+        ]
+        app.write_batch(statements)
+
+        spec = {
+            "table": "t",
+            "columns": ["id", "v"],
+            "predicate": {"type": "all"},
+            "auth_scope": "",
+            "schema_version": 1,
+        }
+        # replay_limit=1 → extension cap = 10 → page should yield 11
+        # rows (initial 1 + 10 extension), and up_to_date=False since
+        # the batch isn't fully drained.
+        body = app.replay(spec, 0, 1)
+        self.assertEqual(len(body["messages"]), 11)
+        self.assertFalse(body["up_to_date"])
+        # Continue: next page should also be capped.
+        body2 = app.replay(spec, body["offset"], 1)
+        self.assertEqual(len(body2["messages"]), 11)
+        # Final page drains the rest.
+        body3 = app.replay(spec, body2["offset"], 1)
+        self.assertGreater(len(body3["messages"]), 0)
+        self.assertTrue(body3["up_to_date"])
+
+    def test_shutdown_wakes_live_waiters(self):
+        # A live waiter should be woken by shutdown() so the request
+        # returns instead of hanging until the timeout.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = os.path.join(tmp.name, "app.db")
+        app = create_electrolite(
+            db_path,
+            live_timeout_ms=10_000,
+            shapes={
+                "all": shape(
+                    table="t",
+                    columns=["id", "v"],
+                )
+            },
+        )
+        app.execute_batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);"
+        )
+        app.install_triggers("t")
+
+        # Pin to current offset so the live wait triggers.
+        _, snap = app.handle("/electrolite/v1/all", "offset=-1")
+        result = {}
+        started = threading.Event()
+
+        def wait_for_change():
+            started.set()
+            result["response"] = app.handle(
+                "/electrolite/v1/all",
+                f"offset={snap['offset']}&live=true&log_id={snap['log_id']}&shape_handle={snap['shape_handle']}",
+            )
+
+        thread = threading.Thread(target=wait_for_change)
+        thread.start()
+        started.wait()
+        time.sleep(0.05)
+
+        start = time.monotonic()
+        app.shutdown()
+        thread.join(2)
+        elapsed = time.monotonic() - start
+
+        self.assertFalse(thread.is_alive())
+        self.assertLess(elapsed, 1.0, "shutdown should wake waiter immediately, not at timeout")
+        status, _ = result["response"]
+        self.assertIn(status, (200, 409, 500))
+
+
 class LiveWaitConformance(unittest.TestCase):
     def test_live_wait_wakes_when_write_commits(self):
         tmp, app = _setup(live_timeout_ms=500)

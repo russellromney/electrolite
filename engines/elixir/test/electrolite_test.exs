@@ -323,6 +323,47 @@ defmodule ElectroliteTest do
     assert m["key"] == %{"org" => "o1", "user" => "u1"}
   end
 
+  test "live wait does not lose its wake to a TOCTOU race" do
+    # 50 iterations of: snapshot → live wait → write. If the wake
+    # registration happens after the write notify, the live request
+    # times out instead of waking — this stress test would expose
+    # that. The fix (atomic subscribe in handle_initial reply) keeps
+    # this loop fast and reliable.
+    {pid, _} = setup_app(live_timeout_ms: 2_000)
+    seed_todos(pid)
+    :ok = Electrolite.add_shape(pid, "projectTodos", project_todos_def())
+
+    for i <- 1..50 do
+      {200, snap} =
+        Electrolite.handle(pid, "/electrolite/v1/projectTodos/p1", "offset=-1", %{projects: ["p1"]})
+
+      parent = self()
+
+      spawn_link(fn ->
+        result =
+          Electrolite.handle(
+            pid,
+            "/electrolite/v1/projectTodos/p1",
+            "offset=#{snap["offset"]}&live=true&log_id=#{snap["log_id"]}&shape_handle=#{snap["shape_handle"]}",
+            %{projects: ["p1"]}
+          )
+
+        send(parent, {:wait_done, i, result})
+      end)
+
+      # Race the write against the live wait — no sleep, just hammer.
+      :ok =
+        Electrolite.execute(
+          pid,
+          "INSERT INTO todos (id, project_id, title, done) VALUES (?, ?, ?, 0)",
+          [1_000 + i, "p1", "race-#{i}"]
+        )
+
+      assert_receive {:wait_done, ^i, {200, body}}, 1_500
+      assert length(body["messages"]) >= 1
+    end
+  end
+
   test "wait_for_change wakes when log changes" do
     {pid, _} = setup_app()
     seed_todos(pid)

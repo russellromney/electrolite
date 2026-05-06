@@ -63,6 +63,18 @@ async function startNode(port: number, dbPath: string): Promise<Server> {
         columns: ["id", "project_id", "title", "done"],
         where: () => gt("id", 1),
       }),
+      // Boolean coercion proof: BOOLEAN column + true predicate.
+      enabledFlags: shape({
+        table: "feature_flags",
+        columns: ["id", "enabled"],
+        where: () => ({ type: "eq", column: "enabled", value: true }),
+      }),
+      // Range-null proof: every engine must reject with 400.
+      bogusGt: shape({
+        table: "todos",
+        columns: ["id", "project_id", "title", "done"],
+        where: () => ({ type: "gt", column: "id", value: null }),
+      }),
     },
   });
   electrolite.executeBatch(`
@@ -72,8 +84,13 @@ async function startNode(port: number, dbPath: string): Promise<Server> {
       title TEXT NOT NULL,
       done INTEGER NOT NULL DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS feature_flags (
+      id INTEGER PRIMARY KEY,
+      enabled BOOLEAN NOT NULL DEFAULT 0
+    );
   `);
   electrolite.installTriggers("todos");
+  electrolite.installTriggers("feature_flags");
 
   const httpServer = createServer(async (req, res) => {
     if (req.url?.startsWith("/electrolite/")) {

@@ -1,0 +1,14 @@
+{
+  "name": "range predicate with null value rejected as 400 bad_request on every engine",
+  "operations": [
+    {
+      "kind": "GET",
+      "path": "/electrolite/v1/bogusGt",
+      "query": "offset=-1"
+    }
+  ],
+  "cross_engine": [
+    "0.status",
+    "0.body.error"
+  ]
+}

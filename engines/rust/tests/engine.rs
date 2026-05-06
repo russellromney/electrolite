@@ -482,6 +482,92 @@ fn live_wait_wakes_when_write_commits() {
     assert_eq!(messages[0]["type"], "insert");
 }
 
+#[test]
+fn log_id_is_collision_free_across_rapid_opens() {
+    // 1000 fresh databases opened back-to-back must produce 1000
+    // distinct log_id values. The xorshift+wall-clock RNG used to
+    // generate identical IDs when system time didn't advance between
+    // opens; getrandom closes that.
+    use std::collections::HashSet;
+    let mut ids = HashSet::new();
+    for i in 0..1000 {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(format!("app-{i}.db"));
+        let app = Electrolite::open(path.to_str().unwrap()).unwrap();
+        // We can't directly call log_id_unsafe from here, so go via
+        // snapshot of an empty trigger-less table — bootstrap already
+        // populated log_id; snapshot's response carries it.
+        app.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        app.install_triggers("t").unwrap();
+        let shape = Shape::new("t", vec!["id".into()], all());
+        let snap = app.snapshot(&shape).unwrap();
+        assert!(
+            ids.insert(snap.log_id.clone()),
+            "duplicate log_id at iteration {i}: {}",
+            snap.log_id
+        );
+    }
+}
+
+#[test]
+fn batch_cap_signals_more_to_come() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("app.db");
+    let app = Electrolite::open(path.to_str().unwrap()).unwrap();
+    app.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);")
+        .unwrap();
+    app.install_triggers("t").unwrap();
+
+    // Single batch of 25 rows; replay limit 1 → cap = 10 → first
+    // page has 11 rows and up_to_date=false.
+    let stmts: Vec<(&str, Vec<Value>)> = (1..=25)
+        .map(|i| {
+            (
+                "INSERT INTO t (id, v) VALUES (?, ?)",
+                vec![Value::Integer(i), Value::Text(format!("row-{i}"))],
+            )
+        })
+        .collect();
+    app.write_batch(&stmts).unwrap();
+
+    let shape = Shape::new("t", vec!["id".into(), "v".into()], all());
+    let r = app.replay(&shape, 0, 1).unwrap();
+    assert_eq!(r.messages.len(), 11);
+    assert!(!r.up_to_date);
+}
+
+#[test]
+fn stale_current_batch_id_cleared_on_bootstrap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("app.db");
+    {
+        let app = Electrolite::open(path.to_str().unwrap()).unwrap();
+        app.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);")
+            .unwrap();
+        app.install_triggers("t").unwrap();
+        // Plant a stale batch_id and drop the engine without clearing.
+        app.execute(
+            "INSERT INTO _electrolite_meta (key, value) VALUES ('current_batch_id', 'STALE') \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            &[],
+        )
+        .unwrap();
+    }
+    let app = Electrolite::open(path.to_str().unwrap()).unwrap();
+    app.execute(
+        "INSERT INTO t (id, v) VALUES (?, ?)",
+        &[Value::Integer(1), Value::Text("hello".into())],
+    )
+    .unwrap();
+    let shape = Shape::new("t", vec!["id".into(), "v".into()], all());
+    let r = app.replay(&shape, 0, 100).unwrap();
+    assert_eq!(r.messages.len(), 1);
+    let batch_id = r.messages[0]["batch_id"].as_str().unwrap();
+    assert_ne!(batch_id, "STALE");
+    assert_eq!(batch_id.len(), 32);
+}
+
 // Smoke test: keep direct API working alongside handle().
 #[test]
 fn direct_snapshot_replay_still_works() {
