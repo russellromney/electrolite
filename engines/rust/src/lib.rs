@@ -876,10 +876,16 @@ fn opt_log_json(s: Option<String>) -> rusqlite::Result<Option<Json>> {
 }
 
 fn predicate_matches(p: &Predicate, row: &Option<Json>) -> bool {
-    let row = match row {
-        Some(r) => r,
-        None => return false,
-    };
+    match row {
+        Some(r) => predicate_matches_row(p, r),
+        None => false,
+    }
+}
+
+/// Public predicate matcher against a JSON object row. Used by the
+/// conformance harness to compare in-process matching against SQL
+/// `WHERE` results.
+pub fn predicate_matches_row(p: &Predicate, row: &Json) -> bool {
     match p {
         Predicate::All => true,
         Predicate::Eq { column, value } => row.get(column) == Some(value),
@@ -891,7 +897,61 @@ fn predicate_matches(p: &Predicate, row: &Option<Json>) -> bool {
             let left = row.get(column);
             values.iter().any(|v| Some(v) == left)
         }
-        Predicate::And(children) => children.iter().all(|c| predicate_matches(c, &Some(row.clone()))),
+        Predicate::And(children) => children.iter().all(|c| predicate_matches_row(c, row)),
+    }
+}
+
+/// Parse a JSON predicate (wire format) into a `Predicate` enum.
+pub fn predicate_from_json(value: &Json) -> Result<Predicate, String> {
+    let kind = value
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "predicate missing 'type'".to_string())?;
+    match kind {
+        "all" => Ok(Predicate::All),
+        "eq" => {
+            let column = value
+                .get("column")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "eq missing column".to_string())?
+                .to_string();
+            let value = value.get("value").cloned().unwrap_or(Json::Null);
+            Ok(Predicate::Eq { column, value })
+        }
+        "gt" | "lt" | "gte" | "lte" => {
+            let op = RangeOp::from_key(kind).unwrap();
+            let column = value
+                .get("column")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "range missing column".to_string())?
+                .to_string();
+            let value = value.get("value").cloned().unwrap_or(Json::Null);
+            Ok(Predicate::Range { op, column, value })
+        }
+        "in" => {
+            let column = value
+                .get("column")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "in missing column".to_string())?
+                .to_string();
+            let values = value
+                .get("values")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            Ok(Predicate::In { column, values })
+        }
+        "and" => {
+            let children = value
+                .get("predicates")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let parsed: Result<Vec<Predicate>, String> =
+                children.iter().map(predicate_from_json).collect();
+            Ok(Predicate::And(parsed?))
+        }
+        other => Err(format!("unknown predicate type: {other}")),
     }
 }
 

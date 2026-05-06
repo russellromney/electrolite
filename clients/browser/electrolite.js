@@ -8,6 +8,7 @@ export class ShapeClient {
       persist = false,
       multiTab = false,
       channelFactory,
+      transport = "long-poll",
     } = options;
     if (keyColumns !== undefined && (!Array.isArray(keyColumns) || keyColumns.length === 0)) {
       throw new Error("ShapeClient keyColumns must be a non-empty array");
@@ -20,6 +21,10 @@ export class ShapeClient {
     this.keyColumns = keyColumns ?? null;
     this.fetch = fetchFn;
     this.live = live;
+    if (transport !== "long-poll" && transport !== "sse") {
+      throw new Error(`ShapeClient transport must be 'long-poll' or 'sse', got ${transport}`);
+    }
+    this.transport = transport;
     this.retryMinDelayMs = retry.minDelayMs ?? 250;
     this.retryMaxDelayMs = retry.maxDelayMs ?? 5_000;
     this.logId = null;
@@ -90,7 +95,12 @@ export class ShapeClient {
 
   stop() {
     this.stopped = true;
-    this.abortController?.abort();
+    try {
+      this.abortController?.abort();
+    } catch {
+      // AbortController.abort() can synthesize a rejection that some
+      // runtimes (Node 25+) attribute to the abort caller; swallow.
+    }
     this.releaseLeadership();
     if (this.channel && this.channelHandler) {
       this.channel.removeEventListener?.("message", this.channelHandler);
@@ -132,6 +142,8 @@ export class ShapeClient {
           await this.request({ offset: this.offset });
         } else if (!this.live) {
           return;
+        } else if (this.transport === "sse") {
+          await this.streamSse();
         } else {
           await this.request({ offset: this.offset, live: true });
         }
@@ -144,6 +156,87 @@ export class ShapeClient {
         await this.sleep(delay);
         delay = Math.min(delay * 2, this.retryMaxDelayMs);
       }
+    }
+  }
+
+  /**
+   * Open an SSE stream for live replay. Keeps the connection open
+   * until `stop()` is called or the server sends an error event.
+   * Server sends `event: replay\ndata: {...}\n\n` for each new
+   * batch; this client materializes them via `apply()`.
+   */
+  async streamSse() {
+    this.renewLeadership();
+    this.abortController = new AbortController();
+    this.notifyStatus({ type: "live", offset: this.offset });
+
+    const url = new URL(this.url, globalThis.location?.href);
+    url.searchParams.set("offset", String(this.offset));
+    if (this.logId) url.searchParams.set("log_id", this.logId);
+    if (this.shapeHandle) url.searchParams.set("shape_handle", this.shapeHandle);
+
+    let response;
+    try {
+      response = await this.fetch(url, {
+        signal: this.abortController.signal,
+        headers: { Accept: "text/event-stream" },
+      });
+    } catch (err) {
+      this.abortController = null;
+      throw err;
+    }
+
+    if (response.status === 409) {
+      this.abortController = null;
+      this.notifyStatus({ type: "resync_required", offset: this.offset });
+      await this.resetLocalState();
+      return this.request({ offset: -1 });
+    }
+    if (!response.ok || !response.body) {
+      this.abortController = null;
+      throw new Error(`Electrolite SSE failed: ${response.status}`);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      while (!this.stopped) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buffer.indexOf("\n\n")) !== -1) {
+          const frame = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          this.handleSseFrame(frame);
+        }
+      }
+    } finally {
+      try {
+        await reader.cancel();
+      } catch {}
+      this.abortController = null;
+    }
+  }
+
+  handleSseFrame(frame) {
+    let event = "message";
+    let data = "";
+    for (const line of frame.split("\n")) {
+      if (line.startsWith(":")) continue; // comment / heartbeat
+      if (line.startsWith("event:")) event = line.slice(6).trim();
+      else if (line.startsWith("data:")) data += line.slice(5).trim();
+    }
+    if (!data) return;
+    let body;
+    try {
+      body = JSON.parse(data);
+    } catch {
+      return;
+    }
+    if (event === "snapshot" || event === "replay") {
+      this.apply(body);
     }
   }
 

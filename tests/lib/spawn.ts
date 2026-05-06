@@ -15,6 +15,7 @@ import {
   gt,
   shape,
 } from "../../packages/electrolite-node/electrolite-node.ts";
+import { predicateMatchesRow } from "../../packages/electrolite-node/electrolite-node-engine.ts";
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 export const HOST = "127.0.0.1";
@@ -77,6 +78,11 @@ async function startNode(port: number, dbPath: string): Promise<Server> {
   const httpServer = createServer(async (req, res) => {
     if (req.url?.startsWith("/electrolite/")) {
       const url = `http://${HOST}:${port}${req.url}`;
+      const accept = req.headers["accept"] ?? "";
+      if (typeof accept === "string" && accept.includes("text/event-stream")) {
+        await streamSseNode(electrolite, url, req, res);
+        return;
+      }
       const response = await electrolite.handle(new Request(url), {
         user: { projects: new Set(["p1", "p2"]) },
       });
@@ -97,6 +103,14 @@ async function startNode(port: number, dbPath: string): Promise<Server> {
           electrolite.writeBatch(payload.statements);
         } else if (req.url === "/_test/seed") {
           electrolite.executeBatch(payload.sql);
+        } else if (req.url === "/_test/match-predicate") {
+          const matched = (payload.rows as any[])
+            .filter((row) => predicateMatchesRow(payload.predicate, row))
+            .map((row) => row.id);
+          res.statusCode = 200;
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify({ matched_ids: matched }));
+          return;
         }
         res.statusCode = 200;
         res.setHeader("content-type", "application/json");
@@ -125,6 +139,58 @@ async function startNode(port: number, dbPath: string): Promise<Server> {
 }
 
 // ---------- subprocess servers ----------
+
+async function streamSseNode(electrolite: any, url: string, req: any, res: any) {
+  res.statusCode = 200;
+  res.setHeader("content-type", "text/event-stream");
+  res.setHeader("cache-control", "no-cache");
+  res.setHeader("access-control-allow-origin", "*");
+
+  const ctx = { user: { projects: new Set(["p1", "p2"]) } };
+  const initial = await electrolite.handle(new Request(url), ctx);
+  if (initial.status !== 200) {
+    res.write(`event: error\ndata: ${await initial.text()}\n\n`);
+    res.end();
+    return;
+  }
+  const initialBody = await initial.json();
+  const u = new URL(url);
+  const startedFromSnapshot = (u.searchParams.get("offset") ?? "-1") === "-1";
+  res.write(
+    `event: ${startedFromSnapshot ? "snapshot" : "replay"}\ndata: ${JSON.stringify(initialBody)}\n\n`,
+  );
+
+  let offset = initialBody.offset as number;
+  const logId = initialBody.log_id as string;
+  const shapeHandle = initialBody.shape_handle as string;
+
+  let closed = false;
+  req.on("close", () => {
+    closed = true;
+  });
+
+  while (!closed) {
+    const liveUrl = new URL(url);
+    liveUrl.searchParams.set("offset", String(offset));
+    liveUrl.searchParams.set("log_id", logId);
+    liveUrl.searchParams.set("shape_handle", shapeHandle);
+    liveUrl.searchParams.set("live", "true");
+
+    const r = await electrolite.handle(new Request(liveUrl), ctx);
+    if (r.status !== 200) {
+      res.write(`event: error\ndata: ${await r.text()}\n\n`);
+      break;
+    }
+    const body = await r.json();
+    if (body.messages && body.messages.length > 0) {
+      res.write(`event: replay\ndata: ${JSON.stringify(body)}\n\n`);
+      offset = body.offset;
+    }
+    if (closed) break;
+    if (!res.write(`: ping\n\n`)) break;
+  }
+  res.end();
+}
 
 async function startSubprocessRaw(
   command: string,
@@ -307,7 +373,15 @@ export function ensureBuilt(): void {
     );
     if (r.status !== 0) throw new Error("cargo build failed");
   }
-  // Elixir compile cache is per-project; first mix run compiles deps
-  // then exits via timeout. Skip pre-warm; matrix tolerates the
-  // first run being a few seconds slower.
+  // Pre-warm the Elixir compile cache so the first matrix /
+  // conformance run doesn't pay 5–10s of mix compile time inside
+  // the readiness timeout.
+  const elixirCacheMarker = join(ROOT, "engines/elixir/_build/dev/lib/electrolite/.compile.elixir");
+  if (!existsSync(elixirCacheMarker)) {
+    const r = spawnSync("mix", ["compile"], {
+      cwd: join(ROOT, "engines/elixir"),
+      stdio: "inherit",
+    });
+    if (r.status !== 0) throw new Error("mix compile failed");
+  }
 }

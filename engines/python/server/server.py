@@ -23,7 +23,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ENGINE_DIR = os.path.dirname(HERE)
 sys.path.insert(0, ENGINE_DIR)
 
-from electrolite import create_electrolite, eq, gt, in_list, shape  # noqa: E402
+from electrolite import (  # noqa: E402
+    and_,
+    create_electrolite,
+    eq,
+    gt,
+    in_list,
+    predicate_matches,
+    shape,
+)
 
 
 def build_app(db_path: str):
@@ -77,6 +85,10 @@ def make_handler(app):
         def do_GET(self):
             parsed = urlparse(self.path)
             if parsed.path.startswith("/electrolite/"):
+                accept = self.headers.get("accept", "")
+                if "text/event-stream" in accept:
+                    self._stream_sse(parsed)
+                    return
                 status, body = app.handle(
                     parsed.path,
                     parsed.query,
@@ -85,6 +97,65 @@ def make_handler(app):
                 self._send(status, body)
                 return
             self._send(404, {"error": "not_found"})
+
+        def _stream_sse(self, parsed):
+            # Send headers for an event-stream response.
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("cache-control", "no-cache")
+            self.send_header("connection", "keep-alive")
+            self.send_header("access-control-allow-origin", "*")
+            self.end_headers()
+
+            from urllib.parse import parse_qs as _pq
+            from threading import Event
+            qd = _pq(parsed.query)
+            try:
+                offset = int(qd.get("offset", ["-1"])[0])
+            except ValueError:
+                self._write_event("error", {"error": "bad_request"})
+                return
+            ctx = {"projects": {"p1", "p2"}}
+
+            # Initial snapshot or replay.
+            status, body = app.handle(parsed.path, parsed.query, context=ctx)
+            if status != 200:
+                self._write_event("error", body)
+                return
+            kind = "snapshot" if offset < 0 else "replay"
+            self._write_event(kind, body)
+            offset = body.get("offset", offset)
+
+            # Loop: wait for change, replay, send. On disconnect, break.
+            log_id = body.get("log_id", "")
+            shape_handle = body.get("shape_handle", "")
+            while True:
+                # Build a query for the next replay.
+                next_query = (
+                    f"offset={offset}&log_id={log_id}&shape_handle={shape_handle}&live=true"
+                )
+                status, body = app.handle(parsed.path, next_query, context=ctx)
+                if status != 200:
+                    self._write_event("error", body)
+                    return
+                if body.get("messages"):
+                    self._write_event("replay", body)
+                    offset = body.get("offset", offset)
+                # If client disconnected, write will fail.
+                try:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+
+        def _write_event(self, event, data):
+            try:
+                payload = json.dumps(data).encode()
+                frame = b"event: " + event.encode() + b"\ndata: " + payload + b"\n\n"
+                self.wfile.write(frame)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                raise
 
         def do_POST(self):
             length = int(self.headers.get("content-length") or 0)
@@ -105,6 +176,14 @@ def make_handler(app):
             if self.path == "/_test/seed":
                 app.execute_batch(payload["sql"])
                 self._send(200, {"ok": True})
+                return
+            if self.path == "/_test/match-predicate":
+                pred = payload["predicate"]
+                rows = payload["rows"]
+                matched_ids = [
+                    row["id"] for row in rows if predicate_matches(pred, row)
+                ]
+                self._send(200, {"matched_ids": matched_ids})
                 return
             self._send(404, {"error": "not_found"})
 

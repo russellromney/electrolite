@@ -31,18 +31,23 @@ long-polls for replay messages.
   harness at `engines/conformance/`.
 - Engines support a `shutdown()` API that wakes live waiters and
   closes the connection.
+- Two transports are supported: long-poll (default) and SSE. The
+  browser `ShapeClient` selects via `transport: "sse"`. Every
+  engine's test server speaks both. The matrix runs the full
+  scenario (snapshot, insert/update/delete, batch, predicate
+  boundary) over each transport against each engine: 5 × 2 = 10
+  cells, all green.
+- The cross-engine in-process predicate matcher is exercised by
+  the conformance harness; SQL `WHERE` and the matcher agree on
+  every engine.
 - The system does not yet do:
-  - **SSE transport.** Long-polling is the only transport today.
-    HTTP/2 push and WebSocket adapter are out of scope.
+  - HTTP/2 push and WebSocket adapter (out of scope; SSE is the
+    streaming transport).
   - **Connection pool / WAL-mode-aware concurrency.** Every engine
     is single-connection serialized. PRAGMAs are the user's
     responsibility (engines do not force `journal_mode`).
   - **Cross-process wake.** `update_hook` (Rust) only sees this
     connection's writes; other engines rely on engine-internal notify.
-  - **Predicate-parity property test.** SQL `WHERE` and the in-
-    process matcher are not yet directly compared on a fixed row
-    set. Cross-engine handle parity exercises the same paths
-    indirectly.
   - **Backend client libraries.** Browser is the only client.
 
 ## Boundaries that matter

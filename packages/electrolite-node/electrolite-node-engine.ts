@@ -544,6 +544,12 @@ function predicateMatches(predicate, row) {
   }
 }
 
+// Public predicate matcher exposed for conformance testing. Same
+// semantics as the internal one used during replay.
+export function predicateMatchesRow(predicate, row) {
+  return predicateMatches(predicate, row);
+}
+
 function compareScalar(left, right, op) {
   if (left === null || left === undefined || right === null || right === undefined) {
     return false;

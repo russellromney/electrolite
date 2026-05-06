@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
@@ -78,7 +79,14 @@ func main() {
 		if r.URL.RawQuery != "" {
 			query = r.URL.RawQuery
 		}
-		resp := app.Handle(r.URL.Path, query, map[string]bool{"p1": true, "p2": true})
+
+		ctx := map[string]bool{"p1": true, "p2": true}
+		if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+			streamSSE(w, r, app, query, ctx)
+			return
+		}
+
+		resp := app.Handle(r.URL.Path, query, ctx)
 		w.Header().Set("content-type", "application/json")
 		w.WriteHeader(resp.Status)
 		_ = json.NewEncoder(w).Encode(resp.Body)
@@ -145,6 +153,27 @@ func main() {
 				return
 			}
 			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/_test/match-predicate":
+			var p struct {
+				Predicate map[string]interface{}   `json:"predicate"`
+				Rows      []map[string]interface{} `json:"rows"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			pred, err := electrolite.PredicateFromJSON(p.Predicate)
+			if err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			matched := []interface{}{}
+			for _, row := range p.Rows {
+				if electrolite.PredicateMatches(pred, row) {
+					matched = append(matched, row["id"])
+				}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"matched_ids": matched})
 		default:
 			http.NotFound(w, r)
 		}
@@ -156,4 +185,75 @@ func main() {
 	if err := http.ListenAndServe(addr, mux); err != nil && !strings.Contains(err.Error(), "use of closed") {
 		log.Fatalf("serve: %v", err)
 	}
+}
+
+func streamSSE(w http.ResponseWriter, r *http.Request, app *electrolite.Electrolite, query string, ctx map[string]bool) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", 500)
+		return
+	}
+	w.Header().Set("content-type", "text/event-stream")
+	w.Header().Set("cache-control", "no-cache")
+	w.Header().Set("connection", "keep-alive")
+	w.WriteHeader(200)
+
+	// Pull initial snapshot or replay.
+	resp := app.Handle(r.URL.Path, query, ctx)
+	if resp.Status != 200 {
+		writeSSE(w, "error", resp.Body)
+		flusher.Flush()
+		return
+	}
+	body, _ := resp.Body.(map[string]interface{})
+
+	kind := "replay"
+	values, _ := url.ParseQuery(query)
+	if v := values.Get("offset"); v == "" || v == "-1" {
+		kind = "snapshot"
+	}
+	writeSSE(w, kind, body)
+	flusher.Flush()
+
+	offset := body["offset"]
+	logID, _ := body["log_id"].(string)
+	shapeHandle, _ := body["shape_handle"].(string)
+
+	notify := r.Context().Done()
+	for {
+		select {
+		case <-notify:
+			return
+		default:
+		}
+		nextQuery := fmt.Sprintf(
+			"offset=%v&log_id=%s&shape_handle=%s&live=true",
+			offset, logID, shapeHandle,
+		)
+		resp := app.Handle(r.URL.Path, nextQuery, ctx)
+		if resp.Status != 200 {
+			writeSSE(w, "error", resp.Body)
+			flusher.Flush()
+			return
+		}
+		b, _ := resp.Body.(map[string]interface{})
+		msgs, _ := b["messages"].([]electrolite.Message)
+		if len(msgs) > 0 {
+			writeSSE(w, "replay", b)
+			flusher.Flush()
+			offset = b["offset"]
+		}
+		// Heartbeat to detect client disconnect.
+		if _, err := w.Write([]byte(": ping\n\n")); err != nil {
+			return
+		}
+		flusher.Flush()
+	}
+}
+
+func writeSSE(w http.ResponseWriter, event string, data interface{}) {
+	payload, _ := json.Marshal(data)
+	_, _ = w.Write([]byte("event: " + event + "\ndata: "))
+	_, _ = w.Write(payload)
+	_, _ = w.Write([]byte("\n\n"))
 }

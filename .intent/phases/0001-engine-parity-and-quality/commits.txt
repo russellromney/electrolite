@@ -8,7 +8,4 @@ f8149d6 cluster B  #7 #13 #18 #19  engine robustness
 ae1e074 cluster D2 D3 + E  #8 #9 #10 #11 #12 #15 #17 #20 #23  concurrency docs, shutdown, polish
 
 # remaining
-# D1 (#14)  SSE transport — deferred to a follow-up phase
-# C2 (#16)  predicate parity (SQL vs in-process matcher) — deferred
-# G5  monitor pid for dropped Plug workers in Elixir — deferred
-# E9  pre-warm Elixir compile cache in ensureBuilt — partial
+# (none — all 24 plan items + review gap items landed)

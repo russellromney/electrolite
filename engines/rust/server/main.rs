@@ -5,10 +5,13 @@
 //!   cargo run --manifest-path engines/rust/Cargo.toml \
 //!     --bin electrolite-server -- --port 5103 --db /tmp/x/app.db
 
-use electrolite::{eq, gt, AuthContext, BuildContext, Electrolite, Predicate, ShapeDef};
+use electrolite::{
+    eq, gt, predicate_from_json, predicate_matches_row, AuthContext, BuildContext, Electrolite,
+    Predicate, ShapeDef,
+};
 use serde_json::{json, Value as Json};
 use std::env;
-use std::io::Read;
+use std::io::Write;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -102,6 +105,17 @@ fn main() {
 
             if path.starts_with("/electrolite/") && request.method() == &Method::Get {
                 let context = json!({"projects": ["p1", "p2"]});
+                let accepts_sse = request
+                    .headers()
+                    .iter()
+                    .any(|h| {
+                        h.field.as_str().as_str().eq_ignore_ascii_case("accept")
+                            && h.value.as_str().contains("text/event-stream")
+                    });
+                if accepts_sse {
+                    stream_sse(request, app, path, query, context);
+                    return;
+                }
                 let (status, body) = app.handle(&path, &query, &context);
                 respond(request, status, &body);
                 return;
@@ -151,6 +165,26 @@ fn main() {
                         respond(request, 200, &json!({"ok": true}));
                         return;
                     }
+                    "/_test/match-predicate" => {
+                        let predicate = match predicate_from_json(&payload["predicate"]) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                respond(request, 400, &json!({"error": e}));
+                                return;
+                            }
+                        };
+                        let rows = payload["rows"].as_array().cloned().unwrap_or_default();
+                        let matched: Vec<&Json> = rows
+                            .iter()
+                            .filter(|row| predicate_matches_row(&predicate, row))
+                            .collect();
+                        let ids: Vec<Json> = matched
+                            .into_iter()
+                            .filter_map(|r| r.get("id").cloned())
+                            .collect();
+                        respond(request, 200, &json!({"matched_ids": ids}));
+                        return;
+                    }
                     _ => {}
                 }
             }
@@ -158,6 +192,107 @@ fn main() {
             respond(request, 404, &json!({"error": "not_found"}));
         });
     }
+}
+
+/// Stream SSE events to the client by taking control of the
+/// underlying TCP writer. tiny_http does not push streamed Read
+/// data eagerly enough for SSE (it buffers under 32 KiB), so the
+/// SSE branch writes the HTTP response by hand.
+fn stream_sse(
+    request: tiny_http::Request,
+    app: Arc<electrolite::Electrolite>,
+    path: String,
+    query: String,
+    context: Json,
+) {
+    let mut writer = request.into_writer();
+    if writer
+        .write_all(
+            b"HTTP/1.1 200 OK\r\n\
+              content-type: text/event-stream\r\n\
+              cache-control: no-cache\r\n\
+              access-control-allow-origin: *\r\n\
+              \r\n",
+        )
+        .is_err()
+    {
+        return;
+    }
+    let _ = writer.flush();
+
+    // Initial snapshot or replay.
+    let (status, body) = app.handle(&path, &query, &context);
+    if status != 200 {
+        let _ = writer.write_all(&sse_frame("error", &body));
+        let _ = writer.flush();
+        return;
+    }
+    let kind = if query
+        .split('&')
+        .any(|p| p.starts_with("offset=") && p != "offset=-1")
+    {
+        "replay"
+    } else {
+        "snapshot"
+    };
+    if writer.write_all(&sse_frame(kind, &body)).is_err() {
+        return;
+    }
+    let _ = writer.flush();
+
+    let mut offset = body.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+    let log_id = body
+        .get("log_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let shape_handle = body
+        .get("shape_handle")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    loop {
+        let q = format!(
+            "offset={}&log_id={}&shape_handle={}&live=true",
+            offset, log_id, shape_handle
+        );
+        let (status, body) = app.handle(&path, &q, &context);
+        if status != 200 {
+            let _ = writer.write_all(&sse_frame("error", &body));
+            let _ = writer.flush();
+            return;
+        }
+        let has_msg = body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        if has_msg {
+            if writer.write_all(&sse_frame("replay", &body)).is_err() {
+                return;
+            }
+            let _ = writer.flush();
+            offset = body.get("offset").and_then(|v| v.as_i64()).unwrap_or(offset);
+        }
+        // Heartbeat doubles as a disconnect probe.
+        if writer.write_all(b": ping\n\n").is_err() {
+            return;
+        }
+        if writer.flush().is_err() {
+            return;
+        }
+    }
+}
+
+fn sse_frame(event: &str, body: &Json) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"event: ");
+    out.extend_from_slice(event.as_bytes());
+    out.extend_from_slice(b"\ndata: ");
+    out.extend_from_slice(serde_json::to_string(body).unwrap().as_bytes());
+    out.extend_from_slice(b"\n\n");
+    out
 }
 
 fn json_to_sql(v: &Json) -> rusqlite::types::Value {

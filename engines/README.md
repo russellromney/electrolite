@@ -43,7 +43,8 @@ that file.
 
 | | Node | Python | Rust | Go | Elixir |
 |---|---|---|---|---|---|
-| Browser `ShapeClient` over HTTP | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Browser `ShapeClient` over HTTP (long-poll) | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Browser `ShapeClient` over HTTP (SSE) | ✓ | ✓ | ✓ | ✓ | ✓ |
 
 The matrix scenario covers snapshot, live insert/update/delete, write
 batches arriving as one logical group, and predicate filtering at the

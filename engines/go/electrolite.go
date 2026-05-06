@@ -1020,6 +1020,53 @@ func newMsg(kind string, r logRow, key, value map[string]interface{}) Message {
 	return Message{Type: kind, BatchID: r.BatchID, Key: key, Offset: r.Seq, Value: value}
 }
 
+// PredicateMatches evaluates a predicate against a row map. Used by
+// the conformance harness to compare in-process matching against SQL
+// `WHERE` results.
+func PredicateMatches(p Predicate, row map[string]interface{}) bool {
+	return predicateMatches(p, row)
+}
+
+// PredicateFromJSON parses a JSON-decoded predicate object (per the
+// wire format) into a Predicate variant.
+func PredicateFromJSON(raw map[string]interface{}) (Predicate, error) {
+	kind, _ := raw["type"].(string)
+	switch kind {
+	case "all", "":
+		return AllPredicate{}, nil
+	case "eq":
+		col, _ := raw["column"].(string)
+		return EqPredicate{Column: col, Value: raw["value"]}, nil
+	case "gt", "lt", "gte", "lte":
+		col, _ := raw["column"].(string)
+		return RangePredicate{Op: kind, Column: col, Value: raw["value"]}, nil
+	case "in":
+		col, _ := raw["column"].(string)
+		var values []interface{}
+		if vs, ok := raw["values"].([]interface{}); ok {
+			values = vs
+		}
+		return InPredicate{Column: col, Values: values}, nil
+	case "and":
+		var children []Predicate
+		if cs, ok := raw["predicates"].([]interface{}); ok {
+			for _, c := range cs {
+				cm, ok := c.(map[string]interface{})
+				if !ok {
+					return nil, fmt.Errorf("and child not an object")
+				}
+				child, err := PredicateFromJSON(cm)
+				if err != nil {
+					return nil, err
+				}
+				children = append(children, child)
+			}
+		}
+		return AndPredicate{Predicates: children}, nil
+	}
+	return nil, fmt.Errorf("unknown predicate type: %s", kind)
+}
+
 func predicateMatches(p Predicate, row map[string]interface{}) bool {
 	if row == nil {
 		return false

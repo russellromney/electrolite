@@ -54,9 +54,13 @@ engines all implement this contract.
 - A row that did not match but now does generates an `insert`.
 - A row that matched before and after with the same key generates an
   `update`.
-- Replay never returns a partial batch. If a page would split a
-  `batch_id` group, the engine extends the page to include the rest of
-  that batch.
+- Replay tries to never return a partial batch. If a page would
+  split a `batch_id` group, the engine extends the page to include
+  the rest of that batch — up to a safety cap of `10 ×
+  replay_limit` extra rows. Batches larger than the cap are split
+  across replays; the response sets `up_to_date: false` so the
+  client knows to fetch again immediately. Use a larger
+  `replay_limit` if your application produces known-large batches.
 - `value` is omitted on `delete`.
 
 ### Error responses
@@ -183,6 +187,39 @@ engine:
 
 Implementations may use a Condvar / channel / process mailbox / SQLite
 `update_hook` to drive the wake. The user-visible behavior must match.
+
+## Transports
+
+Two transports are supported. Both speak the same wire types above.
+
+### Long-poll (default)
+
+Client `GET`s the shape URL with `Accept: application/json`. Server
+responds when there is data or when `live_timeout_ms` elapses.
+
+### Server-Sent Events
+
+Client `GET`s the shape URL with `Accept: text/event-stream`. Server
+responds with `Content-Type: text/event-stream` and writes events:
+
+```text
+event: snapshot
+data: {snapshot body}
+
+event: replay
+data: {replay body}
+
+: ping
+
+event: replay
+data: {replay body}
+```
+
+The first event is `snapshot` if the request offset was -1, else
+`replay`. Subsequent `replay` events are pushed as new messages
+arrive. Lines starting with `:` are heartbeats that double as
+disconnect probes. The browser `ShapeClient` opts in via
+`new ShapeClient(url, { transport: "sse" })`.
 
 ## Compact
 

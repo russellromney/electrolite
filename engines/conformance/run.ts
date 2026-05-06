@@ -20,13 +20,15 @@ import {
 import type { Server } from "../../tests/lib/spawn.ts";
 
 interface Operation {
-  kind: "GET" | "exec" | "write_batch" | "seed" | "wait_ms";
+  kind: "GET" | "exec" | "write_batch" | "seed" | "wait_ms" | "match_predicate";
   path?: string;
   query?: string;
   sql?: string;
   args?: unknown[];
   statements?: [string, unknown[]][];
   ms?: number;
+  predicate?: any;
+  rows?: any[];
 }
 
 interface Case {
@@ -71,6 +73,14 @@ async function runOperation(server: Server, op: Operation, prev: any[]): Promise
       body: JSON.stringify({ sql: op.sql }),
     });
     return { ok: true };
+  }
+  if (op.kind === "match_predicate") {
+    const r = await fetch(`${server.url}/_test/match-predicate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ predicate: op.predicate, rows: op.rows }),
+    });
+    return { status: r.status, body: await r.json().catch(() => null) };
   }
   if (op.kind === "GET") {
     const path = expandTemplate(op.path!, prev);

@@ -127,6 +127,7 @@ defmodule Electrolite do
     state = %{
       conn: conn,
       subscribers: MapSet.new(),
+      monitors: %{},
       shapes: %{},
       prefix: Keyword.get(opts, :prefix, "/electrolite/v1"),
       replay_limit: Keyword.get(opts, :replay_limit, 1000),
@@ -211,8 +212,16 @@ defmodule Electrolite do
       {:wait, shape, offset, timeout_ms} ->
         # Pre-register the caller as a subscriber so a notify that
         # fires after this reply but before the caller's receive is
-        # still delivered.
-        new_state = %{state | subscribers: MapSet.put(state.subscribers, from_pid)}
+        # still delivered. Monitor the caller so a dropped Plug
+        # worker doesn't leak its subscription past the next notify.
+        ref = Process.monitor(from_pid)
+
+        new_state = %{
+          state
+          | subscribers: MapSet.put(state.subscribers, from_pid),
+            monitors: Map.put(state.monitors, from_pid, ref)
+        }
+
         {:reply, {:wait, shape, offset, timeout_ms}, new_state}
 
       reply ->
@@ -237,11 +246,33 @@ defmodule Electrolite do
 
   @impl true
   def handle_cast({:unsubscribe_change, pid}, state) do
-    {:noreply, %{state | subscribers: MapSet.delete(state.subscribers, pid)}}
+    case Map.get(state.monitors, pid) do
+      nil -> :ok
+      ref -> Process.demonitor(ref, [:flush])
+    end
+
+    {:noreply,
+     %{
+       state
+       | subscribers: MapSet.delete(state.subscribers, pid),
+         monitors: Map.delete(state.monitors, pid)
+     }}
   end
 
   def handle_cast(:wake_all_waiters, state) do
     {:noreply, notify(state)}
+  end
+
+  @impl true
+  def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
+    # Clean up subscription for a Plug worker (or any caller) that
+    # died before its receive completed.
+    {:noreply,
+     %{
+       state
+       | subscribers: MapSet.delete(state.subscribers, pid),
+         monitors: Map.delete(state.monitors, pid)
+     }}
   end
 
   defp notify(state) do
@@ -249,7 +280,8 @@ defmodule Electrolite do
       send(pid, {:electrolite_change, self()})
     end)
 
-    %{state | subscribers: MapSet.new()}
+    Enum.each(state.monitors, fn {_pid, ref} -> Process.demonitor(ref, [:flush]) end)
+    %{state | subscribers: MapSet.new(), monitors: %{}}
   end
 
   # ---- handle dispatch ----
@@ -701,6 +733,33 @@ defmodule Electrolite do
     base = %{type: kind, batch_id: row.batch_id, key: key, offset: row.seq}
     if value, do: Map.put(base, :value, value), else: base
   end
+
+  @doc """
+  Public predicate matcher. Used by the conformance harness to
+  compare in-process matching against SQL `WHERE` results.
+  """
+  def match?(predicate, row) when is_map(row), do: predicate_matches(predicate, row)
+  def match?(_, _), do: false
+
+  @doc """
+  Parse a JSON-decoded predicate (wire format, with string keys) into
+  the engine's internal predicate representation.
+  """
+  def predicate_from_json(%{"type" => "all"}), do: %{type: :all}
+
+  def predicate_from_json(%{"type" => "eq", "column" => c, "value" => v}),
+    do: %{type: :eq, column: c, value: v}
+
+  def predicate_from_json(%{"type" => op, "column" => c, "value" => v})
+      when op in ["gt", "lt", "gte", "lte"] do
+    %{type: String.to_atom(op), column: c, value: v}
+  end
+
+  def predicate_from_json(%{"type" => "in", "column" => c, "values" => vs}),
+    do: %{type: :in, column: c, values: vs}
+
+  def predicate_from_json(%{"type" => "and", "predicates" => ps}),
+    do: %{type: :and, predicates: Enum.map(ps, &predicate_from_json/1)}
 
   defp predicate_matches(_p, nil), do: false
   defp predicate_matches(%{type: :all}, _row), do: true
