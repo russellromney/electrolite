@@ -1,0 +1,19 @@
+{
+  "private": true,
+  "name": "electrolite-react",
+  "version": "0.0.1",
+  "type": "module",
+  "main": "./electrolite-react.ts",
+  "exports": {
+    ".": "./electrolite-react.ts"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "devDependencies": {
+    "react": "^18.3.1"
+  },
+  "scripts": {
+    "test": "node --no-warnings --experimental-strip-types --test electrolite-react.test.ts"
+  }
+}

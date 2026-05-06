@@ -12,3 +12,4 @@ engines/elixir/_build/
 engines/elixir/deps/
 engines/elixir/mix.lock
 engines/go/server/server-bin
+/clients/react/node_modules
