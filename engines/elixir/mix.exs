@@ -18,7 +18,9 @@ defmodule Electrolite.MixProject do
   defp deps do
     [
       {:exqlite, "~> 0.23"},
-      {:jason, "~> 1.4"}
+      {:jason, "~> 1.4"},
+      {:plug, "~> 1.16"},
+      {:plug_cowboy, "~> 2.7"}
     ]
   end
 end

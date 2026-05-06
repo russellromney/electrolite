@@ -11,3 +11,4 @@ packages/electrolite-node/native/*.node
 engines/elixir/_build/
 engines/elixir/deps/
 engines/elixir/mix.lock
+engines/go/server/server-bin

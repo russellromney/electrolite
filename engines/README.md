@@ -32,13 +32,27 @@ suite that exercises each case.
 | `install_triggers` requires primary key | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Composite primary keys exposed in `key` objects | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Live wait wakes when a write commits | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Browser `ShapeClient` end-to-end | ✓ | — | — | — | — |
+| Browser `ShapeClient` end-to-end (in-process) | ✓ | — | — | — | — |
 
-The browser-client end-to-end test is intrinsically a Node-side
-integration — the `ShapeClient` lives in `clients/browser/electrolite.js`
-and runs against the Node engine in the same process. Other engines
-serve the same protocol over HTTP, so the same browser client works
-against them; the integration is just easiest to drive from Node.
+## Client × engine matrix
+
+`tests/matrix.test.ts` spawns each engine as a real HTTP server and
+drives the same scenario against it from each client. New client
+language libraries are added by appending to the `CLIENTS` list in
+that file.
+
+| | Node | Python | Rust | Go | Elixir |
+|---|---|---|---|---|---|
+| Browser `ShapeClient` over HTTP | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+The matrix scenario covers snapshot, live insert/update/delete, write
+batches arriving as one logical group, and predicate filtering at the
+boundary (a row that doesn't match must not appear in the client's
+materialized state).
+
+```sh
+npm run test:matrix
+```
 
 ## Running the suites
 

@@ -7,12 +7,13 @@
     "demo:fanout": "node --no-warnings examples/live-fanout/demo.ts",
     "demo:web": "node --no-warnings examples/basic-web-app/server.ts",
     "test": "npm run test:browser && npm run test:node && npm run test:python",
-    "test:all": "npm run test && npm run test:rust && npm run test:go && npm run test:elixir",
+    "test:all": "npm run test && npm run test:rust && npm run test:go && npm run test:elixir && npm run test:matrix",
     "test:browser": "npm test --prefix clients/browser",
     "test:node": "npm test --prefix packages/electrolite-node",
     "test:python": "python3 -m unittest discover -s engines/python",
     "test:rust": "cargo test --manifest-path engines/rust/Cargo.toml --quiet",
     "test:go": "cd engines/go && go test ./...",
-    "test:elixir": "cd engines/elixir && mix deps.get >/dev/null && mix test"
+    "test:elixir": "cd engines/elixir && mix deps.get >/dev/null && mix test",
+    "test:matrix": "node --no-warnings --experimental-strip-types --test tests/matrix.test.ts"
   }
 }

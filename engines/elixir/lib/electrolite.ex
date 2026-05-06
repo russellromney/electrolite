@@ -67,15 +67,37 @@ defmodule Electrolite do
   @doc """
   Serve an Electrolite path. Returns `{status, body}` where status is
   an HTTP-style integer and body is a map suitable for JSON encoding.
+
+  Live waits are managed in the calling process so the GenServer stays
+  free to accept writes that would unblock the wait.
   """
-  def handle(pid, path, query \\ "", context \\ %{}),
-    do: GenServer.call(pid, {:handle, path, query, context}, :infinity)
+  def handle(pid, path, query \\ "", context \\ %{}) do
+    case GenServer.call(pid, {:handle_initial, path, query, context}, :infinity) do
+      {:reply, response} ->
+        response
+
+      {:wait, shape, offset, timeout_ms} ->
+        engine_pid = GenServer.whereis(pid) || pid
+        :ok = GenServer.call(pid, :subscribe_change, :infinity)
+
+        receive do
+          {:electrolite_change, ^engine_pid} -> :ok
+        after
+          timeout_ms ->
+            GenServer.cast(pid, {:unsubscribe_change, self()})
+            :timeout
+        end
+
+        GenServer.call(pid, {:replay_for_handle, shape, offset}, :infinity)
+    end
+  end
 
   def wait_for_change(pid, timeout \\ 20_000) do
+    engine_pid = GenServer.whereis(pid) || pid
     GenServer.call(pid, :subscribe_change, :infinity)
 
     receive do
-      {:electrolite_change, ^pid} -> :changed
+      {:electrolite_change, ^engine_pid} -> :changed
     after
       timeout ->
         GenServer.cast(pid, {:unsubscribe_change, self()})
@@ -172,19 +194,19 @@ defmodule Electrolite do
 
   def handle_call(:log_id, _from, state), do: {:reply, fetch_log_id(state.conn), state}
 
-  def handle_call({:handle, path, query, context}, from, state) do
-    case do_handle(state, path, query, context) do
-      {:wait_then_replay, shape, offset, deadline} ->
-        spawn_link(fn ->
-          wait_for_state_change(self(), deadline, state)
-          GenServer.cast(state_pid_or_self(from), {:resume_handle, from, shape, offset})
-        end)
+  def handle_call({:handle_initial, path, query, context}, _from, state) do
+    {:reply, do_handle_initial(state, path, query, context), state}
+  end
 
-        {:noreply, state}
+  def handle_call({:replay_for_handle, %Shape{} = shape, offset}, _from, state) do
+    response =
+      case do_replay(state.conn, shape, offset, state.replay_limit) do
+        {:ok, body} -> {200, replay_to_body(body)}
+        {:error, :resync_required} -> {409, %{"error" => "resync_required"}}
+        {:error, _} -> {500, %{"error" => "internal"}}
+      end
 
-      {:reply, response} ->
-        {:reply, response, state}
-    end
+    {:reply, response, state}
   end
 
   def handle_call(:subscribe_change, {pid, _ref}, state) do
@@ -194,31 +216,6 @@ defmodule Electrolite do
   @impl true
   def handle_cast({:unsubscribe_change, pid}, state) do
     {:noreply, %{state | subscribers: MapSet.delete(state.subscribers, pid)}}
-  end
-
-  def handle_cast({:resume_handle, from, shape, offset}, state) do
-    response =
-      case do_replay(state.conn, shape, offset, state.replay_limit) do
-        {:ok, body} -> {200, replay_to_body(body)}
-        {:error, :resync_required} -> {409, %{"error" => "resync_required"}}
-        {:error, _} -> {500, %{"error" => "internal"}}
-      end
-
-    GenServer.reply(from, response)
-    {:noreply, state}
-  end
-
-  # We resume on the same GenServer; pass the pid through.
-  defp state_pid_or_self(_from), do: self()
-
-  # ---- live wait ----
-
-  defp wait_for_state_change(_pid, deadline, state) do
-    timeout = max(0, System.system_time(:millisecond) - deadline)
-
-    if timeout >= 0 do
-      :timer.sleep(min(state.live_timeout_ms, max(50, deadline - System.system_time(:millisecond))))
-    end
   end
 
   defp notify(state) do
@@ -231,7 +228,7 @@ defmodule Electrolite do
 
   # ---- handle dispatch ----
 
-  defp do_handle(state, path, query, context) do
+  defp do_handle_initial(state, path, query, context) do
     with {:ok, route} <- parse_route(state.prefix, path, query),
          {:ok, def} <- Map.fetch(state.shapes, route.name) |> wrap_fetch(:not_found),
          {:ok, params} <- bind_params(def, route.params),
@@ -265,15 +262,9 @@ defmodule Electrolite do
             case do_replay(state.conn, shape, route.offset, state.replay_limit) do
               {:ok, body} ->
                 if route.live and body.messages == [] and body.up_to_date do
-                  # Synchronous wait + retry. Simpler than message-based plumbing
-                  # for the GenServer here; live tests don't span seconds.
-                  wait_inline(state)
-
-                  case do_replay(state.conn, shape, route.offset, state.replay_limit) do
-                    {:ok, b} -> {:reply, {200, replay_to_body(b)}}
-                    {:error, :resync_required} -> {:reply, {409, %{"error" => "resync_required"}}}
-                    {:error, _} -> {:reply, {500, %{"error" => "internal"}}}
-                  end
+                  # Tell the caller to wait; the GenServer must stay
+                  # free to receive writes that would unblock the wait.
+                  {:wait, shape, route.offset, state.live_timeout_ms}
                 else
                   {:reply, {200, replay_to_body(body)}}
                 end
@@ -293,33 +284,6 @@ defmodule Electrolite do
       :not_found -> {:reply, {404, %{"error" => "shape_not_found"}}}
       {:error, :not_found} -> {:reply, {404, %{"error" => "shape_not_found"}}}
       {:error, _} -> {:reply, {500, %{"error" => "internal"}}}
-    end
-  end
-
-  defp wait_inline(state) do
-    # Block this GenServer briefly. Because the GenServer is the writer,
-    # this is just a polling loop that returns as soon as a write commits
-    # (writes go through GenServer.call too, so the wait must spin —
-    # poll high_water_mark until it changes or timeout elapses).
-    deadline = System.monotonic_time(:millisecond) + state.live_timeout_ms
-    {:ok, base} = high_water(state.conn)
-    poll_until_changed(state, base, deadline)
-  end
-
-  defp poll_until_changed(state, base, deadline) do
-    if System.monotonic_time(:millisecond) >= deadline do
-      :timeout
-    else
-      {:ok, n} = high_water(state.conn)
-
-      if n != base do
-        :ok
-      else
-        receive do
-        after
-          25 -> poll_until_changed(state, base, deadline)
-        end
-      end
     end
   end
 
@@ -717,7 +681,7 @@ defmodule Electrolite do
   defp compile_predicate(%{type: :eq, column: c, value: nil}), do: {"#{quote_ident(c)} IS NULL", []}
   defp compile_predicate(%{type: :eq, column: c, value: v}), do: {"#{quote_ident(c)} = ?", [v]}
 
-  defp compile_predicate(%{type: op, column: c, value: nil}) when op in [:gt, :lt, :gte, :lte],
+  defp compile_predicate(%{type: op, column: _c, value: nil}) when op in [:gt, :lt, :gte, :lte],
     do: {"0", []}
 
   defp compile_predicate(%{type: op, column: c, value: v}) when op in [:gt, :lt, :gte, :lte] do
