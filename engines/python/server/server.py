@@ -24,6 +24,7 @@ ENGINE_DIR = os.path.dirname(HERE)
 sys.path.insert(0, ENGINE_DIR)
 
 from electrolite import (  # noqa: E402
+    all as all_pred,
     and_,
     create_electrolite,
     eq,
@@ -66,6 +67,24 @@ def build_app(db_path: str):
                 columns=["id", "project_id", "title", "done"],
                 where=lambda ctx: gt("id", None),
             ),
+            # Composite-PK proof: snapshot key_columns and message
+            # `key` objects must include both PK columns identically.
+            "memberships": shape(
+                table="memberships",
+                columns=["org", "user", "role"],
+            ),
+            # IN-predicate parity through SQL.
+            "multiProject": shape(
+                table="todos",
+                columns=["id", "project_id", "title", "done"],
+                where=lambda ctx: in_list("project_id", ["p1", "p2"]),
+            ),
+            # AND-predicate parity through SQL.
+            "p1HighIds": shape(
+                table="todos",
+                columns=["id", "project_id", "title", "done"],
+                where=lambda ctx: and_(eq("project_id", "p1"), gt("id", 1)),
+            ),
         },
     )
     app.execute_batch(
@@ -80,10 +99,17 @@ def build_app(db_path: str):
           id INTEGER PRIMARY KEY,
           enabled BOOLEAN NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS memberships (
+          org TEXT NOT NULL,
+          "user" TEXT NOT NULL,
+          role TEXT NOT NULL,
+          PRIMARY KEY (org, "user")
+        );
         """
     )
     app.install_triggers("todos")
     app.install_triggers("feature_flags")
+    app.install_triggers("memberships")
     return app
 
 

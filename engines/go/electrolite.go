@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -124,6 +125,7 @@ type Electrolite struct {
 	db          *sql.DB
 	mu          sync.Mutex
 	cond        *sync.Cond
+	stopped     atomic.Bool
 	shapes      map[string]ShapeDef
 	prefix      string
 	replayLimit int64
@@ -205,12 +207,19 @@ func Open(path string) (*Electrolite, error) {
 // Close releases the SQLite connection.
 func (e *Electrolite) Close() error { return e.db.Close() }
 
-// Shutdown wakes any live waiters then closes the SQLite connection.
-// Live waiters return whatever replay state they currently have;
-// callers re-snapshot on reconnect.
-func (e *Electrolite) Shutdown() error {
+// Shutdown marks the engine stopped and wakes every live waiter.
+// In-flight live waits return a clean
+// `200 {messages: [], up_to_date: true, shutdown: true}` response
+// instead of touching the closed database. Call Close() when ready
+// to release the SQLite connection.
+func (e *Electrolite) Shutdown() {
+	e.stopped.Store(true)
 	e.notify()
-	return e.db.Close()
+}
+
+// IsStopped reports whether Shutdown has been called.
+func (e *Electrolite) IsStopped() bool {
+	return e.stopped.Load()
 }
 
 // AddShape registers a named shape.
@@ -647,6 +656,17 @@ func (e *Electrolite) Handle(path, query string, context interface{}) HandleResp
 	}
 	if route.Live && len(body.Messages) == 0 && body.UpToDate {
 		e.waitUntil(time.Now().Add(e.LiveTimeout))
+		if e.stopped.Load() {
+			return HandleResponse{Status: 200, Body: map[string]interface{}{
+				"type":         "replay",
+				"log_id":       currentLogID,
+				"shape_handle": currentHandle,
+				"messages":     []Message{},
+				"offset":       route.Offset,
+				"up_to_date":   true,
+				"shutdown":     true,
+			}}
+		}
 		body, err = e.Replay(shape, route.Offset, e.replayLimit)
 		if err != nil {
 			if _, ok := err.(errResync); ok {

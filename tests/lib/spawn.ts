@@ -10,9 +10,11 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  and,
   createElectrolite,
   eq,
   gt,
+  inList,
   shape,
 } from "../../packages/electrolite-node/electrolite-node.ts";
 import { predicateMatchesRow } from "../../packages/electrolite-node/electrolite-node-engine.ts";
@@ -75,6 +77,23 @@ async function startNode(port: number, dbPath: string): Promise<Server> {
         columns: ["id", "project_id", "title", "done"],
         where: () => ({ type: "gt", column: "id", value: null }),
       }),
+      // Composite-PK proof.
+      memberships: shape({
+        table: "memberships",
+        columns: ["org", "user", "role"],
+      }),
+      // IN-predicate parity through SQL.
+      multiProject: shape({
+        table: "todos",
+        columns: ["id", "project_id", "title", "done"],
+        where: () => inList("project_id", ["p1", "p2"]),
+      }),
+      // AND-predicate parity through SQL.
+      p1HighIds: shape({
+        table: "todos",
+        columns: ["id", "project_id", "title", "done"],
+        where: () => and([eq("project_id", "p1"), gt("id", 1)]),
+      }),
     },
   });
   electrolite.executeBatch(`
@@ -88,9 +107,16 @@ async function startNode(port: number, dbPath: string): Promise<Server> {
       id INTEGER PRIMARY KEY,
       enabled BOOLEAN NOT NULL DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS memberships (
+      org TEXT NOT NULL,
+      "user" TEXT NOT NULL,
+      role TEXT NOT NULL,
+      PRIMARY KEY (org, "user")
+    );
   `);
   electrolite.installTriggers("todos");
   electrolite.installTriggers("feature_flags");
+  electrolite.installTriggers("memberships");
 
   const httpServer = createServer(async (req, res) => {
     if (req.url?.startsWith("/electrolite/")) {

@@ -603,10 +603,14 @@ function normalizePredicate(info, predicate) {
         )))].map(JSON.parse).sort(compareJson),
       };
     case "and":
+      // Sort children by canonical (sorted-keys) JSON, not raw
+      // JSON.stringify, so that insertion order in predicate
+      // objects can't change child order. Other engines do the
+      // same; without this, Node's `and` shape_handle diverges.
       return {
         type: "and",
         predicates: predicate.predicates.map((child) => normalizePredicate(info, child))
-          .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+          .sort((a, b) => canonicalJson(a).localeCompare(canonicalJson(b))),
       };
     default:
       throw new Error(`unsupported predicate type ${predicate?.type}`);

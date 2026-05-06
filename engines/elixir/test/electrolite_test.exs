@@ -323,6 +323,129 @@ defmodule ElectroliteTest do
     assert m["key"] == %{"org" => "o1", "user" => "u1"}
   end
 
+  test "stale current_batch_id cleared on bootstrap" do
+    dir = System.tmp_dir!() |> Path.join("electrolite-stale-#{:rand.uniform(10_000_000)}")
+    File.mkdir_p!(dir)
+    db_path = Path.join(dir, "app.db")
+    {:ok, pid} = Electrolite.start_link(db_path: db_path)
+
+    on_exit(fn ->
+      try do
+        Process.exit(pid, :normal)
+      catch
+        :exit, _ -> :ok
+      end
+
+      File.rm_rf!(dir)
+    end)
+
+    :ok =
+      Electrolite.execute_batch(
+        pid,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);"
+      )
+
+    :ok = Electrolite.install_triggers(pid, "t")
+
+    # Plant a stale batch_id in the meta table.
+    :ok =
+      Electrolite.execute(
+        pid,
+        "INSERT INTO _electrolite_meta (key, value) VALUES ('current_batch_id', 'STALE') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        []
+      )
+
+    # Stop the engine and reopen it; bootstrap on the fresh GenServer
+    # must clear the stale batch_id.
+    Process.exit(pid, :normal)
+    :timer.sleep(20)
+    {:ok, pid2} = Electrolite.start_link(db_path: db_path)
+    on_exit(fn ->
+      try do
+        Process.exit(pid2, :normal)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+
+    :ok = Electrolite.execute(pid2, "INSERT INTO t (id, v) VALUES (?, ?)", [1, "hello"])
+
+    {:ok, r} =
+      Electrolite.replay(
+        pid2,
+        Electrolite.shape(table: "t", columns: ["id", "v"], predicate: Electrolite.all_pred()),
+        0,
+        100
+      )
+
+    [m] = r.messages
+    refute m.batch_id == "STALE"
+    assert byte_size(m.batch_id) == 32
+  end
+
+  test "replay batch cap signals more_to_come" do
+    {pid, _} = setup_app()
+    :ok = Electrolite.execute_batch(pid, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);")
+    :ok = Electrolite.install_triggers(pid, "t")
+
+    statements =
+      for i <- 1..25 do
+        {"INSERT INTO t (id, v) VALUES (?, ?)", [i, "row"]}
+      end
+
+    :ok = Electrolite.write_batch(pid, statements)
+
+    shape =
+      Electrolite.shape(
+        table: "t",
+        columns: ["id", "v"],
+        predicate: Electrolite.all_pred()
+      )
+
+    {:ok, r} = Electrolite.replay(pid, shape, 0, 1)
+    # limit=1, extension cap = 10 → first page has 11 messages.
+    assert length(r.messages) == 11
+    refute r.up_to_date
+  end
+
+  test "shutdown wakes live waiters with a clean response" do
+    {pid, _} = setup_app(live_timeout_ms: 10_000)
+    :ok = Electrolite.execute_batch(pid, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);")
+    :ok = Electrolite.install_triggers(pid, "t")
+
+    :ok =
+      Electrolite.add_shape(
+        pid,
+        "all",
+        Electrolite.shape_def(table: "t", columns: ["id", "v"])
+      )
+
+    {200, snap} = Electrolite.handle(pid, "/electrolite/v1/all", "offset=-1", %{})
+    parent = self()
+
+    spawn_link(fn ->
+      result =
+        Electrolite.handle(
+          pid,
+          "/electrolite/v1/all",
+          "offset=#{snap["offset"]}&live=true&log_id=#{snap["log_id"]}&shape_handle=#{snap["shape_handle"]}",
+          %{}
+        )
+
+      send(parent, {:done, result})
+    end)
+
+    Process.sleep(50)
+    started = System.monotonic_time(:millisecond)
+    Electrolite.shutdown(pid)
+
+    assert_receive {:done, {200, body}}, 2_000
+    elapsed = System.monotonic_time(:millisecond) - started
+    assert elapsed < 1_000, "shutdown took #{elapsed}ms"
+    assert body["shutdown"] == true
+    assert body["messages"] == []
+  end
+
   test "live wait does not lose its wake to a TOCTOU race" do
     # 50 iterations of: snapshot → live wait → write. If the wake
     # registration happens after the write notify, the live request

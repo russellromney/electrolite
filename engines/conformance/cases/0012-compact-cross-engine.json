@@ -1,0 +1,22 @@
+{
+  "name": "after compact past offset, replay returns 409 resync_required everywhere",
+  "setup": "INSERT INTO todos (id, project_id, title, done) VALUES (1, 'p1', 'first', 0);",
+  "operations": [
+    { "kind": "GET", "path": "/electrolite/v1/projectTodos/p1", "query": "offset=-1" },
+    { "kind": "exec", "sql": "INSERT INTO todos (id, project_id, title, done) VALUES (?, ?, ?, 0)", "args": [2, "p1", "second"] },
+    {
+      "kind": "exec",
+      "sql": "DELETE FROM _electrolite_log WHERE table_name = 'todos' AND seq <= 9999"
+    },
+    {
+      "kind": "exec",
+      "sql": "INSERT INTO _electrolite_meta (key, value) VALUES ('retained_offset:todos', '9999') ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+    },
+    {
+      "kind": "GET",
+      "path": "/electrolite/v1/projectTodos/p1",
+      "query": "offset={prev[0].body.offset}&log_id={prev[0].body.log_id}&shape_handle={prev[0].body.shape_handle}"
+    }
+  ],
+  "cross_engine": ["4.status", "4.body.error"]
+}

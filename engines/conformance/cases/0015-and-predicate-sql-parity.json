@@ -1,0 +1,12 @@
+{
+  "name": "AND predicate compiled to SQL produces same handle and rows across engines",
+  "setup": "INSERT INTO todos (id, project_id, title, done) VALUES (1, 'p1', 'a', 0), (2, 'p1', 'b', 0), (3, 'p2', 'c', 0);",
+  "operations": [
+    { "kind": "GET", "path": "/electrolite/v1/p1HighIds", "query": "offset=-1" }
+  ],
+  "cross_engine": [
+    "0.status",
+    "0.body.shape_handle",
+    "0.body.rows"
+  ]
+}

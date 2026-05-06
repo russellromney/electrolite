@@ -1,0 +1,24 @@
+{
+  "name": "composite primary keys: snapshot keys + replay message keys identical across engines",
+  "setup": "INSERT INTO memberships (org, \"user\", role) VALUES ('o1', 'u1', 'admin');",
+  "operations": [
+    { "kind": "GET", "path": "/electrolite/v1/memberships", "query": "offset=-1" },
+    {
+      "kind": "exec",
+      "sql": "DELETE FROM memberships WHERE org = ? AND \"user\" = ?",
+      "args": ["o1", "u1"]
+    },
+    {
+      "kind": "GET",
+      "path": "/electrolite/v1/memberships",
+      "query": "offset={prev[0].body.offset}&log_id={prev[0].body.log_id}&shape_handle={prev[0].body.shape_handle}"
+    }
+  ],
+  "cross_engine": [
+    "0.body.shape_handle",
+    "0.body.key_columns",
+    "0.body.rows",
+    "2.status",
+    "2.body.shape_handle"
+  ]
+}

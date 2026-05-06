@@ -1,0 +1,17 @@
+{
+  "name": "SSE first event has identical event tag and body across engines",
+  "operations": [
+    {
+      "kind": "sse_first",
+      "path": "/electrolite/v1/projectTodos/p1",
+      "query": "offset=-1"
+    }
+  ],
+  "cross_engine": [
+    "0.status",
+    "0.body.event",
+    "0.body.body.type",
+    "0.body.body.shape_handle",
+    "0.body.body.key_columns"
+  ]
+}

@@ -38,10 +38,17 @@ pid = Electrolite.TestServer.engine_name()
     id INTEGER PRIMARY KEY,
     enabled BOOLEAN NOT NULL DEFAULT 0
   );
+  CREATE TABLE IF NOT EXISTS memberships (
+    org TEXT NOT NULL,
+    "user" TEXT NOT NULL,
+    role TEXT NOT NULL,
+    PRIMARY KEY (org, "user")
+  );
   """)
 
 :ok = Electrolite.install_triggers(pid, "todos")
 :ok = Electrolite.install_triggers(pid, "feature_flags")
+:ok = Electrolite.install_triggers(pid, "memberships")
 
 :ok =
   Electrolite.add_shape(
@@ -94,6 +101,46 @@ pid = Electrolite.TestServer.engine_name()
       table: "todos",
       columns: ["id", "project_id", "title", "done"],
       where: fn _ -> Electrolite.gt("id", nil) end
+    )
+  )
+
+# Composite-PK proof.
+:ok =
+  Electrolite.add_shape(
+    pid,
+    "memberships",
+    Electrolite.shape_def(
+      table: "memberships",
+      columns: ["org", "user", "role"]
+    )
+  )
+
+# IN-predicate parity through SQL.
+:ok =
+  Electrolite.add_shape(
+    pid,
+    "multiProject",
+    Electrolite.shape_def(
+      table: "todos",
+      columns: ["id", "project_id", "title", "done"],
+      where: fn _ -> Electrolite.in_list("project_id", ["p1", "p2"]) end
+    )
+  )
+
+# AND-predicate parity through SQL.
+:ok =
+  Electrolite.add_shape(
+    pid,
+    "p1HighIds",
+    Electrolite.shape_def(
+      table: "todos",
+      columns: ["id", "project_id", "title", "done"],
+      where: fn _ ->
+        Electrolite.and_pred([
+          Electrolite.eq("project_id", "p1"),
+          Electrolite.gt("id", 1)
+        ])
+      end
     )
   )
 

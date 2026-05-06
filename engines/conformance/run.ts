@@ -20,7 +20,7 @@ import {
 import type { Server } from "../../tests/lib/spawn.ts";
 
 interface Operation {
-  kind: "GET" | "exec" | "write_batch" | "seed" | "wait_ms" | "match_predicate";
+  kind: "GET" | "exec" | "write_batch" | "seed" | "wait_ms" | "match_predicate" | "sse_first";
   path?: string;
   query?: string;
   sql?: string;
@@ -89,6 +89,58 @@ async function runOperation(server: Server, op: Operation, prev: any[]): Promise
     const r = await fetch(url);
     const body = await r.json().catch(() => null);
     return { status: r.status, body };
+  }
+  if (op.kind === "sse_first") {
+    // Open an SSE stream, read until the first `\n\n`, parse the
+    // event + data lines, return them. Cancel the stream after.
+    const path = expandTemplate(op.path!, prev);
+    const query = op.query ? expandTemplate(op.query, prev) : "";
+    const url = `${server.url}${path}${query ? "?" + query : ""}`;
+    const controller = new AbortController();
+    const r = await fetch(url, {
+      signal: controller.signal,
+      headers: { Accept: "text/event-stream" },
+    });
+    if (!r.body) {
+      controller.abort();
+      return { status: r.status, body: null };
+    }
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let event = "";
+    let data = "";
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const idx = buffer.indexOf("\n\n");
+        if (idx !== -1) {
+          const frame = buffer.slice(0, idx);
+          for (const line of frame.split("\n")) {
+            if (line.startsWith("event:")) event = line.slice(6).trim();
+            else if (line.startsWith("data:")) data += line.slice(5).trim();
+          }
+          break;
+        }
+      }
+    } finally {
+      try {
+        await reader.cancel();
+      } catch {}
+      try {
+        controller.abort();
+      } catch {}
+    }
+    let parsed: any = null;
+    try {
+      parsed = data ? JSON.parse(data) : null;
+    } catch {}
+    return {
+      status: r.status,
+      body: { event, body: parsed },
+    };
   }
   throw new Error(`unknown op kind: ${(op as any).kind}`);
 }

@@ -103,6 +103,7 @@ export class Electrolite<TContext = unknown> {
   pollIntervalMs: number;
   activeShapes: Map<string, BuiltShape["shape"]>;
   waiters: Map<string, Set<Waiter>>;
+  stopped: boolean;
 
   constructor(options: ElectroliteOptions<TContext>) {
     const {
@@ -125,6 +126,7 @@ export class Electrolite<TContext = unknown> {
     this.pollIntervalMs = pollIntervalMs;
     this.activeShapes = new Map();
     this.waiters = new Map();
+    this.stopped = false;
   }
 
   installTriggers(table: string): InstallResult {
@@ -170,8 +172,12 @@ export class Electrolite<TContext = unknown> {
   }
 
   shutdown(): void {
-    // Wake any live waiters; they return whatever replay state they
-    // have (typically empty; clients re-snapshot on reconnect).
+    // Mark the engine as stopped and wake every live waiter. In-flight
+    // live waits return a clean
+    // `200 {messages: [], up_to_date: true, shutdown: true}` instead
+    // of touching the closed engine. Subsequent live requests also
+    // short-circuit.
+    this.stopped = true;
     this.notifyChanged();
     if (typeof (this.engine as any).close === "function") {
       (this.engine as any).close();
@@ -339,6 +345,17 @@ export class Electrolite<TContext = unknown> {
     try {
       const deadline = Date.now() + this.liveTimeoutMs;
       while (Date.now() <= deadline) {
+        if (this.stopped) {
+          return jsonResponse({
+            type: "replay",
+            log_id: "",
+            shape_handle: shapeHandle,
+            messages: [],
+            offset,
+            up_to_date: true,
+            shutdown: true,
+          });
+        }
         let replay;
         try {
           replay = JSON.parse(

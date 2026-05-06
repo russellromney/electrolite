@@ -1,0 +1,22 @@
+{
+  "name": "primary-key update produces delete+insert messages with identical bytes across engines",
+  "setup": "INSERT INTO todos (id, project_id, title, done) VALUES (1, 'p1', 'first', 0);",
+  "operations": [
+    { "kind": "GET", "path": "/electrolite/v1/projectTodos/p1", "query": "offset=-1" },
+    {
+      "kind": "exec",
+      "sql": "UPDATE todos SET id = ? WHERE id = ?",
+      "args": [42, 1]
+    },
+    {
+      "kind": "GET",
+      "path": "/electrolite/v1/projectTodos/p1",
+      "query": "offset={prev[0].body.offset}&log_id={prev[0].body.log_id}&shape_handle={prev[0].body.shape_handle}"
+    }
+  ],
+  "cross_engine": [
+    "0.body.shape_handle",
+    "2.status",
+    "2.body.up_to_date"
+  ]
+}

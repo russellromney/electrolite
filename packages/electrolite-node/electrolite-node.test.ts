@@ -798,6 +798,132 @@ test("range predicates filter snapshot and replay", async () => {
   }
 });
 
+test("stale current_batch_id cleared on bootstrap", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "electrolite-node-stale-"));
+  const dbPath = join(dir, "app.db");
+  try {
+    const first = createElectrolite({ dbPath });
+    first.executeBatch(
+      "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);",
+    );
+    first.installTriggers("t");
+    // Plant a stale batch_id in meta and let `first` go out of scope
+    // without clearing it. The next createElectrolite must reset.
+    first.execute(
+      `INSERT INTO _electrolite_meta (key, value) VALUES ('current_batch_id', 'STALE')
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    );
+
+    const second = createElectrolite({ dbPath });
+    second.execute("INSERT INTO t (id, v) VALUES (?1, ?2)", [1, "hello"]);
+
+    const replay = JSON.parse(
+      second.engine.replay(
+        JSON.stringify({
+          table: "t",
+          columns: ["id", "v"],
+          predicate: { type: "all" },
+          auth_scope: "",
+          schema_version: 1,
+        }),
+        0,
+        100,
+      ),
+    );
+    assert.equal(replay.messages.length, 1);
+    assert.notEqual(replay.messages[0].batch_id, "STALE");
+    assert.match(replay.messages[0].batch_id, /^[a-f0-9]{32}$/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("replay batch cap signals more_to_come", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "electrolite-node-cap-"));
+  const dbPath = join(dir, "app.db");
+  try {
+    const electrolite = createElectrolite({ dbPath });
+    electrolite.executeBatch(
+      "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);",
+    );
+    electrolite.installTriggers("t");
+    const stmts = [];
+    for (let i = 1; i <= 25; i++) {
+      stmts.push([
+        "INSERT INTO t (id, v) VALUES (?1, ?2)",
+        [i, "row"],
+      ]);
+    }
+    electrolite.writeBatch(stmts);
+
+    const replay = JSON.parse(
+      electrolite.engine.replay(
+        JSON.stringify({
+          table: "t",
+          columns: ["id", "v"],
+          predicate: { type: "all" },
+          auth_scope: "",
+          schema_version: 1,
+        }),
+        0,
+        1,
+      ),
+    );
+    // limit=1, extension cap = 10 → first page has 11 rows.
+    assert.equal(replay.messages.length, 11);
+    assert.equal(replay.up_to_date, false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("shutdown wakes live waiters with a clean response", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "electrolite-node-shutdown-"));
+  const dbPath = join(dir, "app.db");
+  try {
+    const electrolite = createElectrolite({
+      dbPath,
+      liveTimeoutMs: 10_000,
+      pollIntervalMs: 10,
+      shapes: {
+        all: shape({
+          table: "t",
+          columns: ["id", "v"],
+        }),
+      },
+    });
+    electrolite.executeBatch(
+      "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);",
+    );
+    electrolite.installTriggers("t");
+
+    const snap = await (
+      await electrolite.handle(
+        new Request("https://app.test/electrolite/v1/all?offset=-1"),
+        {},
+      )
+    ).json();
+    const liveUrl =
+      `https://app.test/electrolite/v1/all?offset=${snap.offset}` +
+      `&live=true&log_id=${snap.log_id}&shape_handle=${snap.shape_handle}`;
+    const livePromise = electrolite.handle(new Request(liveUrl), {});
+
+    await sleep(50);
+    const started = Date.now();
+    electrolite.shutdown();
+    const live = await livePromise;
+    const elapsed = Date.now() - started;
+    const body = await live.json();
+
+    assert.equal(live.status, 200);
+    assert.equal(body.shutdown, true);
+    assert.deepEqual(body.messages, []);
+    assert.ok(elapsed < 1_000, `shutdown took ${elapsed}ms`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 function setup(options = {}) {
   const dir = mkdtempSync(join(tmpdir(), "electrolite-node-"));
   const dbPath = join(dir, "app.db");

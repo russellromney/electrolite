@@ -50,6 +50,12 @@ func main() {
 		  id INTEGER PRIMARY KEY,
 		  enabled BOOLEAN NOT NULL DEFAULT 0
 		);
+		CREATE TABLE IF NOT EXISTS memberships (
+		  org TEXT NOT NULL,
+		  "user" TEXT NOT NULL,
+		  role TEXT NOT NULL,
+		  PRIMARY KEY (org, "user")
+		);
 	`); err != nil {
 		log.Fatalf("create: %v", err)
 	}
@@ -57,6 +63,9 @@ func main() {
 		log.Fatalf("triggers: %v", err)
 	}
 	if err := app.InstallTriggers("feature_flags"); err != nil {
+		log.Fatalf("triggers: %v", err)
+	}
+	if err := app.InstallTriggers("memberships"); err != nil {
 		log.Fatalf("triggers: %v", err)
 	}
 
@@ -89,6 +98,27 @@ func main() {
 		Table:   "todos",
 		Columns: []string{"id", "project_id", "title", "done"},
 		Where:   func(electrolite.BuildContext) electrolite.Predicate { return electrolite.Gt("id", nil) },
+	})
+	// Composite-PK proof.
+	app.AddShape("memberships", electrolite.ShapeDef{
+		Table:   "memberships",
+		Columns: []string{"org", "user", "role"},
+	})
+	// IN-predicate parity through SQL.
+	app.AddShape("multiProject", electrolite.ShapeDef{
+		Table:   "todos",
+		Columns: []string{"id", "project_id", "title", "done"},
+		Where: func(electrolite.BuildContext) electrolite.Predicate {
+			return electrolite.In("project_id", "p1", "p2")
+		},
+	})
+	// AND-predicate parity through SQL.
+	app.AddShape("p1HighIds", electrolite.ShapeDef{
+		Table:   "todos",
+		Columns: []string{"id", "project_id", "title", "done"},
+		Where: func(electrolite.BuildContext) electrolite.Predicate {
+			return electrolite.And(electrolite.Eq("project_id", "p1"), electrolite.Gt("id", 1))
+		},
 	})
 
 	mux := http.NewServeMux()

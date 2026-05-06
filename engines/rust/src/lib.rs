@@ -7,6 +7,7 @@
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use serde_json::{json, Map, Value as Json};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -165,6 +166,7 @@ impl ShapeDef {
 pub struct Electrolite {
     db: Mutex<Connection>,
     wake: Arc<(Mutex<u64>, Condvar)>,
+    stopped: Arc<AtomicBool>,
     shapes: HashMap<String, ShapeDef>,
     prefix: String,
     replay_limit: i64,
@@ -229,6 +231,7 @@ impl Electrolite {
         let me = Self {
             db: Mutex::new(db),
             wake,
+            stopped: Arc::new(AtomicBool::new(false)),
             shapes: HashMap::new(),
             prefix: "/electrolite/v1".to_string(),
             replay_limit: 1000,
@@ -512,16 +515,21 @@ impl Electrolite {
         })
     }
 
-    /// Wake any live waiters, then drop the SQLite connection. Live
-    /// waiters return with whatever replay state they currently have
-    /// (typically empty; clients re-snapshot on reconnect).
-    pub fn shutdown(self) {
+    /// Mark the engine as stopped and wake every live waiter. Subsequent
+    /// `handle()` calls that were blocked in a live wait return a clean
+    /// `200 {messages: [], up_to_date: true, shutdown: true}` response.
+    /// New requests after shutdown also short-circuit. Drop the engine
+    /// when you're done; the connection closes via `Drop`.
+    pub fn shutdown(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
         let (lock, cv) = &*self.wake;
         let mut g = lock.lock().unwrap();
         *g = g.wrapping_add(1);
         cv.notify_all();
-        drop(g);
-        // Connection is dropped when self goes out of scope.
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
     }
 
     /// Block until the log changes or live_timeout elapses.
@@ -628,6 +636,20 @@ impl Electrolite {
         if route.live && body.messages.is_empty() && body.up_to_date {
             let deadline = Instant::now() + self.live_timeout;
             self.wait_for_change_until(deadline);
+            if self.stopped.load(Ordering::SeqCst) {
+                return (
+                    200,
+                    json!({
+                        "type": "replay",
+                        "log_id": current_log_id,
+                        "shape_handle": current_handle,
+                        "messages": [],
+                        "offset": route.offset,
+                        "up_to_date": true,
+                        "shutdown": true,
+                    }),
+                );
+            }
             let body = match self.replay(&shape, route.offset, self.replay_limit) {
                 Ok(b) => b,
                 Err(Error::ResyncRequired) => return (409, json!({"error": "resync_required"})),

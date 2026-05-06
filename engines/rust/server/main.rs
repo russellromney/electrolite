@@ -6,8 +6,8 @@
 //!     --bin electrolite-server -- --port 5103 --db /tmp/x/app.db
 
 use electrolite::{
-    eq, gt, predicate_from_json, predicate_matches_row, AuthContext, BuildContext, Electrolite,
-    Predicate, ShapeDef,
+    and, eq, gt, in_list, predicate_from_json, predicate_matches_row, AuthContext, BuildContext,
+    Electrolite, Predicate, ShapeDef,
 };
 use serde_json::{json, Value as Json};
 use std::env;
@@ -54,11 +54,18 @@ fn main() {
           id INTEGER PRIMARY KEY,
           enabled BOOLEAN NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS memberships (
+          org TEXT NOT NULL,
+          "user" TEXT NOT NULL,
+          role TEXT NOT NULL,
+          PRIMARY KEY (org, "user")
+        );
         "#,
     )
     .unwrap();
     app.install_triggers("todos").unwrap();
     app.install_triggers("feature_flags").unwrap();
+    app.install_triggers("memberships").unwrap();
     app.add_shape(
         "projectTodos",
         ShapeDef::new(
@@ -116,6 +123,42 @@ fn main() {
             ],
         )
         .where_fn(|_| gt("id", json!(null))),
+    );
+    // Composite-PK proof.
+    app.add_shape(
+        "memberships",
+        ShapeDef::new(
+            "memberships",
+            vec!["org".into(), "user".into(), "role".into()],
+        ),
+    );
+    // IN-predicate parity through SQL.
+    app.add_shape(
+        "multiProject",
+        ShapeDef::new(
+            "todos",
+            vec![
+                "id".into(),
+                "project_id".into(),
+                "title".into(),
+                "done".into(),
+            ],
+        )
+        .where_fn(|_| in_list("project_id", vec![json!("p1"), json!("p2")])),
+    );
+    // AND-predicate parity through SQL.
+    app.add_shape(
+        "p1HighIds",
+        ShapeDef::new(
+            "todos",
+            vec![
+                "id".into(),
+                "project_id".into(),
+                "title".into(),
+                "done".into(),
+            ],
+        )
+        .where_fn(|_| and(vec![eq("project_id", json!("p1")), gt("id", json!(1))])),
     );
 
     let app = Arc::new(app);

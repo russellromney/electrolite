@@ -53,13 +53,15 @@ defmodule Electrolite do
   def stop(pid), do: GenServer.stop(pid)
 
   @doc """
-  Wake any live waiters, then stop the GenServer (and close the
-  SQLite connection). Live waiters return with whatever replay state
-  they currently have; clients re-snapshot on reconnect.
+  Mark the engine as stopped and wake every live waiter. In-flight
+  live waits return a clean `200 {messages: [], up_to_date: true,
+  shutdown: true}` response instead of trying to call back into
+  the GenServer. The GenServer stays alive so existing handle/4
+  callers can finish their reply; call `stop/1` to terminate it
+  when you're done.
   """
   def shutdown(pid) do
-    GenServer.cast(pid, :wake_all_waiters)
-    GenServer.stop(pid)
+    GenServer.cast(pid, :electrolite_shutdown)
   end
 
   def execute(pid, sql, args \\ []), do: GenServer.call(pid, {:execute, sql, args})
@@ -92,15 +94,34 @@ defmodule Electrolite do
         # notify before we asked to be subscribed.
         engine_pid = GenServer.whereis(pid) || pid
 
-        receive do
-          {:electrolite_change, ^engine_pid} -> :ok
-        after
-          timeout_ms ->
-            GenServer.cast(pid, {:unsubscribe_change, self()})
-            :timeout
-        end
+        outcome =
+          receive do
+            {:electrolite_change, ^engine_pid} -> :changed
+            {:electrolite_shutdown, ^engine_pid} -> :shutdown
+          after
+            timeout_ms ->
+              GenServer.cast(pid, {:unsubscribe_change, self()})
+              :timeout
+          end
 
-        GenServer.call(pid, {:replay_for_handle, shape, offset}, :infinity)
+        case outcome do
+          :shutdown ->
+            current_handle = shape_handle(shape)
+
+            {200,
+             %{
+               "type" => "replay",
+               "log_id" => "",
+               "shape_handle" => current_handle,
+               "messages" => [],
+               "offset" => offset,
+               "up_to_date" => true,
+               "shutdown" => true
+             }}
+
+          _ ->
+            GenServer.call(pid, {:replay_for_handle, shape, offset}, :infinity)
+        end
     end
   end
 
@@ -128,6 +149,7 @@ defmodule Electrolite do
       conn: conn,
       subscribers: MapSet.new(),
       monitors: %{},
+      stopped: false,
       shapes: %{},
       prefix: Keyword.get(opts, :prefix, "/electrolite/v1"),
       replay_limit: Keyword.get(opts, :replay_limit, 1000),
@@ -261,6 +283,21 @@ defmodule Electrolite do
 
   def handle_cast(:wake_all_waiters, state) do
     {:noreply, notify(state)}
+  end
+
+  def handle_cast(:electrolite_shutdown, state) do
+    # Send a distinct shutdown message to every subscriber so they
+    # can return a clean response without calling back into the
+    # GenServer. Mark state.stopped so subsequent handle_initial
+    # calls also short-circuit.
+    Enum.each(state.subscribers, fn pid ->
+      send(pid, {:electrolite_shutdown, self()})
+    end)
+
+    Enum.each(state.monitors, fn {_pid, ref} -> Process.demonitor(ref, [:flush]) end)
+
+    {:noreply,
+     %{state | stopped: true, subscribers: MapSet.new(), monitors: %{}}}
   end
 
   @impl true

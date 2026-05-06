@@ -568,6 +568,49 @@ fn stale_current_batch_id_cleared_on_bootstrap() {
     assert_eq!(batch_id.len(), 32);
 }
 
+#[test]
+fn shutdown_wakes_live_waiters_with_clean_response() {
+    use std::time::Instant;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("app.db");
+    let mut app = Electrolite::open(path.to_str().unwrap()).unwrap();
+    app.live_timeout = Duration::from_millis(10_000);
+    app.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);")
+        .unwrap();
+    app.install_triggers("t").unwrap();
+    app.add_shape(
+        "all",
+        ShapeDef::new("t", vec!["id".into(), "v".into()]),
+    );
+
+    let app = Arc::new(app);
+    let (_, snap) = app.handle("/electrolite/v1/all", "offset=-1", &json!({}));
+
+    let waiter = Arc::clone(&app);
+    let q = format!(
+        "offset={}&live=true&log_id={}&shape_handle={}",
+        snap["offset"].as_i64().unwrap(),
+        snap["log_id"].as_str().unwrap(),
+        snap["shape_handle"].as_str().unwrap()
+    );
+    let h = thread::spawn(move || waiter.handle("/electrolite/v1/all", &q, &json!({})));
+
+    thread::sleep(Duration::from_millis(50));
+    let started = Instant::now();
+    app.shutdown();
+    let (status, body) = h.join().unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(status, 200);
+    assert_eq!(body["shutdown"], true);
+    assert_eq!(body["messages"], json!([]));
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "shutdown should wake within 1s, took {elapsed:?}"
+    );
+}
+
 // Smoke test: keep direct API working alongside handle().
 #[test]
 fn direct_snapshot_replay_still_works() {

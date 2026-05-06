@@ -332,6 +332,143 @@ func TestCompositePrimaryKeysExposedAndUsedInKeys(t *testing.T) {
 	}
 }
 
+func TestStaleCurrentBatchIDClearedOnBootstrap(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "app.db")
+
+	app, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.ExecBatch(
+		`CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.InstallTriggers("t"); err != nil {
+		t.Fatal(err)
+	}
+	// Plant a stale batch_id and drop the engine without clearing.
+	if _, err := app.Exec(
+		`INSERT INTO _electrolite_meta (key, value) VALUES ('current_batch_id', 'STALE')
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	_ = app.Close()
+
+	app2, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = app2.Close() })
+	if _, err := app2.Exec("INSERT INTO t (id, v) VALUES (?, ?)", 1, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	r, err := app2.Replay(Shape{Table: "t", Columns: []string{"id", "v"}, Predicate: All()}, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(r.Messages))
+	}
+	if r.Messages[0].BatchID == "STALE" {
+		t.Fatalf("stale batch_id leaked into next write")
+	}
+	if len(r.Messages[0].BatchID) != 32 {
+		t.Fatalf("expected 32-hex batch_id, got %q", r.Messages[0].BatchID)
+	}
+}
+
+func TestReplayBatchCapSignalsMoreToCome(t *testing.T) {
+	dir := t.TempDir()
+	app, err := Open(filepath.Join(dir, "app.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = app.Close() })
+	if err := app.ExecBatch(
+		`CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.InstallTriggers("t"); err != nil {
+		t.Fatal(err)
+	}
+	stmts := make([]Stmt, 0, 25)
+	for i := 1; i <= 25; i++ {
+		stmts = append(stmts, Stmt{
+			SQL:  "INSERT INTO t (id, v) VALUES (?, ?)",
+			Args: []interface{}{i, "row"},
+		})
+	}
+	if err := app.WriteBatch(stmts); err != nil {
+		t.Fatal(err)
+	}
+	shape := Shape{Table: "t", Columns: []string{"id", "v"}, Predicate: All()}
+	r, err := app.Replay(shape, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// limit=1, extension cap = 10 → first page has 11 rows.
+	if len(r.Messages) != 11 {
+		t.Fatalf("expected 11 messages (1 + 10 extension cap), got %d", len(r.Messages))
+	}
+	if r.UpToDate {
+		t.Fatalf("expected up_to_date=false because the batch isn't drained")
+	}
+}
+
+func TestShutdownWakesLiveWaiters(t *testing.T) {
+	dir := t.TempDir()
+	app, err := Open(filepath.Join(dir, "app.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.LiveTimeout = 10 * time.Second
+	if err := app.ExecBatch(
+		`CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.InstallTriggers("t"); err != nil {
+		t.Fatal(err)
+	}
+	app.AddShape("all", ShapeDef{Table: "t", Columns: []string{"id", "v"}})
+
+	snap := bodyMap(app.Handle("/electrolite/v1/all", "offset=-1", nil))
+	q := buildQ(snap, true)
+
+	type result struct {
+		resp HandleResponse
+	}
+	out := make(chan result, 1)
+	go func() {
+		out <- result{resp: app.Handle("/electrolite/v1/all", q, nil)}
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	start := time.Now()
+	app.Shutdown()
+
+	select {
+	case r := <-out:
+		if r.resp.Status != 200 {
+			t.Fatalf("expected 200, got %d", r.resp.Status)
+		}
+		body := r.resp.Body.(map[string]interface{})
+		if body["shutdown"] != true {
+			t.Fatalf("expected shutdown:true, got %+v", body)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("shutdown took too long: %v", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not wake live waiter")
+	}
+	_ = app.Close()
+}
+
 func TestLiveWaitWakesWhenWriteCommits(t *testing.T) {
 	app := projectTodosApp(t)
 	app.LiveTimeout = 1 * time.Second
