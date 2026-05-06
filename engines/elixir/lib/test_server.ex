@@ -31,10 +31,53 @@ defmodule Electrolite.TestServer do
       {status, body} =
         Electrolite.handle(@engine, conn.request_path, query, %{projects: ["p1", "p2"]})
 
-      conn
-      |> put_resp_content_type("application/json")
-      |> put_resp_header("access-control-allow-origin", "*")
-      |> send_resp(status, Jason.encode!(body))
+      etag = compute_etag(body, status)
+      cache_control = compute_cache_control(query, status)
+      if_none_match = get_req_header(conn, "if-none-match") |> List.first()
+
+      conn =
+        conn
+        |> put_resp_header("access-control-allow-origin", "*")
+        |> put_resp_header("vary", "authorization")
+
+      conn = if etag, do: put_resp_header(conn, "etag", etag), else: conn
+      conn = if cache_control, do: put_resp_header(conn, "cache-control", cache_control), else: conn
+
+      if etag && if_none_match == etag do
+        send_resp(conn, 304, "")
+      else
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(status, Jason.encode!(body))
+      end
+    end
+  end
+
+  defp compute_etag(body, 200) when is_map(body) do
+    case {body["shape_handle"], body["offset"]} do
+      {nil, _} -> nil
+      {h, o} -> ~s("#{h}-#{o}")
+    end
+  end
+
+  defp compute_etag(_, _), do: nil
+
+  defp compute_cache_control(query, 200) do
+    qp = URI.decode_query(query)
+
+    cond do
+      Map.get(qp, "live") == "true" -> "no-store"
+      (Map.get(qp, "offset") || "-1") |> safe_int() |> Kernel.>=(0) -> "public, max-age=31536000, immutable"
+      true -> "public, max-age=5"
+    end
+  end
+
+  defp compute_cache_control(_, _), do: nil
+
+  defp safe_int(s) do
+    case Integer.parse(s) do
+      {n, ""} -> n
+      _ -> -1
     end
   end
 

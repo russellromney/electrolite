@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 
 	electrolite "github.com/russellromney/electrolite/engines/go"
@@ -147,6 +148,48 @@ func main() {
 		}
 
 		resp := app.Handle(r.URL.Path, query, ctx)
+
+		// Compute CDN-friendly cache headers.
+		etag := ""
+		cacheControl := ""
+		if resp.Status == 200 {
+			if body, ok := resp.Body.(map[string]interface{}); ok {
+				shapeHandle, _ := body["shape_handle"].(string)
+				offsetOut := body["offset"]
+				etag = fmt.Sprintf(`"%s-%v"`, shapeHandle, offsetOut)
+				values, _ := url.ParseQuery(query)
+				offsetIn := int64(-1)
+				if v := values.Get("offset"); v != "" {
+					if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+						offsetIn = n
+					}
+				}
+				live := values.Get("live") == "true"
+				switch {
+				case live:
+					cacheControl = "no-store"
+				case offsetIn >= 0:
+					cacheControl = "public, max-age=31536000, immutable"
+				default:
+					cacheControl = "public, max-age=5"
+				}
+			}
+		}
+		w.Header().Set("vary", "authorization")
+		if etag != "" {
+			if r.Header.Get("If-None-Match") == etag {
+				w.Header().Set("etag", etag)
+				if cacheControl != "" {
+					w.Header().Set("cache-control", cacheControl)
+				}
+				w.WriteHeader(304)
+				return
+			}
+			w.Header().Set("etag", etag)
+		}
+		if cacheControl != "" {
+			w.Header().Set("cache-control", cacheControl)
+		}
 		w.Header().Set("content-type", "application/json")
 		w.WriteHeader(resp.Status)
 		_ = json.NewEncoder(w).Encode(resp.Body)

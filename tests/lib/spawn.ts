@@ -138,12 +138,20 @@ async function startNode(port: number, dbPath: string): Promise<Server> {
         await streamSseNode(electrolite, url, req, res);
         return;
       }
-      const response = await electrolite.handle(new Request(url), {
+      const response = await electrolite.handle(new Request(url, { headers: req.headers as any }), {
         user: { projects: new Set(["p1", "p2"]) },
       });
       res.statusCode = response.status;
-      res.setHeader("content-type", "application/json");
-      res.end(await response.text());
+      // Forward every response header so cache headers (etag,
+      // cache-control, vary) reach the conformance harness.
+      response.headers.forEach((value, key) => {
+        res.setHeader(key, value);
+      });
+      if (!res.getHeader("content-type") && response.status !== 304) {
+        res.setHeader("content-type", "application/json");
+      }
+      const text = response.status === 304 ? "" : await response.text();
+      res.end(text);
       return;
     }
     if (req.method === "POST" && req.url?.startsWith("/_test/")) {

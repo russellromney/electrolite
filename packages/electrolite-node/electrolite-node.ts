@@ -242,6 +242,11 @@ export class Electrolite<TContext = unknown> {
   }
 
   async handle(request: Request, context?: TContext): Promise<Response> {
+    const response = await this.handleInner(request, context);
+    return applyCacheHeaders(response, request);
+  }
+
+  async handleInner(request: Request, context?: TContext): Promise<Response> {
     if (request.method !== "GET") {
       return jsonError(405, "method_not_allowed");
     }
@@ -500,6 +505,60 @@ function badInputResponse(error) {
     { error: "bad_request", detail: String(error?.message ?? error) },
     { status: 400 },
   );
+}
+
+async function applyCacheHeaders(response: Response, request: Request): Promise<Response> {
+  // Only annotate 200 responses; errors and 204 timeouts are not
+  // cacheable.
+  if (response.status !== 200) {
+    return response;
+  }
+  const ct = response.headers.get("content-type") ?? "";
+  if (!ct.includes("application/json")) {
+    return response;
+  }
+  const body = await response.clone().json().catch(() => null);
+  if (!body || typeof body !== "object") {
+    return response;
+  }
+  const shapeHandle = (body as any).shape_handle;
+  const offsetOut = (body as any).offset;
+  if (typeof shapeHandle !== "string" || offsetOut === undefined) {
+    return response;
+  }
+  const etag = `"${shapeHandle}-${offsetOut}"`;
+
+  const url = new URL(request.url, "http://electrolite.local");
+  const offsetIn = Number(url.searchParams.get("offset") ?? "-1");
+  const live = url.searchParams.get("live") === "true";
+  let cacheControl: string;
+  if (live) {
+    cacheControl = "no-store";
+  } else if (offsetIn >= 0) {
+    cacheControl = "public, max-age=31536000, immutable";
+  } else {
+    cacheControl = "public, max-age=5";
+  }
+
+  // 304 Not Modified path.
+  if (request.headers.get("if-none-match") === etag) {
+    const headers304 = new Headers({
+      etag,
+      "cache-control": cacheControl,
+      vary: "authorization",
+    });
+    return new Response(null, { status: 304, headers: headers304 });
+  }
+
+  const merged = new Headers(response.headers);
+  merged.set("etag", etag);
+  merged.set("cache-control", cacheControl);
+  merged.set("vary", "authorization");
+  return new Response(await response.clone().text(), {
+    status: response.status,
+    statusText: response.statusText,
+    headers: merged,
+  });
 }
 
 function sleep(ms) {

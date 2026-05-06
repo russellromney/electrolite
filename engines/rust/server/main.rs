@@ -209,8 +209,29 @@ fn main() {
                     stream_sse(request, app, path, query, context);
                     return;
                 }
+                let if_none_match = request
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("if-none-match"))
+                    .map(|h| h.value.as_str().to_string());
                 let (status, body) = app.handle(&path, &query, &context);
-                respond(request, status, &body);
+                let etag = compute_etag(&body, status);
+                let cache_control = compute_cache_control(&query, status);
+                if let Some(client_tag) = if_none_match {
+                    if let Some(server_tag) = &etag {
+                        if &client_tag == server_tag {
+                            respond_304(request, server_tag, cache_control.as_deref());
+                            return;
+                        }
+                    }
+                }
+                respond_with_cache(
+                    request,
+                    status,
+                    &body,
+                    etag.as_deref(),
+                    cache_control.as_deref(),
+                );
                 return;
             }
 
@@ -405,10 +426,80 @@ fn json_to_sql(v: &Json) -> rusqlite::types::Value {
 }
 
 fn respond(request: tiny_http::Request, status: u16, body: &Json) {
+    respond_with_cache(request, status, body, None, None);
+}
+
+fn respond_with_cache(
+    request: tiny_http::Request,
+    status: u16,
+    body: &Json,
+    etag: Option<&str>,
+    cache_control: Option<&str>,
+) {
     let payload = serde_json::to_string(body).unwrap();
-    let response = Response::from_string(payload)
+    let mut response = Response::from_string(payload)
         .with_status_code(status as i32)
         .with_header(Header::from_bytes(&b"content-type"[..], &b"application/json"[..]).unwrap())
-        .with_header(Header::from_bytes(&b"access-control-allow-origin"[..], &b"*"[..]).unwrap());
+        .with_header(Header::from_bytes(&b"access-control-allow-origin"[..], &b"*"[..]).unwrap())
+        .with_header(Header::from_bytes(&b"vary"[..], &b"authorization"[..]).unwrap());
+    if let Some(tag) = etag {
+        response = response
+            .with_header(Header::from_bytes(&b"etag"[..], tag.as_bytes()).unwrap());
+    }
+    if let Some(cc) = cache_control {
+        response = response.with_header(
+            Header::from_bytes(&b"cache-control"[..], cc.as_bytes()).unwrap(),
+        );
+    }
     let _ = request.respond(response);
+}
+
+fn respond_304(request: tiny_http::Request, etag: &str, cache_control: Option<&str>) {
+    let mut response = Response::from_string("")
+        .with_status_code(304)
+        .with_header(Header::from_bytes(&b"etag"[..], etag.as_bytes()).unwrap())
+        .with_header(Header::from_bytes(&b"vary"[..], &b"authorization"[..]).unwrap())
+        .with_header(Header::from_bytes(&b"access-control-allow-origin"[..], &b"*"[..]).unwrap());
+    if let Some(cc) = cache_control {
+        response = response.with_header(
+            Header::from_bytes(&b"cache-control"[..], cc.as_bytes()).unwrap(),
+        );
+    }
+    let _ = request.respond(response);
+}
+
+fn compute_etag(body: &Json, status: u16) -> Option<String> {
+    if status != 200 {
+        return None;
+    }
+    let shape_handle = body.get("shape_handle").and_then(|v| v.as_str())?;
+    let offset = body.get("offset").map(|v| v.to_string()).unwrap_or_default();
+    Some(format!("\"{shape_handle}-{offset}\""))
+}
+
+fn compute_cache_control(query: &str, status: u16) -> Option<String> {
+    if status != 200 {
+        return None;
+    }
+    let mut offset_in: i64 = -1;
+    let mut live = false;
+    for pair in query.split('&') {
+        let mut it = pair.splitn(2, '=');
+        let k = it.next().unwrap_or("");
+        let v = it.next().unwrap_or("");
+        if k == "offset" {
+            if let Ok(n) = v.parse::<i64>() {
+                offset_in = n;
+            }
+        } else if k == "live" && v == "true" {
+            live = true;
+        }
+    }
+    if live {
+        Some("no-store".to_string())
+    } else if offset_in >= 0 {
+        Some("public, max-age=31536000, immutable".to_string())
+    } else {
+        Some("public, max-age=5".to_string())
+    }
 }

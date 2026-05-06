@@ -88,7 +88,14 @@ async function runOperation(server: Server, op: Operation, prev: any[]): Promise
     const url = `${server.url}${path}${query ? "?" + query : ""}`;
     const r = await fetch(url);
     const body = await r.json().catch(() => null);
-    return { status: r.status, body };
+    // Expose a small subset of response headers so conformance cases
+    // can assert cache-control / etag / vary parity across engines.
+    const headers = {
+      etag: r.headers.get("etag"),
+      "cache-control": r.headers.get("cache-control"),
+      vary: r.headers.get("vary"),
+    };
+    return { status: r.status, body, headers };
   }
   if (op.kind === "sse_first") {
     // Open an SSE stream, read until the first `\n\n`, parse the

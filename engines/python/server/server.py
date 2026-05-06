@@ -129,12 +129,44 @@ def make_handler(app):
         def log_message(self, *args, **kwargs):
             return  # silence access logs in tests
 
-        def _send(self, status, body):
+        def _send(self, status, body, *, electrolite_route=None):
             payload = json.dumps(body).encode()
+            etag = None
+            cache_control = None
+            if status == 200 and isinstance(body, dict) and electrolite_route is not None:
+                shape_handle = body.get("shape_handle", "")
+                offset_out = body.get("offset", -1)
+                etag = f'"{shape_handle}-{offset_out}"'
+                if electrolite_route.get("live"):
+                    cache_control = "no-store"
+                elif electrolite_route.get("offset", -1) >= 0:
+                    cache_control = "public, max-age=31536000, immutable"
+                else:
+                    cache_control = "public, max-age=5"
+
+            # 304 Not Modified path: if client's If-None-Match matches
+            # the etag we'd return, send 304 without a body.
+            if etag is not None:
+                inm = self.headers.get("if-none-match")
+                if inm == etag:
+                    self.send_response(304)
+                    self.send_header("etag", etag)
+                    if cache_control:
+                        self.send_header("cache-control", cache_control)
+                    self.send_header("vary", "authorization")
+                    self.send_header("access-control-allow-origin", "*")
+                    self.end_headers()
+                    return
+
             self.send_response(status)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(payload)))
             self.send_header("access-control-allow-origin", "*")
+            if etag is not None:
+                self.send_header("etag", etag)
+            if cache_control:
+                self.send_header("cache-control", cache_control)
+            self.send_header("vary", "authorization")
             self.end_headers()
             self.wfile.write(payload)
 
@@ -150,7 +182,16 @@ def make_handler(app):
                     parsed.query,
                     context={"projects": {"p1", "p2"}},
                 )
-                self._send(status, body)
+                # Parse the route shallowly to know whether this was a
+                # snapshot, replay, or live request — that's enough to
+                # pick the cache-control class.
+                from urllib.parse import parse_qs as _pq
+                qd = _pq(parsed.query)
+                route = {
+                    "offset": int(qd.get("offset", ["-1"])[0]) if qd.get("offset", ["-1"])[0].lstrip("-").isdigit() else -1,
+                    "live": qd.get("live", ["false"])[0] == "true",
+                }
+                self._send(status, body, electrolite_route=route)
                 return
             self._send(404, {"error": "not_found"})
 
