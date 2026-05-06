@@ -1,0 +1,2 @@
+# Commits for phase 0001
+# format: <cluster> <issue ids> <commit sha> — <message>
