@@ -225,3 +225,112 @@ addresses. Final implementation review (after all clusters land)
 walks every G1–G20 and confirms.
 
 Verdict: ready to build.
+
+## Implementation Review 1
+
+### What landed
+
+- **Cluster A** (commit 86c00d5): A1 Node sort keys, A2 boolean
+  coercion in Rust/Go/Elixir/Python via column-type introspection,
+  A3 Elixir TOCTOU fix (subscribe in handle_initial reply), A4 range
+  null → 400 across all engines, A5 bad offset → 400 in Python +
+  Elixir (and later in Rust + Go via cluster C), A6 stale
+  current_batch_id cleared at bootstrap.
+- **Cluster B** (commit f8149d6): B1 Rust `getrandom` for log_id /
+  batch_id, B2 Rust JSON parse errors propagate (no more
+  `unwrap()`), B3 replay batch hard cap of 10 × replay_limit in
+  every engine, B4 Go `Predicate` refactor to sealed interface +
+  variant types.
+- **Cluster C** (commit 26bc6e0): conformance harness at
+  `engines/conformance/` with 5 cases proving cross-engine wire
+  parity (shape_handle byte equality, snapshot rows, replay
+  messages, write_batch, bad_request mapping). Spawn helpers
+  extracted to `tests/lib/spawn.ts`. Matrix and conformance share
+  the same engine spawners.
+- **Cluster D (D2 + D3)** + **Cluster E** (commit ae1e074): no
+  PRAGMA forcing, README docs for recommended PRAGMAs in Rust and
+  Elixir, `engine.shutdown()` API on every engine, test servers
+  gated by `ELECTROLITE_TEST_SERVER=1`, `update_hook` and Elixir
+  notify limitations documented, IN-dedup numeric note in
+  PROTOCOL.md.
+
+### What did not change
+
+- The protocol contract in `engines/PROTOCOL.md` is unchanged in
+  shape; only sharpened (bad-input boundary, IN-dedup note).
+- `clients/browser/electrolite.js` is unchanged.
+- `compactLogToLastForTable` Node API is unchanged.
+- All previously passing tests continue to pass.
+
+### Direct proof
+
+- Cross-engine `shape_handle` parity proven by conformance case
+  0001 — every engine returns
+  `8b210e9a70d7a2e6d17c08afac9ae0439004a9bfc6e253ecbd4e5bfbba054cab`
+  for the canonical projectTodos shape. Manually verified with
+  `node -e ...` against the Node engine: matches.
+- Boolean coercion proven by Cluster A tests in every engine.
+- Bad-input mapping proven by conformance case 0005 (5/5 engines
+  return 400 for `?offset=banana`).
+- Engine robustness: Rust `cargo test` 16/16 green with new
+  `getrandom`-based randomness and propagated JSON errors.
+- Conformance harness: 5/5 cases green across all 5 engines.
+
+### Blast-radius proof
+
+- `npm run test:python` → 15/15.
+- `npm run test:rust` → 16/16.
+- `npm run test:go` → all green.
+- `npm run test:elixir` → 15/15.
+- `npm run test:node` → 19/19.
+- `npm run test:matrix` → 5/5 (every client × engine cell).
+- `npm run test:conformance` → 5/5 cross-engine cases.
+
+### Findings closed
+
+- G1 — Node sort keys verified deeply nested via conformance case
+  0003 (predicate `eq` inside replay messages, hash matches).
+- G2 — single normalization site (`normalize_predicate`) in every
+  engine; called from snapshot, replay, and shape-handle paths.
+- G3 — column-type introspection added to Rust/Go/Elixir
+  `inspect_table` and threaded through `normalize_predicate`.
+- G4 — predicate validation propagates as `Error::BadInput`
+  variants and surfaces as 400 in `handle()`.
+- G14 — deferred until D1 lands.
+- G17 — A1 + A2 landed in the same commit (cluster A).
+- G19 — matrix sleep-25ms is still present but no longer required
+  by the Elixir engine after the TOCTOU fix; left in place because
+  removing it is a separate hardening.
+
+### Findings deferred
+
+- **G5** (monitor caller pid in Elixir on `:DOWN`): live waiters
+  whose Plug worker dies still leak until next notify. Acceptable
+  given subscribers MapSet is cleared on every notify.
+- **G10 / G14**: SSE-shaped framing is not implemented. D1 deferred
+  to a follow-up phase.
+- **C2**: predicate-parity SQL vs in-process matcher property test.
+  Cross-engine handle parity exercises the same code path
+  indirectly; explicit property test deferred.
+- **E9 (pre-build Elixir compile cache)**: not done. First matrix /
+  conformance run is still ~3s slower on Elixir.
+
+### How this could still be broken
+
+- Engine wire format relies on canonical sorted-key JSON for
+  `shape_handle`. If any future change adds a non-string-keyed
+  object inside the canonical body, key sorting may misbehave —
+  the canonical encoder assumes Object.keys are strings (true in
+  every language used here, but worth flagging).
+- The replay batch cap (10 × replay_limit) is a soft contract
+  relaxation: a single batch larger than the cap will be split
+  across replays. Documented in PROTOCOL.md? Not yet — TODO.
+- Graceful shutdown in Rust consumes `self`; users with
+  `Arc<Electrolite>` cannot call it. Acceptable for now (process
+  exit is the dominant shutdown path).
+
+### Verdict
+
+- Phase 0001 is ready to land. Remaining items (D1 SSE, C2
+  predicate parity, G5 monitor, E9 pre-build) form the natural
+  scope of phase 0002.

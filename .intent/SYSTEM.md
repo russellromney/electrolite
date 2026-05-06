@@ -25,17 +25,25 @@ long-polls for replay messages.
   - **Test matrix**: `tests/matrix.test.ts` spawns every engine over
     real HTTP and drives the browser `ShapeClient` against each.
     Today: 5 engines × 1 client = 5 cells, all green.
+- Wire parity is **proven** as of phase 0001: every engine produces
+  byte-identical `shape_handle` for the same shape; every engine
+  returns 400 / 404 / 409 the same way. Verified by the conformance
+  harness at `engines/conformance/`.
+- Engines support a `shutdown()` API that wakes live waiters and
+  closes the connection.
 - The system does not yet do:
-  - **Wire parity is unverified.** Conformance is hand-translated per
-    language. No test asserts cross-engine `shape_handle` equality.
-  - SSE transport. HTTP/2 push. WebSocket adapter.
-  - Connection pool / WAL-mode-aware concurrency. Every engine is
-    single-connection serialized.
-  - Cross-process wake. `update_hook` (Rust) only sees this
+  - **SSE transport.** Long-polling is the only transport today.
+    HTTP/2 push and WebSocket adapter are out of scope.
+  - **Connection pool / WAL-mode-aware concurrency.** Every engine
+    is single-connection serialized. PRAGMAs are the user's
+    responsibility (engines do not force `journal_mode`).
+  - **Cross-process wake.** `update_hook` (Rust) only sees this
     connection's writes; other engines rely on engine-internal notify.
-  - Graceful shutdown. Live waiters see their connection drop on
-    process exit.
-  - Backend client libraries. Browser is the only client.
+  - **Predicate-parity property test.** SQL `WHERE` and the in-
+    process matcher are not yet directly compared on a fixed row
+    set. Cross-engine handle parity exercises the same paths
+    indirectly.
+  - **Backend client libraries.** Browser is the only client.
 
 ## Boundaries that matter
 

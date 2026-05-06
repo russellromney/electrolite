@@ -1,2 +1,14 @@
 # Commits for phase 0001
 # format: <cluster> <issue ids> <commit sha> — <message>
+
+a87e90a IDD scaffolding — SYSTEM.md, plan.md, review.md
+86c00d5 cluster A  #1 #3 #4 #5 #6 #22  wire parity, normalization, error mapping
+f8149d6 cluster B  #7 #13 #18 #19  engine robustness
+26bc6e0 cluster C  #2 #5 #6 #24  language-agnostic conformance harness, side fixes
+ae1e074 cluster D2 D3 + E  #8 #9 #10 #11 #12 #15 #17 #20 #23  concurrency docs, shutdown, polish
+
+# remaining
+# D1 (#14)  SSE transport — deferred to a follow-up phase
+# C2 (#16)  predicate parity (SQL vs in-process matcher) — deferred
+# G5  monitor pid for dropped Plug workers in Elixir — deferred
+# E9  pre-warm Elixir compile cache in ensureBuilt — partial
