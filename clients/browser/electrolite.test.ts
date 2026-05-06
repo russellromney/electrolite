@@ -647,6 +647,94 @@ test("multi-tab clients release leadership on pagehide", () => {
   }
 });
 
+test("calls headers callback on every request", async () => {
+  const seenHeaders: any[] = [];
+  let token = "tok-1";
+  const client = new ShapeClient("http://app.test/electrolite/v1/x/p1", {
+    keyColumns: ["id"],
+    headers: () => ({ Authorization: `Bearer ${token}` }),
+    fetch: async (_url, init) => {
+      seenHeaders.push(init?.headers);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          type: "snapshot",
+          key_columns: ["id"],
+          rows: [],
+          offset: 0,
+          up_to_date: true,
+          log_id: "x",
+          shape_handle: "y",
+        }),
+      };
+    },
+  });
+
+  await client.request({ offset: -1 });
+  assert.deepEqual(seenHeaders[0], { Authorization: "Bearer tok-1" });
+
+  token = "tok-2";
+  await client.request({ offset: client.offset });
+  assert.deepEqual(seenHeaders[1], { Authorization: "Bearer tok-2" });
+});
+
+test("onError callback can recover from a 401 by returning new headers", async () => {
+  let calls = 0;
+  let token = "expired";
+  const client = new ShapeClient("http://app.test/electrolite/v1/x/p1", {
+    keyColumns: ["id"],
+    headers: () => ({ Authorization: `Bearer ${token}` }),
+    fetch: async (_url, init) => {
+      calls += 1;
+      const auth = (init?.headers as any)?.Authorization;
+      if (auth === "Bearer expired") {
+        return { ok: false, status: 401, json: async () => ({ error: "expired" }) };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          type: "snapshot",
+          key_columns: ["id"],
+          rows: [],
+          offset: 0,
+          up_to_date: true,
+          log_id: "x",
+          shape_handle: "y",
+        }),
+      };
+    },
+    onError: async (err: any) => {
+      if (err.status === 401) {
+        token = "fresh";
+        return {};
+      }
+      return undefined;
+    },
+  });
+
+  await client.request({ offset: -1 });
+  // Two calls: first returns 401, second succeeds with refreshed token.
+  assert.equal(calls, 2);
+});
+
+test("onError retry is capped so a misbehaving callback can't loop", async () => {
+  let calls = 0;
+  const client = new ShapeClient("http://app.test/electrolite/v1/x/p1", {
+    keyColumns: ["id"],
+    fetch: async () => {
+      calls += 1;
+      return { ok: false, status: 500, json: async () => ({ error: "internal" }) };
+    },
+    onError: async () => ({}), // always tries to retry
+  });
+
+  await assert.rejects(() => client.request({ offset: -1 }));
+  // Initial attempt + 3 capped retries = 4 calls.
+  assert.equal(calls, 4);
+});
+
 class TestChannelBus {
   constructor() {
     this.channels = new Map();

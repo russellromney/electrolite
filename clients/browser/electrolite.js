@@ -9,6 +9,8 @@ export class ShapeClient {
       multiTab = false,
       channelFactory,
       transport = "long-poll",
+      headers,
+      onError,
     } = options;
     if (keyColumns !== undefined && (!Array.isArray(keyColumns) || keyColumns.length === 0)) {
       throw new Error("ShapeClient keyColumns must be a non-empty array");
@@ -25,6 +27,9 @@ export class ShapeClient {
       throw new Error(`ShapeClient transport must be 'long-poll' or 'sse', got ${transport}`);
     }
     this.transport = transport;
+    this.headersFn = headers ?? null;
+    this.onError = onError ?? null;
+    this.maxOnErrorRetries = 3;
     this.retryMinDelayMs = retry.minDelayMs ?? 250;
     this.retryMaxDelayMs = retry.maxDelayMs ?? 5_000;
     this.logId = null;
@@ -177,9 +182,10 @@ export class ShapeClient {
 
     let response;
     try {
+      const dynamicHeaders = await this.resolveHeaders({ Accept: "text/event-stream" });
       response = await this.fetch(url, {
         signal: this.abortController.signal,
-        headers: { Accept: "text/event-stream" },
+        headers: dynamicHeaders,
       });
     } catch (err) {
       this.abortController = null;
@@ -240,7 +246,18 @@ export class ShapeClient {
     }
   }
 
-  async request(params) {
+  async resolveHeaders(extra) {
+    const out = { ...(extra ?? {}) };
+    if (this.headersFn) {
+      const dynamic = await this.headersFn();
+      if (dynamic && typeof dynamic === "object") {
+        Object.assign(out, dynamic);
+      }
+    }
+    return out;
+  }
+
+  async request(params, attempt = 0) {
     this.renewLeadership();
     this.abortController = new AbortController();
     this.notifyStatus({
@@ -249,9 +266,12 @@ export class ShapeClient {
     });
     let response;
     const heartbeat = params.live ? this.startLeadershipHeartbeat() : null;
+    let headers;
     try {
+      headers = await this.resolveHeaders();
       response = await this.fetch(this.requestUrl(params), {
         signal: this.abortController.signal,
+        headers,
       });
     } finally {
       heartbeat?.();
@@ -267,7 +287,17 @@ export class ShapeClient {
       return this.request({ offset: -1 });
     }
     if (!response.ok) {
-      throw new Error(`Electrolite request failed: ${response.status}`);
+      const error = new Error(`Electrolite request failed: ${response.status}`);
+      error.status = response.status;
+      // onError can recover (e.g. refresh a token). Cap retries so a
+      // misbehaving onError can't loop forever.
+      if (this.onError && attempt < this.maxOnErrorRetries) {
+        const recovery = await this.onError(error, attempt);
+        if (recovery) {
+          return this.request(params, attempt + 1);
+        }
+      }
+      throw error;
     }
 
     const body = await response.json();
