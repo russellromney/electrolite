@@ -735,6 +735,80 @@ test("onError retry is capped so a misbehaving callback can't loop", async () =>
   assert.equal(calls, 4);
 });
 
+test("SSE onError can recover from a 401 by returning new headers", async () => {
+  let calls = 0;
+  let token = "expired";
+  const client = new ShapeClient("http://app.test/electrolite/v1/x/p1", {
+    keyColumns: ["id"],
+    transport: "sse",
+    headers: () => ({ Authorization: `Bearer ${token}` }),
+    fetch: async (_url, init) => {
+      calls += 1;
+      const auth = (init?.headers as any)?.Authorization;
+      if (auth === "Bearer expired") {
+        return { ok: false, status: 401, body: null };
+      }
+      // Successful SSE response — return a body with one snapshot
+      // event then immediately close, so streamSse exits cleanly.
+      const encoder = new TextEncoder();
+      const frame =
+        "event: snapshot\ndata: " +
+        JSON.stringify({
+          type: "snapshot",
+          key_columns: ["id"],
+          rows: [],
+          offset: 0,
+          up_to_date: true,
+          log_id: "x",
+          shape_handle: "y",
+        }) +
+        "\n\n";
+      const body = {
+        getReader() {
+          let sent = false;
+          return {
+            async read() {
+              if (sent) return { done: true, value: undefined };
+              sent = true;
+              return { done: false, value: encoder.encode(frame) };
+            },
+            async cancel() {},
+          };
+        },
+      };
+      return { ok: true, status: 200, body };
+    },
+    onError: async (err: any) => {
+      if (err.status === 401) {
+        token = "fresh";
+        return {};
+      }
+      return undefined;
+    },
+  });
+
+  await client.streamSse();
+  // Two calls: initial 401, retry succeeds with refreshed token.
+  assert.equal(calls, 2);
+});
+
+test("SSE onError retry is capped so a misbehaving callback can't loop", async () => {
+  let calls = 0;
+  const client = new ShapeClient("http://app.test/electrolite/v1/x/p1", {
+    keyColumns: ["id"],
+    transport: "sse",
+    fetch: async () => {
+      calls += 1;
+      return { ok: false, status: 500, body: null };
+    },
+    onError: async () => ({}), // always tries to retry
+  });
+
+  await assert.rejects(() => client.streamSse());
+  // Initial attempt + 3 capped retries = 4 calls.
+  assert.equal(calls, 4);
+});
+
 class TestChannelBus {
   constructor() {
     this.channels = new Map();

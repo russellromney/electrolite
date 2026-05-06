@@ -9,24 +9,46 @@ import { getShape, getShapeStream } from "./electrolite-react.ts";
 
 const NULL_FETCH = () => new Promise(() => {}); // never resolves
 
-test("getShapeStream shares one ShapeClient by url+transport", () => {
+test("getShapeStream shares one ShapeClient by url+transport, dispose returns", () => {
   const url = "http://app.test/electrolite/v1/x/p1";
   const a = getShapeStream(url, { fetch: NULL_FETCH as any, live: false } as any);
   const b = getShapeStream(url, { fetch: NULL_FETCH as any, live: false } as any);
-  assert.strictEqual(a, b);
+  // Same underlying client.
+  assert.strictEqual(a.client, b.client);
 
   const c = getShapeStream(url, {
     transport: "sse",
     fetch: NULL_FETCH as any,
     live: false,
   } as any);
-  assert.notStrictEqual(a, c);
+  // Different transport → different client.
+  assert.notStrictEqual(a.client, c.client);
 
-  a.stop();
-  c.stop();
+  a.dispose();
+  b.dispose();
+  c.dispose();
 });
 
-test("getShape exposes a subscribable rows view that starts empty", () => {
+test("explicit cacheKey scopes entries (auth-leak fix)", () => {
+  const url = "http://app.test/electrolite/v1/multi-user/p1";
+  const userA = getShapeStream(url, {
+    fetch: NULL_FETCH as any,
+    live: false,
+    cacheKey: `userA::${url}`,
+  } as any);
+  const userB = getShapeStream(url, {
+    fetch: NULL_FETCH as any,
+    live: false,
+    cacheKey: `userB::${url}`,
+  } as any);
+  // Different cacheKey → different client; one user's headers don't
+  // leak to another.
+  assert.notStrictEqual(userA.client, userB.client);
+  userA.dispose();
+  userB.dispose();
+});
+
+test("getShape exposes a subscribable rows view; dispose releases", () => {
   const url = "http://app.test/electrolite/v1/y/p1";
   const view = getShape(url, { fetch: NULL_FETCH as any, live: false } as any);
   let seen: any[] | null = null;
@@ -36,9 +58,15 @@ test("getShape exposes a subscribable rows view that starts empty", () => {
   // No fetch resolves, so rows stay [].
   assert.deepEqual(view.rows, []);
   unsub();
-  // Stop the underlying client by accessing it through the stream cache.
-  const client = getShapeStream(url, { fetch: NULL_FETCH as any, live: false } as any);
-  client.stop();
+  view.dispose();
+});
+
+test("getShape dispose is idempotent", () => {
+  const url = "http://app.test/electrolite/v1/idempotent/p1";
+  const view = getShape(url, { fetch: NULL_FETCH as any, live: false } as any);
+  view.dispose();
+  // Second dispose must be a no-op (no double-stop, no throw).
+  view.dispose();
 });
 
 test("modules export the four public hooks", async () => {

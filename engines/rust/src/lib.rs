@@ -1179,12 +1179,14 @@ fn compile_predicate(p: &Predicate) -> (String, Vec<Value>) {
             (where_part, args)
         }
         Predicate::Or(children) => {
-            let compiled: Vec<(String, Vec<Value>)> = children
-                .iter()
-                .map(compile_predicate)
-                .filter(|(w, _)| !w.is_empty())
-                .collect();
-            if compiled.is_empty() {
+            // Empty OR is vacuously false → match nothing.
+            if children.is_empty() {
+                return ("0".to_string(), vec![]);
+            }
+            let compiled: Vec<(String, Vec<Value>)> =
+                children.iter().map(compile_predicate).collect();
+            // If any child compiled to "" (match-all), the whole OR is match-all.
+            if compiled.iter().any(|(w, _)| w.is_empty()) {
                 return (String::new(), vec![]);
             }
             let where_part = compiled

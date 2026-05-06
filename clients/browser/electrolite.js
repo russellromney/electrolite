@@ -175,7 +175,7 @@ export class ShapeClient {
    * Server sends `event: replay\ndata: {...}\n\n` for each new
    * batch; this client materializes them via `apply()`.
    */
-  async streamSse() {
+  async streamSse(attempt = 0) {
     this.renewLeadership();
     this.abortController = new AbortController();
     this.notifyStatus({ type: "live", offset: this.offset });
@@ -194,6 +194,14 @@ export class ShapeClient {
       });
     } catch (err) {
       this.abortController = null;
+      // Mirror request()'s recovery path so SSE clients can refresh
+      // tokens / retry transient network errors.
+      if (this.onError && attempt < this.maxOnErrorRetries) {
+        const recovery = await this.onError(err, attempt);
+        if (recovery) {
+          return this.streamSse(attempt + 1);
+        }
+      }
       throw err;
     }
 
@@ -205,7 +213,15 @@ export class ShapeClient {
     }
     if (!response.ok || !response.body) {
       this.abortController = null;
-      throw new Error(`Electrolite SSE failed: ${response.status}`);
+      const error = new Error(`Electrolite SSE failed: ${response.status}`);
+      error.status = response.status;
+      if (this.onError && attempt < this.maxOnErrorRetries) {
+        const recovery = await this.onError(error, attempt);
+        if (recovery) {
+          return this.streamSse(attempt + 1);
+        }
+      }
+      throw error;
     }
 
     const reader = response.body.getReader();

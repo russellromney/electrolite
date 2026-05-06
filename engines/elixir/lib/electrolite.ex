@@ -753,7 +753,7 @@ defmodule Electrolite do
 
   # ---- predicate eval ----
 
-  defp messages_for(predicate, row, replica \\ :full) do
+  defp messages_for(predicate, row, replica) do
     old_match = predicate_matches(predicate, row.old_row)
     new_match = predicate_matches(predicate, row.new_row)
     old_key = row.old_pk || row.pk
@@ -930,19 +930,24 @@ defmodule Electrolite do
     {Enum.join(parts, " AND "), args}
   end
 
+  defp compile_predicate(%{type: :or, predicates: []}) do
+    # Empty OR is vacuously false → match nothing.
+    {"0", []}
+  end
+
   defp compile_predicate(%{type: :or, predicates: children}) do
-    {parts, args} =
-      Enum.reduce(children, {[], []}, fn child, {ps, as} ->
+    {parts, args, match_all} =
+      Enum.reduce(children, {[], [], false}, fn child, {ps, as, ma} ->
         case compile_predicate(child) do
-          {"", _} -> {ps, as}
-          {w, a} -> {ps ++ ["(#{w})"], as ++ a}
+          # child is match-all → whole OR is match-all
+          {"", _} -> {ps, as, true}
+          {w, a} -> {ps ++ ["(#{w})"], as ++ a, ma}
         end
       end)
 
-    if parts == [] do
-      {"", []}
-    else
-      {Enum.join(parts, " OR "), args}
+    cond do
+      match_all -> {"", []}
+      true -> {Enum.join(parts, " OR "), args}
     end
   end
 

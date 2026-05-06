@@ -7,7 +7,7 @@
 
 use electrolite::{
     and, eq, gt, in_list, not, or, predicate_from_json, predicate_matches_row, AuthContext,
-    BuildContext, Electrolite, Predicate, ShapeDef,
+    BuildContext, Electrolite, ShapeDef,
 };
 use serde_json::{json, Value as Json};
 use std::env;
@@ -181,6 +181,20 @@ fn main() {
                 not(eq("done", json!(1))),
             ])
         }),
+    );
+    // Empty-OR is vacuously false: this shape matches no rows.
+    app.add_shape(
+        "emptyOrShape",
+        ShapeDef::new(
+            "todos",
+            vec![
+                "id".into(),
+                "project_id".into(),
+                "title".into(),
+                "done".into(),
+            ],
+        )
+        .where_fn(|_| or(vec![])),
     );
 
     let app = Arc::new(app);

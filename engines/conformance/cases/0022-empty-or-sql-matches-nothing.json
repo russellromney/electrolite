@@ -1,0 +1,12 @@
+{
+  "name": "Empty OR compiled to SQL returns no rows across engines",
+  "setup": "INSERT INTO todos (id, project_id, title, done) VALUES (1, 'p1', 'a', 0), (2, 'p2', 'b', 1), (3, 'p3', 'c', 0);",
+  "operations": [
+    { "kind": "GET", "path": "/electrolite/v1/emptyOrShape", "query": "offset=-1" }
+  ],
+  "cross_engine": [
+    "0.status",
+    "0.body.shape_handle",
+    "0.body.rows"
+  ]
+}

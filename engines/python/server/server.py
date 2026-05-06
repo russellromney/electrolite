@@ -96,6 +96,12 @@ def build_app(db_path: str):
                     not_(eq("done", 1)),
                 ),
             ),
+            # Empty-OR is vacuously false: this shape matches no rows.
+            "emptyOrShape": shape(
+                table="todos",
+                columns=["id", "project_id", "title", "done"],
+                where=lambda ctx: or_(),
+            ),
         },
     )
     app.execute_batch(

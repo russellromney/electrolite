@@ -1296,16 +1296,24 @@ func compilePredicate(p Predicate) (string, []interface{}) {
 		}
 		return strings.Join(parts, " AND "), args
 	case OrPredicate:
+		// Empty OR is vacuously false → match nothing.
+		if len(x.Predicates) == 0 {
+			return "0", nil
+		}
 		var parts []string
 		var args []interface{}
+		matchAll := false
 		for _, c := range x.Predicates {
 			where, a := compilePredicate(c)
-			if where != "" {
-				parts = append(parts, "("+where+")")
-				args = append(args, a...)
+			if where == "" {
+				// child is match-all → whole OR is match-all
+				matchAll = true
+				continue
 			}
+			parts = append(parts, "("+where+")")
+			args = append(args, a...)
 		}
-		if len(parts) == 0 {
+		if matchAll {
 			return "", nil
 		}
 		return strings.Join(parts, " OR "), args

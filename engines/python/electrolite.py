@@ -455,8 +455,12 @@ class Electrolite:
             ]
         if predicate["type"] == "or":
             children = [self._compile_predicate(info, child) for child in predicate["predicates"]]
-            children = [child for child in children if child[0]]
+            # Empty OR is vacuously false (match nothing). Drop only children
+            # that compiled to "" because they were already match-all (so the
+            # whole OR matches all).
             if not children:
+                return "0", []
+            if any(not sql for sql, _ in children):
                 return "", []
             return " OR ".join(f"({child[0]})" for child in children), [
                 param for child in children for param in child[1]

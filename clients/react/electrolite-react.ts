@@ -3,12 +3,17 @@
 // shape and re-render on changes.
 //
 // Hooks:
-//   useShape(url, opts)   → { data, isLoading, lastSyncedAt, isError, error }
-//   preloadShape(url, opts) → Promise<void>      // for route loaders
-//   getShapeStream(url, opts) → ShapeClient      // memoized
-//   getShape(url, opts) → { rows, subscribe }    // materialized view
+//   useShape(url, opts)                    → { data, isLoading, ... }
+//   preloadShape(url, opts)                → Promise<void>
+//   getShapeStream(url, opts)              → { client, dispose }
+//   getShape(url, opts)                    → { rows, subscribe, dispose }
+//
+// Cache scoping: by default, entries are shared by (url, transport).
+// Callers whose `headers` / `onError` / `keyColumns` differ for the
+// same URL must pass `cacheKey` to avoid sharing — otherwise the
+// first caller's callbacks win and others' are ignored.
 
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useRef, useSyncExternalStore } from "react";
 import { ShapeClient } from "../browser/electrolite.js";
 
 export interface UseShapeOptions {
@@ -18,9 +23,21 @@ export interface UseShapeOptions {
   onError?: (error: any, attempt: number) => Promise<unknown> | unknown;
   retry?: { minDelayMs?: number; maxDelayMs?: number };
   fetch?: typeof fetch;
+  // Scope override. Two callers with different `headers`/`onError`
+  // callbacks for the same URL MUST pass distinct cacheKey values to
+  // avoid silently sharing one ShapeClient (and one auth context).
+  cacheKey?: string;
+}
+
+interface Snapshot {
+  rows: any[];
+  lastSyncedAt: number | null;
+  error: any;
+  client: ShapeClient | null;
 }
 
 interface CacheEntry {
+  key: string;
   client: ShapeClient;
   refCount: number;
   rows: any[];
@@ -29,112 +46,156 @@ interface CacheEntry {
   subscribers: Set<() => void>;
   unsubscribe: () => void;
   unsubStatus: () => void;
+  // Cached snapshot reused across getSnapshot calls when underlying
+  // fields are unchanged. Required for useSyncExternalStore to not
+  // tear or thrash.
+  snapshot: Snapshot;
 }
 
 const cache = new Map<string, CacheEntry>();
+const EMPTY_SNAPSHOT: Snapshot = Object.freeze({
+  rows: Object.freeze([]) as any,
+  lastSyncedAt: null,
+  error: null,
+  client: null,
+}) as Snapshot;
 
-function cacheKey(url: string, opts: UseShapeOptions): string {
+function computeCacheKey(url: string, opts: UseShapeOptions): string {
+  if (opts.cacheKey) return opts.cacheKey;
   // The transport differs the wire format enough that cached state
   // shouldn't be shared between long-poll and SSE clients.
   return `${opts.transport ?? "long-poll"}::${url}`;
 }
 
+function rebuildSnapshot(entry: CacheEntry): void {
+  entry.snapshot = {
+    rows: entry.rows,
+    lastSyncedAt: entry.lastSyncedAt,
+    error: entry.error,
+    client: entry.client,
+  };
+}
+
 function acquire(url: string, opts: UseShapeOptions): CacheEntry {
-  const key = cacheKey(url, opts);
+  const key = computeCacheKey(url, opts);
   let entry = cache.get(key);
   if (entry) {
     entry.refCount++;
     return entry;
   }
   const client = new ShapeClient(url, opts as any);
-  const entryNew: CacheEntry = {
+  const rows = client.currentRows();
+  const newEntry: CacheEntry = {
+    key,
     client,
     refCount: 1,
-    rows: client.currentRows(),
+    rows,
     lastSyncedAt: null,
     error: null,
     subscribers: new Set(),
     unsubscribe: () => {},
     unsubStatus: () => {},
+    snapshot: { rows, lastSyncedAt: null, error: null, client },
   };
-  cache.set(key, entryNew);
-  entryNew.unsubscribe = client.subscribe((rows: any[]) => {
-    entryNew.rows = rows;
-    for (const cb of entryNew.subscribers) cb();
+  cache.set(key, newEntry);
+  newEntry.unsubscribe = client.subscribe((nextRows: any[]) => {
+    newEntry.rows = nextRows;
+    rebuildSnapshot(newEntry);
+    for (const cb of newEntry.subscribers) cb();
   });
-  entryNew.unsubStatus = client.subscribeStatus((status: any) => {
-    if (status?.type === "live" || status?.type === "snapshot" || status?.type === "replay") {
-      entryNew.lastSyncedAt = Date.now();
-      entryNew.error = null;
+  newEntry.unsubStatus = client.subscribeStatus((status: any) => {
+    if (
+      status?.type === "live" ||
+      status?.type === "snapshot" ||
+      status?.type === "replay"
+    ) {
+      newEntry.lastSyncedAt = Date.now();
+      newEntry.error = null;
     } else if (status?.type === "error") {
-      entryNew.error = status.error;
+      newEntry.error = status.error;
+    } else {
+      return;
     }
-    for (const cb of entryNew.subscribers) cb();
+    rebuildSnapshot(newEntry);
+    for (const cb of newEntry.subscribers) cb();
   });
-  // Kick off the initial request loop. ShapeClient.start() is the
-  // lifecycle entry; if it doesn't exist, fall back to a manual
-  // snapshot.
   if (typeof (client as any).start === "function") {
     (client as any).start();
   } else {
-    // best-effort
     (client as any).request({ offset: -1 }).catch((e: any) => {
-      entryNew.error = e;
-      for (const cb of entryNew.subscribers) cb();
+      newEntry.error = e;
+      rebuildSnapshot(newEntry);
+      for (const cb of newEntry.subscribers) cb();
     });
   }
-  return entryNew;
+  return newEntry;
 }
 
-function release(url: string, opts: UseShapeOptions) {
-  const key = cacheKey(url, opts);
-  const entry = cache.get(key);
-  if (!entry) return;
+function release(entry: CacheEntry): void {
   entry.refCount--;
   if (entry.refCount <= 0) {
     entry.unsubscribe();
     entry.unsubStatus();
     entry.client.stop();
-    cache.delete(key);
+    cache.delete(entry.key);
   }
 }
 
 export function useShape<T = any>(url: string, opts: UseShapeOptions = {}) {
-  // Acquire on mount, release on unmount, share by cacheKey.
-  const entryRef = useRef<CacheEntry | null>(null);
-  if (!entryRef.current) {
-    entryRef.current = acquire(url, opts);
-  }
-  const entry = entryRef.current;
+  const key = computeCacheKey(url, opts);
+  // Stash the latest opts so subscribe (only re-bound when key changes)
+  // can construct ShapeClient with the freshest callbacks.
+  const optsRef = useRef(opts);
+  optsRef.current = opts;
 
-  const [, force] = useState(0);
-  useEffect(() => {
-    const cb = () => force((n) => n + 1);
-    entry.subscribers.add(cb);
-    return () => {
-      entry.subscribers.delete(cb);
-      release(url, opts);
-      entryRef.current = null;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cacheKey(url, opts)]);
+  const subscribe = useCallback(
+    (notify: () => void) => {
+      const entry = acquire(url, optsRef.current);
+      entry.subscribers.add(notify);
+      return () => {
+        entry.subscribers.delete(notify);
+        release(entry);
+      };
+    },
+    [key, url],
+  );
+
+  const getSnapshot = useCallback((): Snapshot => {
+    const entry = cache.get(key);
+    return entry ? entry.snapshot : EMPTY_SNAPSHOT;
+  }, [key]);
+
+  const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 
   return {
-    data: entry.rows as T[],
-    isLoading: entry.lastSyncedAt === null && entry.error === null,
-    lastSyncedAt: entry.lastSyncedAt,
-    isError: entry.error !== null,
-    error: entry.error,
-    shape: entry.client,
+    data: snapshot.rows as T[],
+    isLoading: snapshot.lastSyncedAt === null && snapshot.error === null,
+    lastSyncedAt: snapshot.lastSyncedAt,
+    isError: snapshot.error !== null,
+    error: snapshot.error,
+    shape: snapshot.client,
   };
 }
 
-export function getShapeStream(url: string, opts: UseShapeOptions = {}): ShapeClient {
-  return acquire(url, opts).client;
+export function getShapeStream(
+  url: string,
+  opts: UseShapeOptions = {},
+): { client: ShapeClient; dispose: () => void } {
+  const entry = acquire(url, opts);
+  let disposed = false;
+  return {
+    client: entry.client,
+    dispose: () => {
+      if (disposed) return;
+      disposed = true;
+      release(entry);
+    },
+  };
 }
 
 export function getShape(url: string, opts: UseShapeOptions = {}) {
   const entry = acquire(url, opts);
+  let disposed = false;
   return {
     get rows() {
       return entry.rows;
@@ -144,14 +205,31 @@ export function getShape(url: string, opts: UseShapeOptions = {}) {
       entry.subscribers.add(cb);
       return () => entry.subscribers.delete(cb);
     },
+    dispose: () => {
+      if (disposed) return;
+      disposed = true;
+      release(entry);
+    },
   };
 }
 
-export async function preloadShape(url: string, opts: UseShapeOptions = {}): Promise<void> {
+// Preload a shape for SSR/route-loader use. Acquires and DOES NOT
+// release — the cache stays warm so a subsequent useShape gets data
+// instantly. Returns a `dispose` so callers that want to limit cache
+// growth can clean up explicitly.
+export async function preloadShape(
+  url: string,
+  opts: UseShapeOptions = {},
+): Promise<{ dispose: () => void }> {
   const entry = acquire(url, opts);
-  // Wait for the first sync (snapshot or error).
+  let disposed = false;
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    release(entry);
+  };
   if (entry.lastSyncedAt !== null || entry.error !== null) {
-    return;
+    return { dispose };
   }
   await new Promise<void>((resolve) => {
     const cb = () => {
@@ -162,4 +240,5 @@ export async function preloadShape(url: string, opts: UseShapeOptions = {}): Pro
     };
     entry.subscribers.add(cb);
   });
+  return { dispose };
 }

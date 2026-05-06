@@ -164,6 +164,18 @@ pid = Electrolite.TestServer.engine_name()
     )
   )
 
+# Empty-OR is vacuously false: this shape matches no rows.
+:ok =
+  Electrolite.add_shape(
+    pid,
+    "emptyOrShape",
+    Electrolite.shape_def(
+      table: "todos",
+      columns: ["id", "project_id", "title", "done"],
+      where: fn _ -> Electrolite.or_pred([]) end
+    )
+  )
+
 {:ok, _} = Electrolite.TestServer.start(port)
 IO.puts("electrolite-server listening on #{port}")
 

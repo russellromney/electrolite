@@ -106,6 +106,12 @@ async function startNode(port: number, dbPath: string): Promise<Server> {
             not(eq("done", 1)),
           ]),
       }),
+      // Empty-OR is vacuously false: this shape matches no rows.
+      emptyOrShape: shape({
+        table: "todos",
+        columns: ["id", "project_id", "title", "done"],
+        where: () => or([]),
+      }),
     },
   });
   electrolite.executeBatch(`

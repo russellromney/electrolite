@@ -132,6 +132,14 @@ func main() {
 			)
 		},
 	})
+	// Empty-OR is vacuously false: this shape matches no rows.
+	app.AddShape("emptyOrShape", electrolite.ShapeDef{
+		Table:   "todos",
+		Columns: []string{"id", "project_id", "title", "done"},
+		Where: func(electrolite.BuildContext) electrolite.Predicate {
+			return electrolite.Or()
+		},
+	})
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/electrolite/", func(w http.ResponseWriter, r *http.Request) {

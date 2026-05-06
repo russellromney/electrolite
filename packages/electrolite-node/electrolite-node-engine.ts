@@ -537,9 +537,13 @@ function compilePredicate(info, predicate) {
       };
     }
     case "or": {
-      const compiled = predicate.predicates.map((child) => compilePredicate(info, child))
-        .filter((child) => child.where);
-      if (compiled.length === 0) {
+      // Empty OR is vacuously false → match nothing.
+      if (predicate.predicates.length === 0) {
+        return { where: "0", params: [] };
+      }
+      const compiled = predicate.predicates.map((child) => compilePredicate(info, child));
+      // If any child compiled to "" (match-all), the whole OR is match-all.
+      if (compiled.some((child) => !child.where)) {
         return { where: "", params: [] };
       }
       return {
