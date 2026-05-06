@@ -23,12 +23,31 @@ def eq(column: str, value: Any) -> Predicate:
     return {"type": "eq", "column": column, "value": value}
 
 
+def gt(column: str, value: Any) -> Predicate:
+    return {"type": "gt", "column": column, "value": value}
+
+
+def lt(column: str, value: Any) -> Predicate:
+    return {"type": "lt", "column": column, "value": value}
+
+
+def gte(column: str, value: Any) -> Predicate:
+    return {"type": "gte", "column": column, "value": value}
+
+
+def lte(column: str, value: Any) -> Predicate:
+    return {"type": "lte", "column": column, "value": value}
+
+
 def in_list(column: str, values: list[Any]) -> Predicate:
     return {"type": "in", "column": column, "values": values}
 
 
 def and_(*predicates: Predicate) -> Predicate:
     return {"type": "and", "predicates": list(predicates)}
+
+
+_RANGE_OPS = {"gt": ">", "lt": "<", "gte": ">=", "lte": "<="}
 
 
 @dataclass
@@ -340,6 +359,11 @@ class Electrolite:
             if value is None:
                 return f"{quote_ident(predicate['column'])} IS NULL", []
             return f"{quote_ident(predicate['column'])} = ?", [value]
+        if predicate["type"] in _RANGE_OPS:
+            value = self._normalize_predicate_value(info, predicate["column"], predicate["value"])
+            if value is None:
+                raise ValueError(f"range predicate {predicate['type']} requires a non-null value")
+            return f"{quote_ident(predicate['column'])} {_RANGE_OPS[predicate['type']]} ?", [value]
         if predicate["type"] == "in":
             values = [self._normalize_predicate_value(info, predicate["column"], value) for value in predicate["values"]]
             non_null = [value for value in values if value is not None]
@@ -374,6 +398,12 @@ class Electrolite:
         if predicate["type"] == "eq":
             return {
                 "type": "eq",
+                "column": predicate["column"],
+                "value": self._normalize_predicate_value(info, predicate["column"], predicate["value"]),
+            }
+        if predicate["type"] in _RANGE_OPS:
+            return {
+                "type": predicate["type"],
                 "column": predicate["column"],
                 "value": self._normalize_predicate_value(info, predicate["column"], predicate["value"]),
             }
@@ -534,11 +564,31 @@ def predicate_matches(predicate: Optional[Predicate], row: Optional[dict[str, An
         return True
     if predicate["type"] == "eq":
         return row.get(predicate["column"]) == predicate["value"]
+    if predicate["type"] in _RANGE_OPS:
+        return _compare_scalar(row.get(predicate["column"]), predicate["value"], predicate["type"])
     if predicate["type"] == "in":
         return row.get(predicate["column"]) in predicate["values"]
     if predicate["type"] == "and":
         return builtins.all(predicate_matches(child, row) for child in predicate["predicates"])
     raise ValueError(f"unsupported predicate type {predicate.get('type')}")
+
+
+def _compare_scalar(left: Any, right: Any, op: str) -> bool:
+    if left is None or right is None:
+        return False
+    if type(left) is bool or type(right) is bool:
+        return False
+    if not isinstance(left, type(right)) and not isinstance(right, type(left)):
+        return False
+    if op == "gt":
+        return left > right
+    if op == "lt":
+        return left < right
+    if op == "gte":
+        return left >= right
+    if op == "lte":
+        return left <= right
+    return False
 
 
 def shape_handle(shape_spec: dict[str, Any]) -> str:

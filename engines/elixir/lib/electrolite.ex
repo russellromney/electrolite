@@ -22,6 +22,12 @@ defmodule Electrolite do
   def shape(opts), do: struct!(Shape, opts)
   def all_pred, do: %{type: :all}
   def eq(column, value), do: %{type: :eq, column: column, value: value}
+  def gt(column, value), do: %{type: :gt, column: column, value: value}
+  def lt(column, value), do: %{type: :lt, column: column, value: value}
+  def gte(column, value), do: %{type: :gte, column: column, value: value}
+  def lte(column, value), do: %{type: :lte, column: column, value: value}
+
+  @range_ops %{gt: ">", lt: "<", gte: ">=", lte: "<="}
 
   # --- public API ---
 
@@ -361,9 +367,28 @@ defmodule Electrolite do
   defp predicate_matches(%{type: :all}, _row), do: true
   defp predicate_matches(%{type: :eq, column: c, value: v}, row), do: Map.get(row, c) == v
 
+  defp predicate_matches(%{type: op, column: c, value: v}, row) when op in [:gt, :lt, :gte, :lte] do
+    compare_scalar(Map.get(row, c), v, op)
+  end
+
+  defp compare_scalar(nil, _, _), do: false
+  defp compare_scalar(_, nil, _), do: false
+  defp compare_scalar(left, right, op) when is_number(left) and is_number(right), do: cmp(left, right, op)
+  defp compare_scalar(left, right, op) when is_binary(left) and is_binary(right), do: cmp(left, right, op)
+  defp compare_scalar(_, _, _), do: false
+
+  defp cmp(a, b, :gt), do: a > b
+  defp cmp(a, b, :lt), do: a < b
+  defp cmp(a, b, :gte), do: a >= b
+  defp cmp(a, b, :lte), do: a <= b
+
   defp compile_predicate(%{type: :all}), do: {"", []}
   defp compile_predicate(%{type: :eq, column: c, value: nil}), do: {"#{quote_ident(c)} IS NULL", []}
   defp compile_predicate(%{type: :eq, column: c, value: v}), do: {"#{quote_ident(c)} = ?", [v]}
+
+  defp compile_predicate(%{type: op, column: c, value: v}) when op in [:gt, :lt, :gte, :lte] do
+    {"#{quote_ident(c)} #{Map.fetch!(@range_ops, op)} ?", [v]}
+  end
 
   defp inspect_table(conn, table) do
     {:ok, rows} = query(conn, "PRAGMA table_info(#{quote_string(table)})", [])
@@ -423,6 +448,9 @@ defmodule Electrolite do
 
   defp predicate_to_json(%{type: :eq, column: c, value: v}),
     do: %{"type" => "eq", "column" => c, "value" => v}
+
+  defp predicate_to_json(%{type: op, column: c, value: v}) when op in [:gt, :lt, :gte, :lte],
+    do: %{"type" => Atom.to_string(op), "column" => c, "value" => v}
 
   defp canonical_json(value) when is_map(value) do
     pairs =

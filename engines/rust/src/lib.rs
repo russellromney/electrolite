@@ -6,13 +6,41 @@
 
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use serde_json::{json, Map, Value as Json};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+
+#[derive(Clone, Debug)]
+pub enum RangeOp {
+    Gt,
+    Lt,
+    Gte,
+    Lte,
+}
+
+impl RangeOp {
+    fn sql(&self) -> &'static str {
+        match self {
+            RangeOp::Gt => ">",
+            RangeOp::Lt => "<",
+            RangeOp::Gte => ">=",
+            RangeOp::Lte => "<=",
+        }
+    }
+    fn key(&self) -> &'static str {
+        match self {
+            RangeOp::Gt => "gt",
+            RangeOp::Lt => "lt",
+            RangeOp::Gte => "gte",
+            RangeOp::Lte => "lte",
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub enum Predicate {
     All,
     Eq { column: String, value: Json },
+    Range { op: RangeOp, column: String, value: Json },
 }
 
 #[derive(Clone, Debug)]
@@ -24,8 +52,7 @@ pub struct Shape {
 
 pub struct Electrolite {
     db: Mutex<Connection>,
-    cv: Condvar,
-    notify_lock: Mutex<u64>,
+    wake: Arc<(Mutex<u64>, Condvar)>,
     pub live_timeout: Duration,
 }
 
@@ -62,10 +89,25 @@ impl From<rusqlite::Error> for Error {
 impl Electrolite {
     pub fn open(path: &str) -> Result<Self, Error> {
         let db = Connection::open(path)?;
+        let wake: Arc<(Mutex<u64>, Condvar)> = Arc::new((Mutex::new(0), Condvar::new()));
+
+        // Use SQLite's update_hook so any row change in this connection
+        // (including writes that don't go through engine.execute()) wakes
+        // subscribers. The hook fires while SQLite's internal lock is held;
+        // waiters will block on the Connection mutex until the write returns.
+        let wake_for_hook = Arc::clone(&wake);
+        db.update_hook(Some(
+            move |_action, _db: &str, _tbl: &str, _rowid: i64| {
+                let (lock, cv) = &*wake_for_hook;
+                let mut g = lock.lock().unwrap();
+                *g = g.wrapping_add(1);
+                cv.notify_all();
+            },
+        ));
+
         let me = Self {
             db: Mutex::new(db),
-            cv: Condvar::new(),
-            notify_lock: Mutex::new(0),
+            wake,
             live_timeout: Duration::from_millis(20_000),
         };
         me.bootstrap()?;
@@ -113,20 +155,14 @@ impl Electrolite {
     }
 
     pub fn execute(&self, sql: &str, args: &[Value]) -> Result<usize, Error> {
-        let n = {
-            let db = self.db.lock().unwrap();
-            db.execute(sql, params_from_iter(args.iter()))?
-        };
-        self.notify();
-        Ok(n)
+        // update_hook handles wake on row changes; no manual notify needed.
+        let db = self.db.lock().unwrap();
+        Ok(db.execute(sql, params_from_iter(args.iter()))?)
     }
 
     pub fn execute_batch(&self, sql: &str) -> Result<(), Error> {
-        {
-            let db = self.db.lock().unwrap();
-            db.execute_batch(sql)?;
-        }
-        self.notify();
+        let db = self.db.lock().unwrap();
+        db.execute_batch(sql)?;
         Ok(())
     }
 
@@ -174,24 +210,21 @@ impl Electrolite {
 
     pub fn write_batch(&self, statements: &[(&str, Vec<Value>)]) -> Result<(), Error> {
         let batch_id = random_hex(16);
-        {
-            let mut db = self.db.lock().unwrap();
-            let tx = db.transaction()?;
-            tx.execute(
-                "INSERT INTO _electrolite_meta (key, value) VALUES ('current_batch_id', ?) \
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![batch_id],
-            )?;
-            for (sql, args) in statements {
-                tx.execute(sql, params_from_iter(args.iter()))?;
-            }
-            tx.execute(
-                "DELETE FROM _electrolite_meta WHERE key = 'current_batch_id'",
-                [],
-            )?;
-            tx.commit()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute(
+            "INSERT INTO _electrolite_meta (key, value) VALUES ('current_batch_id', ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![batch_id],
+        )?;
+        for (sql, args) in statements {
+            tx.execute(sql, params_from_iter(args.iter()))?;
         }
-        self.notify();
+        tx.execute(
+            "DELETE FROM _electrolite_meta WHERE key = 'current_batch_id'",
+            [],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -284,14 +317,9 @@ impl Electrolite {
 
     /// Block until the log changes or live_timeout elapses.
     pub fn wait_for_change(&self) {
-        let lock = self.notify_lock.lock().unwrap();
-        let _ = self.cv.wait_timeout(lock, self.live_timeout).unwrap();
-    }
-
-    fn notify(&self) {
-        let mut g = self.notify_lock.lock().unwrap();
-        *g = g.wrapping_add(1);
-        self.cv.notify_all();
+        let (lock, cv) = &*self.wake;
+        let lock = lock.lock().unwrap();
+        let _ = cv.wait_timeout(lock, self.live_timeout).unwrap();
     }
 
     fn inspect_table(&self, table: &str) -> Result<TableInfo, Error> {
@@ -383,6 +411,32 @@ fn predicate_matches(p: &Predicate, row: &Option<Json>) -> bool {
     match p {
         Predicate::All => true,
         Predicate::Eq { column, value } => row.get(column) == Some(value),
+        Predicate::Range { op, column, value } => match row.get(column) {
+            Some(left) => compare_json(left, value, op),
+            None => false,
+        },
+    }
+}
+
+fn compare_json(left: &Json, right: &Json, op: &RangeOp) -> bool {
+    if left.is_null() || right.is_null() {
+        return false;
+    }
+    let ord = match (left, right) {
+        (Json::Number(a), Json::Number(b)) => match (a.as_f64(), b.as_f64()) {
+            (Some(x), Some(y)) => x.partial_cmp(&y),
+            _ => None,
+        },
+        (Json::String(a), Json::String(b)) => Some(a.cmp(b)),
+        (Json::Bool(a), Json::Bool(b)) => Some(a.cmp(b)),
+        _ => None,
+    };
+    match (ord, op) {
+        (Some(o), RangeOp::Gt) => o == std::cmp::Ordering::Greater,
+        (Some(o), RangeOp::Lt) => o == std::cmp::Ordering::Less,
+        (Some(o), RangeOp::Gte) => o != std::cmp::Ordering::Less,
+        (Some(o), RangeOp::Lte) => o != std::cmp::Ordering::Greater,
+        _ => false,
     }
 }
 
@@ -432,6 +486,15 @@ fn compile_predicate(p: &Predicate) -> (String, Vec<Value>) {
                 (format!("{} = ?", quote_ident(column)), vec![json_to_value(value)])
             }
         }
+        Predicate::Range { op, column, value } => {
+            if value.is_null() {
+                panic!("range predicate {} requires a non-null value", op.key());
+            }
+            (
+                format!("{} {} ?", quote_ident(column), op.sql()),
+                vec![json_to_value(value)],
+            )
+        }
     }
 }
 
@@ -457,6 +520,9 @@ fn normalize(shape: &Shape) -> Json {
     let pred = match &shape.predicate {
         Predicate::All => json!({"type": "all"}),
         Predicate::Eq { column, value } => json!({"type": "eq", "column": column, "value": value}),
+        Predicate::Range { op, column, value } => {
+            json!({"type": op.key(), "column": column, "value": value})
+        }
     };
     json!({
         "table": shape.table,

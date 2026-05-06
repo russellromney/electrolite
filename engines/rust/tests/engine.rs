@@ -1,4 +1,4 @@
-use electrolite::{Electrolite, Predicate, Shape};
+use electrolite::{Electrolite, Predicate, RangeOp, Shape};
 use rusqlite::types::Value;
 use serde_json::json;
 use std::sync::Arc;
@@ -96,6 +96,54 @@ fn replay_insert_update_delete_and_batch() {
         .map(|m| m["batch_id"].as_str().unwrap())
         .collect();
     assert_eq!(ids[0], ids[1]);
+}
+
+#[test]
+fn range_predicate_filters_snapshot_and_replay() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("app.db");
+    let app = Electrolite::open(path.to_str().unwrap()).unwrap();
+    app.execute_batch(
+        r#"
+        CREATE TABLE todos (
+          id INTEGER PRIMARY KEY,
+          priority INTEGER NOT NULL
+        );
+        INSERT INTO todos (id, priority) VALUES (1, 1), (2, 7), (3, 9);
+        "#,
+    )
+    .unwrap();
+    app.install_triggers("todos").unwrap();
+
+    let shape = Shape {
+        table: "todos".into(),
+        columns: vec!["id".into(), "priority".into()],
+        predicate: Predicate::Range {
+            op: RangeOp::Gt,
+            column: "priority".into(),
+            value: json!(5),
+        },
+    };
+
+    let snap = app.snapshot(&shape).unwrap();
+    let ids: Vec<i64> = snap.rows.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![2, 3]);
+
+    app.execute(
+        "INSERT INTO todos (id, priority) VALUES (?, ?)",
+        &[Value::Integer(4), Value::Integer(2)],
+    )
+    .unwrap();
+    app.execute(
+        "INSERT INTO todos (id, priority) VALUES (?, ?)",
+        &[Value::Integer(5), Value::Integer(8)],
+    )
+    .unwrap();
+
+    let r = app.replay(&shape, snap.offset, 100).unwrap();
+    assert_eq!(r.messages.len(), 1);
+    assert_eq!(r.messages[0]["type"], "insert");
+    assert_eq!(r.messages[0]["value"]["id"], 5);
 }
 
 #[test]

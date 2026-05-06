@@ -123,6 +123,56 @@ func TestReplayInsertUpdateDeleteAndBatch(t *testing.T) {
 	}
 }
 
+func TestRangePredicateFiltersSnapshotAndReplay(t *testing.T) {
+	dir := t.TempDir()
+	app, err := Open(filepath.Join(dir, "app.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = app.Close() })
+	if err := app.ExecBatch(`
+		CREATE TABLE todos (id INTEGER PRIMARY KEY, priority INTEGER NOT NULL);
+		INSERT INTO todos (id, priority) VALUES (1, 1), (2, 7), (3, 9);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.InstallTriggers("todos"); err != nil {
+		t.Fatal(err)
+	}
+
+	shape := Shape{
+		Table:     "todos",
+		Columns:   []string{"id", "priority"},
+		Predicate: Gt("priority", 5),
+	}
+
+	snap, err := app.Snapshot(shape)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Rows) != 2 {
+		t.Fatalf("expected 2 rows above threshold, got %d", len(snap.Rows))
+	}
+
+	if _, err := app.Exec("INSERT INTO todos (id, priority) VALUES (?, ?)", 4, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.Exec("INSERT INTO todos (id, priority) VALUES (?, ?)", 5, 8); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := app.Replay(shape, snap.Offset, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Messages) != 1 {
+		t.Fatalf("expected 1 message past threshold, got %d", len(r.Messages))
+	}
+	if r.Messages[0].Type != "insert" {
+		t.Fatalf("expected insert, got %s", r.Messages[0].Type)
+	}
+}
+
 func TestLiveWaitWakesOnChange(t *testing.T) {
 	app := setup(t)
 	app.LiveTimeout = 1 * time.Second

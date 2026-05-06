@@ -3,6 +3,10 @@ import { JsElectroliteEngine } from "./electrolite-node-engine.ts";
 export type ElectrolitePredicate =
   | { type: "all" }
   | { type: "eq"; column: string; value: unknown }
+  | { type: "gt"; column: string; value: unknown }
+  | { type: "lt"; column: string; value: unknown }
+  | { type: "gte"; column: string; value: unknown }
+  | { type: "lte"; column: string; value: unknown }
   | { type: "in"; column: string; values: unknown[] }
   | { type: "and"; predicates: ElectrolitePredicate[] };
 
@@ -71,6 +75,10 @@ type Waiter = () => void;
 
 export const all = (): ElectrolitePredicate => ({ type: "all" });
 export const eq = (column: string, value: unknown): ElectrolitePredicate => ({ type: "eq", column, value });
+export const gt = (column: string, value: unknown): ElectrolitePredicate => ({ type: "gt", column, value });
+export const lt = (column: string, value: unknown): ElectrolitePredicate => ({ type: "lt", column, value });
+export const gte = (column: string, value: unknown): ElectrolitePredicate => ({ type: "gte", column, value });
+export const lte = (column: string, value: unknown): ElectrolitePredicate => ({ type: "lte", column, value });
 export const inList = (column: string, values: unknown[]): ElectrolitePredicate => ({ type: "in", column, values });
 export const and = (predicates: ElectrolitePredicate[]): ElectrolitePredicate => ({ type: "and", predicates });
 

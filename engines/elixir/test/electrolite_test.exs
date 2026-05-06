@@ -83,6 +83,45 @@ defmodule ElectroliteTest do
     assert m1.batch_id == m2.batch_id
   end
 
+  test "range predicate filters snapshot and replay" do
+    dir = System.tmp_dir!() |> Path.join("electrolite-range-#{:rand.uniform(1_000_000)}")
+    File.mkdir_p!(dir)
+    db_path = Path.join(dir, "app.db")
+    {:ok, pid} = Electrolite.start_link(db_path: db_path)
+
+    on_exit(fn ->
+      Process.exit(pid, :normal)
+      File.rm_rf!(dir)
+    end)
+
+    :ok =
+      Electrolite.execute_batch(pid, """
+        CREATE TABLE todos (id INTEGER PRIMARY KEY, priority INTEGER NOT NULL);
+        INSERT INTO todos (id, priority) VALUES (1, 1), (2, 7), (3, 9);
+      """)
+
+    :ok = Electrolite.install_triggers(pid, "todos")
+
+    shape =
+      Electrolite.shape(
+        table: "todos",
+        columns: ["id", "priority"],
+        predicate: Electrolite.gt("priority", 5)
+      )
+
+    {:ok, snap} = Electrolite.snapshot(pid, shape)
+    assert length(snap.rows) == 2
+    assert Enum.map(snap.rows, & &1["id"]) == [2, 3]
+
+    :ok = Electrolite.execute(pid, "INSERT INTO todos (id, priority) VALUES (?, ?)", [4, 2])
+    :ok = Electrolite.execute(pid, "INSERT INTO todos (id, priority) VALUES (?, ?)", [5, 8])
+
+    {:ok, r} = Electrolite.replay(pid, shape, snap.offset, 100)
+    assert length(r.messages) == 1
+    assert hd(r.messages).type == :insert
+    assert hd(r.messages).value["id"] == 5
+  end
+
   test "wait_for_change wakes when log changes", %{pid: pid} do
     {:ok, snap} = Electrolite.snapshot(pid, p1_shape())
     parent = self()

@@ -38,7 +38,18 @@ These are the highest-leverage items before showing this widely.
   - normalized predicate
   - trigger installation status
   - suggested SQLite indexes
-- Add retention auto-compaction with safe per-table defaults.
+- Document a retention pattern per engine. Ship a `compact(table, retention)`
+  helper that runs `DELETE FROM _electrolite_log` past a watermark and
+  updates `retained_offset:<table>` so disconnected clients hit
+  `409 resync_required` cleanly. Policy lives with the user.
+- Targeted live wakeup: replace the single condvar with per-table notify
+  sets in the Python, Rust, Go, and Elixir engines, then per-shape
+  wakeup driven by predicate evaluation against the new log row.
+- Plumb SQLite `update_hook` into engines whose bindings expose it
+  (`rusqlite`, `exqlite`, `node:sqlite`) so writes that bypass the
+  engine's `execute()` wrapper still wake subscribers in-process.
+- Memoize shape handles at registration instead of recomputing the
+  SHA-256 on every snapshot/replay request.
 - Add a public benchmark harness for:
   - snapshot 1k rows
   - replay one change
@@ -56,7 +67,8 @@ These are the highest-leverage items before showing this widely.
 - Keep the fast path focused on simple, indexable predicates:
   - `column = value`
   - `column IN (...)`
-  - simple ranges later
+  - `column >|<|>=|<=  value` (ranges)
+  - `is_null` and `or` are likely the next two if real shapes need them.
 - Add a Shape predicate index in the Node implementation so writes can
   find candidate Shapes before exact membership evaluation.
 - Keep arbitrary SQL out of the browser protocol.
@@ -79,7 +91,12 @@ This only matters once shared Shapes have real traffic.
 - Coalesce identical in-process waits by `shape_handle + offset`.
 - Materialize immutable response chunks by Shape handle and offset.
 - Make historical chunks cacheable with immutable cache headers and ETags.
-- Keep live delivery as HTTP long-polling; WebSockets can be an adapter.
+- Keep live delivery as HTTP long-polling by default. Add Server-Sent
+  Events as a transport upgrade so a single subscriber holds one
+  persistent connection instead of reconnecting per poll. Pair with the
+  existing multi-tab leadership so it's one socket per browser per
+  shape regardless of tab count. WebSockets remain a possible adapter
+  but are overkill for server-push only.
 - Explore CDN request collapsing for identical shared Shape waits.
 
 ## Optional Object Storage Mode

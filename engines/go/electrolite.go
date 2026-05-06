@@ -27,8 +27,14 @@ type Predicate struct {
 	Value  interface{} `json:"value,omitempty"`
 }
 
-func All() Predicate                          { return Predicate{Type: "all"} }
-func Eq(col string, val interface{}) Predicate { return Predicate{Type: "eq", Column: col, Value: val} }
+func All() Predicate                           { return Predicate{Type: "all"} }
+func Eq(col string, val interface{}) Predicate  { return Predicate{Type: "eq", Column: col, Value: val} }
+func Gt(col string, val interface{}) Predicate  { return Predicate{Type: "gt", Column: col, Value: val} }
+func Lt(col string, val interface{}) Predicate  { return Predicate{Type: "lt", Column: col, Value: val} }
+func Gte(col string, val interface{}) Predicate { return Predicate{Type: "gte", Column: col, Value: val} }
+func Lte(col string, val interface{}) Predicate { return Predicate{Type: "lte", Column: col, Value: val} }
+
+var rangeOps = map[string]string{"gt": ">", "lt": "<", "gte": ">=", "lte": "<="}
 
 // Shape is the row subset a client subscribes to.
 type Shape struct {
@@ -530,6 +536,8 @@ func predicateMatches(p Predicate, row map[string]interface{}) bool {
 		return true
 	case "eq":
 		return jsonEqual(row[p.Column], p.Value)
+	case "gt", "lt", "gte", "lte":
+		return compareScalar(row[p.Column], p.Value, p.Type)
 	}
 	return false
 }
@@ -543,8 +551,86 @@ func compilePredicate(p Predicate) (string, []interface{}) {
 			return fmt.Sprintf("%s IS NULL", quoteIdent(p.Column)), nil
 		}
 		return fmt.Sprintf("%s = ?", quoteIdent(p.Column)), []interface{}{p.Value}
+	case "gt", "lt", "gte", "lte":
+		if p.Value == nil {
+			return "0", nil
+		}
+		return fmt.Sprintf("%s %s ?", quoteIdent(p.Column), rangeOps[p.Type]), []interface{}{p.Value}
 	}
 	return "", nil
+}
+
+func compareScalar(left, right interface{}, op string) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	switch l := left.(type) {
+	case float64:
+		r, ok := toFloat(right)
+		if !ok {
+			return false
+		}
+		return cmp(l, r, op)
+	case string:
+		r, ok := right.(string)
+		if !ok {
+			return false
+		}
+		return cmpStr(l, r, op)
+	case bool:
+		// JSON unmarshals booleans rarely show up in range comparisons; skip.
+		return false
+	}
+	if r, ok := toFloat(left); ok {
+		if rr, ok := toFloat(right); ok {
+			return cmp(r, rr, op)
+		}
+	}
+	return false
+}
+
+func toFloat(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	}
+	return 0, false
+}
+
+func cmp(a, b float64, op string) bool {
+	switch op {
+	case "gt":
+		return a > b
+	case "lt":
+		return a < b
+	case "gte":
+		return a >= b
+	case "lte":
+		return a <= b
+	}
+	return false
+}
+
+func cmpStr(a, b, op string) bool {
+	switch op {
+	case "gt":
+		return a > b
+	case "lt":
+		return a < b
+	case "gte":
+		return a >= b
+	case "lte":
+		return a <= b
+	}
+	return false
 }
 
 func rowJSON(prefix string, columns []string) string {

@@ -453,6 +453,8 @@ function messagesForLog(shape, row) {
   return [];
 }
 
+const RANGE_OPS = { gt: ">", lt: "<", gte: ">=", lte: "<=" };
+
 function compilePredicate(info, predicate) {
   switch (predicate?.type) {
     case "all":
@@ -464,6 +466,16 @@ function compilePredicate(info, predicate) {
         return { where: `${quoteIdent(predicate.column)} IS NULL`, params: [] };
       }
       return { where: `${quoteIdent(predicate.column)} = ?`, params: [value] };
+    }
+    case "gt":
+    case "lt":
+    case "gte":
+    case "lte": {
+      const value = normalizePredicateValue(info, predicate.column, predicate.value);
+      if (value === null) {
+        throw new Error(`range predicate ${predicate.type} requires a non-null value`);
+      }
+      return { where: `${quoteIdent(predicate.column)} ${RANGE_OPS[predicate.type]} ?`, params: [value] };
     }
     case "in": {
       const values = predicate.values.map((value) => normalizePredicateValue(info, predicate.column, value));
@@ -507,6 +519,11 @@ function predicateMatches(predicate, row) {
       return true;
     case "eq":
       return sameJsonValue(row[predicate.column], predicate.value);
+    case "gt":
+    case "lt":
+    case "gte":
+    case "lte":
+      return compareScalar(row[predicate.column], predicate.value, predicate.type);
     case "in":
       return predicate.values.some((value) => sameJsonValue(row[predicate.column], value));
     case "and":
@@ -514,6 +531,22 @@ function predicateMatches(predicate, row) {
     default:
       throw new Error(`unsupported predicate type ${predicate?.type}`);
   }
+}
+
+function compareScalar(left, right, op) {
+  if (left === null || left === undefined || right === null || right === undefined) {
+    return false;
+  }
+  if (typeof left !== typeof right) {
+    return false;
+  }
+  switch (op) {
+    case "gt": return left > right;
+    case "lt": return left < right;
+    case "gte": return left >= right;
+    case "lte": return left <= right;
+  }
+  return false;
 }
 
 function normalizeShape(info, shape) {
@@ -532,6 +565,15 @@ function normalizePredicate(info, predicate) {
     case "eq":
       return {
         type: "eq",
+        column: predicate.column,
+        value: normalizePredicateValue(info, predicate.column, predicate.value),
+      };
+    case "gt":
+    case "lt":
+    case "gte":
+    case "lte":
+      return {
+        type: predicate.type,
         column: predicate.column,
         value: normalizePredicateValue(info, predicate.column, predicate.value),
       };

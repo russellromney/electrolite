@@ -4,7 +4,7 @@ import threading
 import time
 import unittest
 
-from electrolite import create_electrolite, eq, shape
+from electrolite import create_electrolite, eq, gt, shape
 
 
 def setup(live_timeout_ms=100):
@@ -151,6 +151,53 @@ class PythonEngineTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["messages"][0]["type"], "insert")
         self.assertEqual(body["messages"][0]["value"]["title"], "live python")
+
+
+class RangePredicateTest(unittest.TestCase):
+    def test_gt_predicate_filters_snapshot_and_replay(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = os.path.join(tmp.name, "app.db")
+        app = create_electrolite(
+            db_path,
+            shapes={
+                "highPriorityTodos": shape(
+                    table="todos",
+                    columns=["id", "project_id", "priority"],
+                    where=lambda ctx: gt("priority", 5),
+                )
+            },
+        )
+        app.execute_batch(
+            """
+            CREATE TABLE todos (
+              id INTEGER PRIMARY KEY,
+              project_id TEXT NOT NULL,
+              priority INTEGER NOT NULL
+            );
+            INSERT INTO todos (id, project_id, priority) VALUES
+              (1, 'p1', 1),
+              (2, 'p1', 7),
+              (3, 'p1', 9);
+            """
+        )
+        app.install_triggers("todos")
+
+        status, snap = app.handle("/electrolite/v1/highPriorityTodos", "offset=-1")
+        self.assertEqual(status, 200)
+        self.assertEqual([row["id"] for row in snap["rows"]], [2, 3])
+
+        # Insert below threshold: should not generate a message.
+        app.execute("INSERT INTO todos (id, project_id, priority) VALUES (?, ?, ?)", [4, "p1", 2])
+        # Insert above threshold: should generate one insert message.
+        app.execute("INSERT INTO todos (id, project_id, priority) VALUES (?, ?, ?)", [5, "p1", 8])
+
+        _, replay = app.handle(
+            "/electrolite/v1/highPriorityTodos",
+            f"offset={snap['offset']}&log_id={snap['log_id']}&shape_handle={snap['shape_handle']}",
+        )
+        self.assertEqual([m["type"] for m in replay["messages"]], ["insert"])
+        self.assertEqual(replay["messages"][0]["value"]["id"], 5)
 
 
 if __name__ == "__main__":

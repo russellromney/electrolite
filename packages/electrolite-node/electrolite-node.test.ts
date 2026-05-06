@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { ShapeClient } from "../../clients/browser/electrolite.js";
-import { createElectrolite, all, eq, inList, shape } from "./electrolite-node.ts";
+import { createElectrolite, all, eq, gt, inList, shape } from "./electrolite-node.ts";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -746,6 +746,51 @@ test("installs replay indexes for table-filtered log reads", async () => {
 
     assert.ok(indexes.includes("_electrolite_log_table_seq_idx"));
     assert.ok(indexes.includes("_electrolite_log_table_batch_seq_idx"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("range predicates filter snapshot and replay", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "electrolite-node-range-"));
+  try {
+    const electrolite = createElectrolite({
+      dbPath: join(dir, "app.db"),
+      liveTimeoutMs: 100,
+      pollIntervalMs: 10,
+      shapes: {
+        highPriorityTodos: shape({
+          table: "todos",
+          columns: ["id", "priority"],
+          where: () => gt("priority", 5),
+        }),
+      },
+    });
+    electrolite.executeBatch(`
+      CREATE TABLE todos (id INTEGER PRIMARY KEY, priority INTEGER NOT NULL);
+    `);
+    electrolite.installTriggers("todos");
+    electrolite.executeBatch(`
+      INSERT INTO todos (id, priority) VALUES (1, 1), (2, 7), (3, 9);
+    `);
+
+    const snap = await (await electrolite.handle(
+      new Request("https://app.test/electrolite/v1/highPriorityTodos?offset=-1"),
+      {},
+    )).json();
+    assert.deepEqual(snap.rows.map((row) => row.id), [2, 3]);
+
+    electrolite.execute("INSERT INTO todos (id, priority) VALUES (?1, ?2)", [4, 2]);
+    electrolite.execute("INSERT INTO todos (id, priority) VALUES (?1, ?2)", [5, 8]);
+
+    const replay = await (await electrolite.handle(
+      new Request(
+        `https://app.test/electrolite/v1/highPriorityTodos?offset=${snap.offset}&log_id=${snap.log_id}&shape_handle=${snap.shape_handle}`,
+      ),
+      {},
+    )).json();
+    assert.deepEqual(replay.messages.map((m) => m.type), ["insert"]);
+    assert.equal(replay.messages[0].value.id, 5);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
