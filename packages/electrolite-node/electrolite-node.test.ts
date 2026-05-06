@@ -524,8 +524,10 @@ test("predicate type policy rejects ambiguous values", async () => {
         new Request(`https://app.test/electrolite/v1/${shapeName}?offset=-1`),
         {},
       );
-      assert.equal(response.status, 500);
-      assert.deepEqual(await response.json(), { error: "internal_server_error" });
+      assert.equal(response.status, 400);
+      const body = await response.json();
+      assert.equal(body.error, "bad_request");
+      assert.equal(typeof body.detail, "string");
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });

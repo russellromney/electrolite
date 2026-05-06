@@ -138,6 +138,13 @@ type errResync struct{}
 
 func (errResync) Error() string { return "resync_required" }
 
+// errBadInput is returned for predicate / argument validation failures
+// (e.g., null in a range predicate, boolean against a non-BOOLEAN
+// column). handle() maps it to 400.
+type errBadInput struct{ msg string }
+
+func (e errBadInput) Error() string { return e.msg }
+
 // Open opens or creates a SQLite database and bootstraps Electrolite tables.
 func Open(path string) (*Electrolite, error) {
 	db, err := sql.Open("sqlite", path)
@@ -202,8 +209,18 @@ func (e *Electrolite) bootstrap() error {
 	var existing string
 	err := e.db.QueryRow("SELECT value FROM _electrolite_meta WHERE key = 'log_id'").Scan(&existing)
 	if err == sql.ErrNoRows {
-		_, err = e.db.Exec("INSERT INTO _electrolite_meta (key, value) VALUES ('log_id', ?)", randomHex(16))
+		if _, err := e.db.Exec("INSERT INTO _electrolite_meta (key, value) VALUES ('log_id', ?)", randomHex(16)); err != nil {
+			return err
+		}
+		err = nil
 	}
+	if err != nil {
+		return err
+	}
+	// A crashed write_batch may have left current_batch_id behind;
+	// clear it so the next unrelated write does not inherit a dead
+	// batch_id.
+	_, err = e.db.Exec("DELETE FROM _electrolite_meta WHERE key = 'current_batch_id'")
 	return err
 }
 
@@ -353,7 +370,12 @@ func (e *Electrolite) Snapshot(s Shape) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	whereSQL, args := compilePredicate(s.Predicate)
+	normalized, err := normalizePredicate(info, s.Predicate)
+	if err != nil {
+		return nil, err
+	}
+	s.Predicate = normalized
+	whereSQL, args := compilePredicate(normalized)
 	q := fmt.Sprintf("SELECT %s FROM %s", rowJSON("", s.Columns), quoteIdent(s.Table))
 	if whereSQL != "" {
 		q += " WHERE " + whereSQL
@@ -399,9 +421,15 @@ func (e *Electrolite) Replay(s Shape, offset, limit int64) (*Replay, error) {
 	if s.SchemaVersion == 0 {
 		s.SchemaVersion = 1
 	}
-	if _, err := e.watchedInfo(s.Table); err != nil {
+	info, err := e.watchedInfo(s.Table)
+	if err != nil {
 		return nil, err
 	}
+	normalized, err := normalizePredicate(info, s.Predicate)
+	if err != nil {
+		return nil, err
+	}
+	s.Predicate = normalized
 	retained, err := e.retainedOffset(s.Table)
 	if err != nil {
 		return nil, err
@@ -544,6 +572,9 @@ func (e *Electrolite) Handle(path, query string, context interface{}) HandleResp
 			if _, ok := err.(errResync); ok {
 				return HandleResponse{Status: 409, Body: errBody("resync_required")}
 			}
+			if be, ok := err.(errBadInput); ok {
+				return HandleResponse{Status: 400, Body: map[string]string{"error": "bad_request", "detail": be.msg}}
+			}
 			return HandleResponse{Status: 500, Body: errBody("internal")}
 		}
 		return HandleResponse{Status: 200, Body: map[string]interface{}{
@@ -562,6 +593,9 @@ func (e *Electrolite) Handle(path, query string, context interface{}) HandleResp
 		if _, ok := err.(errResync); ok {
 			return HandleResponse{Status: 409, Body: errBody("resync_required")}
 		}
+		if be, ok := err.(errBadInput); ok {
+			return HandleResponse{Status: 400, Body: map[string]string{"error": "bad_request", "detail": be.msg}}
+		}
 		return HandleResponse{Status: 500, Body: errBody("internal")}
 	}
 	if route.Live && len(body.Messages) == 0 && body.UpToDate {
@@ -570,6 +604,9 @@ func (e *Electrolite) Handle(path, query string, context interface{}) HandleResp
 		if err != nil {
 			if _, ok := err.(errResync); ok {
 				return HandleResponse{Status: 409, Body: errBody("resync_required")}
+			}
+			if be, ok := err.(errBadInput); ok {
+				return HandleResponse{Status: 400, Body: map[string]string{"error": "bad_request", "detail": be.msg}}
 			}
 			return HandleResponse{Status: 500, Body: errBody("internal")}
 		}
@@ -673,8 +710,86 @@ func (e *Electrolite) retainedOffset(table string) (int64, error) {
 }
 
 type tableInfo struct {
-	Columns []string
-	PK      []string
+	Columns     []string
+	PK          []string
+	ColumnTypes map[string]string
+}
+
+func isBooleanish(decl string) bool {
+	return strings.Contains(strings.ToUpper(decl), "BOOL")
+}
+
+// normalizeValue coerces a single predicate value against a column's
+// declared type. Booleans against BOOLEAN-affinity columns become 0/1.
+// Booleans against any other column are an error.
+func normalizeValue(info *tableInfo, column string, value interface{}) (interface{}, error) {
+	hasColumn := false
+	for _, c := range info.Columns {
+		if c == column {
+			hasColumn = true
+			break
+		}
+	}
+	if !hasColumn {
+		return nil, errBadInput{msg: fmt.Sprintf("predicate column %s does not exist", column)}
+	}
+	colType := info.ColumnTypes[column]
+	if b, ok := value.(bool); ok {
+		if isBooleanish(colType) {
+			if b {
+				return 1, nil
+			}
+			return 0, nil
+		}
+		return nil, errBadInput{msg: "boolean predicates require BOOLEAN columns"}
+	}
+	return value, nil
+}
+
+// normalizePredicate walks a predicate tree and coerces values against
+// the table info. Single normalization site; downstream code uses the
+// already-normalized predicate.
+func normalizePredicate(info *tableInfo, p Predicate) (Predicate, error) {
+	switch p.Type {
+	case "all", "":
+		return Predicate{Type: "all"}, nil
+	case "eq":
+		v, err := normalizeValue(info, p.Column, p.Value)
+		if err != nil {
+			return Predicate{}, err
+		}
+		return Predicate{Type: "eq", Column: p.Column, Value: v}, nil
+	case "gt", "lt", "gte", "lte":
+		if p.Value == nil {
+			return Predicate{}, errBadInput{msg: fmt.Sprintf("range predicate %s requires a non-null value", p.Type)}
+		}
+		v, err := normalizeValue(info, p.Column, p.Value)
+		if err != nil {
+			return Predicate{}, err
+		}
+		return Predicate{Type: p.Type, Column: p.Column, Value: v}, nil
+	case "in":
+		out := make([]interface{}, 0, len(p.Values))
+		for _, v := range p.Values {
+			nv, err := normalizeValue(info, p.Column, v)
+			if err != nil {
+				return Predicate{}, err
+			}
+			out = append(out, nv)
+		}
+		return Predicate{Type: "in", Column: p.Column, Values: out}, nil
+	case "and":
+		children := make([]Predicate, 0, len(p.Predicates))
+		for _, c := range p.Predicates {
+			nc, err := normalizePredicate(info, c)
+			if err != nil {
+				return Predicate{}, err
+			}
+			children = append(children, nc)
+		}
+		return Predicate{Type: "and", Predicates: children}, nil
+	}
+	return Predicate{}, fmt.Errorf("unsupported predicate type %s", p.Type)
 }
 
 func (e *Electrolite) inspectTable(name string) (*tableInfo, error) {
@@ -684,9 +799,10 @@ func (e *Electrolite) inspectTable(name string) (*tableInfo, error) {
 	}
 	defer rows.Close()
 	type col struct {
-		cid  int
-		name string
-		pk   int
+		cid     int
+		name    string
+		colType string
+		pk      int
 	}
 	var cs []col
 	for rows.Next() {
@@ -696,15 +812,17 @@ func (e *Electrolite) inspectTable(name string) (*tableInfo, error) {
 		if err := rows.Scan(&c.cid, &c.name, &typeName, &notnull, &dflt, &c.pk); err != nil {
 			return nil, err
 		}
+		c.colType = typeName.String
 		cs = append(cs, c)
 	}
 	if len(cs) == 0 {
 		return nil, fmt.Errorf("table %s does not exist", name)
 	}
 	sort.Slice(cs, func(i, j int) bool { return cs[i].cid < cs[j].cid })
-	info := &tableInfo{}
+	info := &tableInfo{ColumnTypes: map[string]string{}}
 	for _, c := range cs {
 		info.Columns = append(info.Columns, c.name)
+		info.ColumnTypes[c.name] = c.colType
 	}
 	pks := make([]col, 0)
 	for _, c := range cs {

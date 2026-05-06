@@ -310,6 +310,12 @@ export class JsElectroliteEngine {
       SELECT 'log_id', ?
       WHERE NOT EXISTS (SELECT 1 FROM _electrolite_meta WHERE key = 'log_id')
     `).run(randomHex(16));
+    // A crashed write_batch may have left current_batch_id behind;
+    // clear it so the next unrelated write does not inherit a dead
+    // batch_id.
+    this.db.prepare(
+      "DELETE FROM _electrolite_meta WHERE key = 'current_batch_id'",
+    ).run();
   }
 
   validatedWatchedTable(shape: Shape): TableInfo {
@@ -473,7 +479,7 @@ function compilePredicate(info, predicate) {
     case "lte": {
       const value = normalizePredicateValue(info, predicate.column, predicate.value);
       if (value === null) {
-        throw new Error(`range predicate ${predicate.type} requires a non-null value`);
+        throw badInputError(`range predicate ${predicate.type} requires a non-null value`);
       }
       return { where: `${quoteIdent(predicate.column)} ${RANGE_OPS[predicate.type]} ?`, params: [value] };
     }
@@ -598,7 +604,7 @@ function normalizePredicate(info, predicate) {
 
 function normalizePredicateValue(info, column, value) {
   if (!info.columns.includes(column)) {
-    throw new Error(`predicate column ${column} does not exist on ${info.table}`);
+    throw badInputError(`predicate column ${column} does not exist on ${info.table}`);
   }
   const columnType = columnTypeInfo(info.columnTypes[column]);
   if (value === null) {
@@ -638,7 +644,16 @@ function normalizePredicateValue(info, column, value) {
 }
 
 function unsupportedPredicateValue(value) {
-  return new Error(`unsupported predicate value ${JSON.stringify(value)}`);
+  const err = new Error(`unsupported predicate value ${JSON.stringify(value)}`);
+  // Tag so handle() can map to 400 rather than 500.
+  err.electroliteBadInput = true;
+  return err;
+}
+
+function badInputError(message) {
+  const err = new Error(message);
+  err.electroliteBadInput = true;
+  return err;
 }
 
 function isBooleanish(type) {
@@ -677,7 +692,27 @@ function canonicalShape(shape) {
 }
 
 function shapeHandleFor(shape) {
-  return createHash("sha256").update(JSON.stringify(canonicalShape(shape))).digest("hex");
+  return createHash("sha256").update(canonicalJson(canonicalShape(shape))).digest("hex");
+}
+
+// Canonical JSON: sorted keys at every nesting level, no whitespace.
+// Must produce identical bytes to Python's json.dumps(sort_keys=True,
+// separators=(",", ":")) and to the Rust/Go/Elixir canonical encoders.
+function canonicalJson(value) {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return "[" + value.map(canonicalJson).join(",") + "]";
+  }
+  const keys = Object.keys(value).sort();
+  return (
+    "{" +
+    keys
+      .map((key) => JSON.stringify(key) + ":" + canonicalJson(value[key]))
+      .join(",") +
+    "}"
+  );
 }
 
 function sameJsonValue(left, right) {

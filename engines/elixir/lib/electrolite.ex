@@ -77,8 +77,10 @@ defmodule Electrolite do
         response
 
       {:wait, shape, offset, timeout_ms} ->
+        # The GenServer registered us as a subscriber atomically with
+        # this reply, closing the TOCTOU window where a writer could
+        # notify before we asked to be subscribed.
         engine_pid = GenServer.whereis(pid) || pid
-        :ok = GenServer.call(pid, :subscribe_change, :infinity)
 
         receive do
           {:electrolite_change, ^engine_pid} -> :ok
@@ -194,8 +196,18 @@ defmodule Electrolite do
 
   def handle_call(:log_id, _from, state), do: {:reply, fetch_log_id(state.conn), state}
 
-  def handle_call({:handle_initial, path, query, context}, _from, state) do
-    {:reply, do_handle_initial(state, path, query, context), state}
+  def handle_call({:handle_initial, path, query, context}, {from_pid, _ref}, state) do
+    case do_handle_initial(state, path, query, context) do
+      {:wait, shape, offset, timeout_ms} ->
+        # Pre-register the caller as a subscriber so a notify that
+        # fires after this reply but before the caller's receive is
+        # still delivered.
+        new_state = %{state | subscribers: MapSet.put(state.subscribers, from_pid)}
+        {:reply, {:wait, shape, offset, timeout_ms}, new_state}
+
+      reply ->
+        {:reply, reply, state}
+    end
   end
 
   def handle_call({:replay_for_handle, %Shape{} = shape, offset}, _from, state) do
@@ -255,6 +267,7 @@ defmodule Electrolite do
             case do_snapshot(state.conn, shape) do
               {:ok, snap} -> {:reply, {200, snapshot_to_body(snap)}}
               {:error, :resync_required} -> {:reply, {409, %{"error" => "resync_required"}}}
+              {:error, {:bad_input, msg}} -> {:reply, {400, %{"error" => "bad_request", "detail" => msg}}}
               {:error, _} -> {:reply, {500, %{"error" => "internal"}}}
             end
 
@@ -272,6 +285,9 @@ defmodule Electrolite do
               {:error, :resync_required} ->
                 {:reply, {409, %{"error" => "resync_required"}}}
 
+              {:error, {:bad_input, msg}} ->
+                {:reply, {400, %{"error" => "bad_request", "detail" => msg}}}
+
               {:error, _} ->
                 {:reply, {500, %{"error" => "internal"}}}
             end
@@ -283,6 +299,7 @@ defmodule Electrolite do
     else
       :not_found -> {:reply, {404, %{"error" => "shape_not_found"}}}
       {:error, :not_found} -> {:reply, {404, %{"error" => "shape_not_found"}}}
+      {:error, :bad_offset} -> {:reply, {400, %{"error" => "bad_request", "detail" => "offset must be an integer"}}}
       {:error, _} -> {:reply, {500, %{"error" => "internal"}}}
     end
   end
@@ -334,24 +351,33 @@ defmodule Electrolite do
       else
         qp = parse_qs(query)
 
-        offset =
-          case Map.get(qp, "offset") do
-            nil -> -1
-            v -> String.to_integer(v)
-          end
+        case parse_offset(Map.get(qp, "offset")) do
+          {:ok, offset} ->
+            {:ok,
+             %{
+               name: hd(parts),
+               params: tl(parts),
+               offset: offset,
+               live: Map.get(qp, "live") == "true",
+               log_id: Map.get(qp, "log_id"),
+               shape_handle: Map.get(qp, "shape_handle")
+             }}
 
-        {:ok,
-         %{
-           name: hd(parts),
-           params: tl(parts),
-           offset: offset,
-           live: Map.get(qp, "live") == "true",
-           log_id: Map.get(qp, "log_id"),
-           shape_handle: Map.get(qp, "shape_handle")
-         }}
+          :error ->
+            {:error, :bad_offset}
+        end
       end
     else
       :not_found
+    end
+  end
+
+  defp parse_offset(nil), do: {:ok, -1}
+
+  defp parse_offset(value) do
+    case Integer.parse(value) do
+      {n, ""} -> {:ok, n}
+      _ -> :error
     end
   end
 
@@ -427,6 +453,12 @@ defmodule Electrolite do
       _ ->
         :ok
     end
+
+    # A crashed write_batch may have left current_batch_id behind;
+    # clear it so the next unrelated write does not inherit a dead
+    # batch_id.
+    :ok = exec(conn, "DELETE FROM _electrolite_meta WHERE key = 'current_batch_id'", [])
+    :ok
   end
 
   defp do_install_triggers(conn, table) do
@@ -479,8 +511,10 @@ defmodule Electrolite do
   # ---- snapshot / replay / compact ----
 
   defp do_snapshot(conn, %Shape{} = shape) do
-    with {:ok, info} <- watched_info(conn, shape.table) do
-      {where_sql, args} = compile_predicate(shape.predicate)
+    with {:ok, info} <- watched_info(conn, shape.table),
+         {:ok, np} <- normalize_predicate_tree(info, shape.predicate) do
+      shape = %{shape | predicate: np}
+      {where_sql, args} = compile_predicate(np)
 
       sql =
         "SELECT #{row_json("", shape.columns)} FROM #{quote_ident(shape.table)}" <>
@@ -504,7 +538,9 @@ defmodule Electrolite do
   end
 
   defp do_replay(conn, %Shape{} = shape, offset, limit) do
-    with {:ok, _info} <- watched_info(conn, shape.table) do
+    with {:ok, info} <- watched_info(conn, shape.table),
+         {:ok, np} <- normalize_predicate_tree(info, shape.predicate) do
+      shape = %{shape | predicate: np}
       {:ok, retained} = retained_offset(conn, shape.table)
 
       if offset < retained do
@@ -744,13 +780,94 @@ defmodule Electrolite do
       sorted = Enum.sort_by(rows, fn [cid | _] -> cid end)
       columns = Enum.map(sorted, fn [_, name | _] -> name end)
 
+      column_types =
+        sorted
+        |> Enum.map(fn [_, name, type | _] -> {name, type || ""} end)
+        |> Map.new()
+
       pk =
         sorted
         |> Enum.filter(fn row -> Enum.at(row, 5) > 0 end)
         |> Enum.sort_by(fn row -> Enum.at(row, 5) end)
         |> Enum.map(fn [_, name | _] -> name end)
 
-      {:ok, %{columns: columns, pk: pk}}
+      {:ok, %{columns: columns, pk: pk, column_types: column_types}}
+    end
+  end
+
+  defp is_booleanish(decl) when is_binary(decl) do
+    String.contains?(String.upcase(decl), "BOOL")
+  end
+
+  defp is_booleanish(_), do: false
+
+  defp normalize_value(info, column, value) do
+    if column not in info.columns do
+      {:error, {:bad_input, "predicate column #{column} does not exist"}}
+    else
+      col_type = Map.get(info.column_types || %{}, column, "")
+
+      cond do
+        is_boolean(value) and is_booleanish(col_type) ->
+          {:ok, if(value, do: 1, else: 0)}
+
+        is_boolean(value) ->
+          {:error, {:bad_input, "boolean predicates require BOOLEAN columns"}}
+
+        true ->
+          {:ok, value}
+      end
+    end
+  end
+
+  defp normalize_predicate_tree(_info, %{type: :all} = p), do: {:ok, p}
+
+  defp normalize_predicate_tree(info, %{type: :eq, column: c, value: v}) do
+    with {:ok, nv} <- normalize_value(info, c, v) do
+      {:ok, %{type: :eq, column: c, value: nv}}
+    end
+  end
+
+  defp normalize_predicate_tree(info, %{type: op, column: c, value: v})
+       when op in [:gt, :lt, :gte, :lte] do
+    cond do
+      is_nil(v) ->
+        {:error, {:bad_input, "range predicate #{op} requires a non-null value"}}
+
+      true ->
+        with {:ok, nv} <- normalize_value(info, c, v) do
+          {:ok, %{type: op, column: c, value: nv}}
+        end
+    end
+  end
+
+  defp normalize_predicate_tree(info, %{type: :in, column: c, values: vs}) do
+    nvs =
+      Enum.reduce_while(vs, {:ok, []}, fn v, {:ok, acc} ->
+        case normalize_value(info, c, v) do
+          {:ok, nv} -> {:cont, {:ok, [nv | acc]}}
+          err -> {:halt, err}
+        end
+      end)
+
+    case nvs do
+      {:ok, vs} -> {:ok, %{type: :in, column: c, values: Enum.reverse(vs)}}
+      err -> err
+    end
+  end
+
+  defp normalize_predicate_tree(info, %{type: :and, predicates: children}) do
+    nchildren =
+      Enum.reduce_while(children, {:ok, []}, fn c, {:ok, acc} ->
+        case normalize_predicate_tree(info, c) do
+          {:ok, nc} -> {:cont, {:ok, [nc | acc]}}
+          err -> {:halt, err}
+        end
+      end)
+
+    case nchildren do
+      {:ok, cs} -> {:ok, %{type: :and, predicates: Enum.reverse(cs)}}
+      err -> err
     end
   end
 

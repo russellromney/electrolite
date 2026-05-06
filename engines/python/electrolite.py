@@ -198,6 +198,8 @@ class Electrolite:
             return 200, body
         except ResyncRequired:
             return 409, {"error": "resync_required"}
+        except BadInput as e:
+            return 400, {"error": "bad_request", "detail": str(e)}
 
     def snapshot(self, shape_spec: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
@@ -288,6 +290,10 @@ class Electrolite:
             """,
             (secrets.token_hex(16),),
         )
+        # A crashed write_batch may have left current_batch_id behind.
+        # If we don't clear it, the next unrelated write would be tagged
+        # as part of the dead batch.
+        self.db.execute("DELETE FROM _electrolite_meta WHERE key = 'current_batch_id'")
         self.db.commit()
 
     def _install_trigger_sql(self, info: dict[str, Any]) -> None:
@@ -383,7 +389,7 @@ class Electrolite:
         if predicate["type"] in _RANGE_OPS:
             value = self._normalize_predicate_value(info, predicate["column"], predicate["value"])
             if value is None:
-                raise ValueError(f"range predicate {predicate['type']} requires a non-null value")
+                raise BadInput(f"range predicate {predicate['type']} requires a non-null value")
             return f"{quote_ident(predicate['column'])} {_RANGE_OPS[predicate['type']]} ?", [value]
         if predicate["type"] == "in":
             values = [self._normalize_predicate_value(info, predicate["column"], value) for value in predicate["values"]]
@@ -443,7 +449,7 @@ class Electrolite:
 
     def _normalize_predicate_value(self, info: dict[str, Any], column: str, value: Any) -> Any:
         if column not in info["columns"]:
-            raise ValueError(f"predicate column {column} does not exist")
+            raise BadInput(f"predicate column {column} does not exist")
         if value is None:
             return None
         column_type = str(info["column_types"].get(column, "")).upper()
@@ -451,7 +457,7 @@ class Electrolite:
         if isinstance(value, bool):
             if booleanish:
                 return 1 if value else 0
-            raise ValueError("boolean predicates require BOOLEAN columns")
+            raise BadInput("boolean predicates require BOOLEAN columns")
         return value
 
     def _read_log_page(self, table: str, offset: int, limit: int) -> dict[str, Any]:
@@ -504,10 +510,15 @@ class Electrolite:
         if not parts:
             return None
         query_dict = parse_query(query)
+        offset_raw = first(query_dict.get("offset"), "-1")
+        try:
+            offset = int(offset_raw)
+        except (TypeError, ValueError):
+            raise BadInput(f"offset must be an integer, got {offset_raw!r}")
         return {
             "name": parts[0],
             "params": parts[1:],
-            "offset": int(first(query_dict.get("offset"), "-1")),
+            "offset": offset,
             "live": first(query_dict.get("live"), "false") == "true",
             "log_id": first(query_dict.get("log_id")),
             "shape_handle": first(query_dict.get("shape_handle")),
@@ -533,6 +544,11 @@ class Electrolite:
 
 
 class ResyncRequired(Exception):
+    pass
+
+
+class BadInput(ValueError):
+    """Predicate or argument validation failure → 400."""
     pass
 
 

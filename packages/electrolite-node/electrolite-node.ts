@@ -247,7 +247,10 @@ export class Electrolite<TContext = unknown> {
     if (route.offset < 0) {
       try {
         return jsonResponse(JSON.parse(this.engine.snapshot(JSON.stringify(built.shape))));
-      } catch {
+      } catch (error) {
+        if (isBadInputError(error)) {
+          return badInputResponse(error);
+        }
         return jsonError(500, "internal_server_error");
       }
     }
@@ -305,6 +308,9 @@ export class Electrolite<TContext = unknown> {
       if (isResyncError(error)) {
         return jsonError(409, "resync_required");
       }
+      if (isBadInputError(error)) {
+        return badInputResponse(error);
+      }
       return jsonError(500, "internal_server_error");
     }
   }
@@ -323,6 +329,9 @@ export class Electrolite<TContext = unknown> {
         } catch (error) {
           if (isResyncError(error)) {
             return jsonError(409, "resync_required");
+          }
+          if (isBadInputError(error)) {
+            return badInputResponse(error);
           }
           return jsonError(500, "internal_server_error");
         }
@@ -436,6 +445,17 @@ function isResyncError(error) {
     message.includes("resync")
     || message.includes("requested offset")
     || message.includes("older than retained offset")
+  );
+}
+
+function isBadInputError(error) {
+  return Boolean(error?.electroliteBadInput);
+}
+
+function badInputResponse(error) {
+  return Response.json(
+    { error: "bad_request", detail: String(error?.message ?? error) },
+    { status: 400 },
   );
 }
 

@@ -199,6 +199,7 @@ pub struct CompactStats {
 pub enum Error {
     Sqlite(rusqlite::Error),
     Bad(String),
+    BadInput(String),
     ResyncRequired,
 }
 
@@ -289,6 +290,13 @@ impl Electrolite {
                 params![random_hex(16)],
             )?;
         }
+        // A crashed write_batch may have left current_batch_id behind;
+        // clear it so the next unrelated write does not inherit a dead
+        // batch_id.
+        db.execute(
+            "DELETE FROM _electrolite_meta WHERE key = 'current_batch_id'",
+            [],
+        )?;
         Ok(())
     }
 
@@ -395,8 +403,16 @@ impl Electrolite {
 
     pub fn snapshot(&self, shape: &Shape) -> Result<Snapshot, Error> {
         let info = self.watched_info(&shape.table)?;
-        let normalized = normalize_shape(shape);
-        let (where_sql, args) = compile_predicate(&shape.predicate);
+        let normalized_predicate = normalize_predicate(&info, &shape.predicate)?;
+        let normalized_shape = Shape {
+            table: shape.table.clone(),
+            columns: shape.columns.clone(),
+            predicate: normalized_predicate.clone(),
+            auth_scope: shape.auth_scope.clone(),
+            schema_version: shape.schema_version,
+        };
+        let normalized = normalize_shape(&normalized_shape);
+        let (where_sql, args) = compile_predicate(&normalized_predicate);
         let mut sql = format!(
             "SELECT {} AS row_json FROM {}",
             row_json("", &shape.columns),
@@ -435,8 +451,16 @@ impl Electrolite {
     }
 
     pub fn replay(&self, shape: &Shape, offset: i64, limit: i64) -> Result<Replay, Error> {
-        let _info = self.watched_info(&shape.table)?;
-        let normalized = normalize_shape(shape);
+        let info = self.watched_info(&shape.table)?;
+        let normalized_predicate = normalize_predicate(&info, &shape.predicate)?;
+        let normalized_shape = Shape {
+            table: shape.table.clone(),
+            columns: shape.columns.clone(),
+            predicate: normalized_predicate.clone(),
+            auth_scope: shape.auth_scope.clone(),
+            schema_version: shape.schema_version,
+        };
+        let normalized = normalize_shape(&normalized_shape);
         let db = self.db.lock().unwrap();
         let retained = retained_offset(&db, &shape.table)?;
         if offset < retained {
@@ -473,7 +497,7 @@ impl Electrolite {
 
         let mut messages = Vec::new();
         for r in &rows {
-            messages.extend(messages_for(&shape.predicate, r));
+            messages.extend(messages_for(&normalized_predicate, r));
         }
         Ok(Replay {
             log_id: log_id(&db)?,
@@ -569,6 +593,7 @@ impl Electrolite {
             return match self.snapshot(&shape) {
                 Ok(s) => (200, snapshot_to_json(&s)),
                 Err(Error::ResyncRequired) => (409, json!({"error": "resync_required"})),
+                Err(Error::BadInput(msg)) => (400, json!({"error": "bad_request", "detail": msg})),
                 Err(_) => (500, json!({"error": "internal"})),
             };
         }
@@ -576,6 +601,9 @@ impl Electrolite {
         let body = match self.replay(&shape, route.offset, self.replay_limit) {
             Ok(b) => b,
             Err(Error::ResyncRequired) => return (409, json!({"error": "resync_required"})),
+            Err(Error::BadInput(msg)) => {
+                return (400, json!({"error": "bad_request", "detail": msg}))
+            }
             Err(_) => return (500, json!({"error": "internal"})),
         };
         if route.live && body.messages.is_empty() && body.up_to_date {
@@ -584,6 +612,9 @@ impl Electrolite {
             let body = match self.replay(&shape, route.offset, self.replay_limit) {
                 Ok(b) => b,
                 Err(Error::ResyncRequired) => return (409, json!({"error": "resync_required"})),
+                Err(Error::BadInput(msg)) => {
+                    return (400, json!({"error": "bad_request", "detail": msg}))
+                }
                 Err(_) => return (500, json!({"error": "internal"})),
             };
             return (200, replay_to_json(&body));
@@ -629,24 +660,34 @@ impl Electrolite {
     fn inspect_table(&self, table: &str) -> Result<TableInfo, Error> {
         let db = self.db.lock().unwrap();
         let mut stmt = db.prepare(&format!("PRAGMA table_info({})", quote_string(table)))?;
-        let mut cols: Vec<(i64, String, i64)> = stmt
+        let mut cols: Vec<(i64, String, String, i64)> = stmt
             .query_map([], |r| {
                 let cid: i64 = r.get(0)?;
                 let name: String = r.get(1)?;
+                let col_type: String = r.get(2).unwrap_or_default();
                 let pk: i64 = r.get(5)?;
-                Ok((cid, name, pk))
+                Ok((cid, name, col_type, pk))
             })?
             .collect::<Result<_, _>>()?;
         if cols.is_empty() {
             return Err(Error::Bad(format!("table {table} does not exist")));
         }
         cols.sort_by_key(|c| c.0);
-        let columns = cols.iter().map(|c| c.1.clone()).collect();
-        let mut pks: Vec<(i64, String)> =
-            cols.into_iter().filter(|c| c.2 > 0).map(|c| (c.2, c.1)).collect();
+        let columns: Vec<String> = cols.iter().map(|c| c.1.clone()).collect();
+        let column_types: HashMap<String, String> =
+            cols.iter().map(|c| (c.1.clone(), c.2.clone())).collect();
+        let mut pks: Vec<(i64, String)> = cols
+            .into_iter()
+            .filter(|c| c.3 > 0)
+            .map(|c| (c.3, c.1))
+            .collect();
         pks.sort_by_key(|c| c.0);
         let pk = pks.into_iter().map(|c| c.1).collect();
-        Ok(TableInfo { columns, pk })
+        Ok(TableInfo {
+            columns,
+            pk,
+            column_types,
+        })
     }
 
     fn watched_info(&self, table: &str) -> Result<TableInfo, Error> {
@@ -665,6 +706,7 @@ impl Electrolite {
         Ok(TableInfo {
             columns: info.columns,
             pk,
+            column_types: info.column_types,
         })
     }
 }
@@ -681,6 +723,83 @@ struct Route {
 struct TableInfo {
     columns: Vec<String>,
     pk: Vec<String>,
+    column_types: HashMap<String, String>,
+}
+
+fn is_booleanish(decl: &str) -> bool {
+    let upper = decl.to_uppercase();
+    upper.contains("BOOL")
+}
+
+/// Coerce a single predicate value against a column's declared type.
+/// Booleans against BOOLEAN-affinity columns become 0/1. Booleans
+/// against any other column are an error. Null stays null.
+fn normalize_value(info: &TableInfo, column: &str, value: &Json) -> Result<Json, Error> {
+    if !info.columns.iter().any(|c| c == column) {
+        return Err(Error::BadInput(format!(
+            "predicate column {column} does not exist"
+        )));
+    }
+    let column_type = info
+        .column_types
+        .get(column)
+        .map(String::as_str)
+        .unwrap_or("");
+    match value {
+        Json::Bool(b) => {
+            if is_booleanish(column_type) {
+                Ok(json!(if *b { 1 } else { 0 }))
+            } else {
+                Err(Error::BadInput(
+                    "boolean predicates require BOOLEAN columns".into(),
+                ))
+            }
+        }
+        _ => Ok(value.clone()),
+    }
+}
+
+/// Walk a predicate tree and coerce every value against the table info.
+/// This is the single normalization site; everything downstream
+/// (compile_predicate, predicate_matches, predicate_to_json) must
+/// receive an already-normalized predicate.
+fn normalize_predicate(info: &TableInfo, p: &Predicate) -> Result<Predicate, Error> {
+    Ok(match p {
+        Predicate::All => Predicate::All,
+        Predicate::Eq { column, value } => Predicate::Eq {
+            column: column.clone(),
+            value: normalize_value(info, column, value)?,
+        },
+        Predicate::Range { op, column, value } => {
+            if value.is_null() {
+                return Err(Error::BadInput(format!(
+                    "range predicate {} requires a non-null value",
+                    op.key()
+                )));
+            }
+            Predicate::Range {
+                op: op.clone(),
+                column: column.clone(),
+                value: normalize_value(info, column, value)?,
+            }
+        }
+        Predicate::In { column, values } => {
+            let values = values
+                .iter()
+                .map(|v| normalize_value(info, column, v))
+                .collect::<Result<Vec<_>, _>>()?;
+            Predicate::In {
+                column: column.clone(),
+                values,
+            }
+        }
+        Predicate::And(children) => Predicate::And(
+            children
+                .iter()
+                .map(|c| normalize_predicate(info, c))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+    })
 }
 
 #[derive(Clone)]
