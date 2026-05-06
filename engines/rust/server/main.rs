@@ -15,6 +15,14 @@ use std::time::Duration;
 use tiny_http::{Header, Method, Response, Server};
 
 fn main() {
+    if env::var("ELECTROLITE_TEST_SERVER").as_deref() != Ok("1") {
+        eprintln!(
+            "engines/rust/server is a test-only HTTP server with an \
+             unauthenticated /_test/exec endpoint. Set \
+             ELECTROLITE_TEST_SERVER=1 to launch it."
+        );
+        std::process::exit(1);
+    }
     let mut port: u16 = 0;
     let mut db_path = String::new();
     let mut args = env::args().skip(1);

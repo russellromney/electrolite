@@ -112,6 +112,13 @@ def make_handler(app):
 
 
 def main():
+    if os.environ.get("ELECTROLITE_TEST_SERVER") != "1":
+        sys.stderr.write(
+            "engines/python/server/server.py is a test-only HTTP server "
+            "with an unauthenticated /_test/exec endpoint. Set "
+            "ELECTROLITE_TEST_SERVER=1 to launch it.\n"
+        )
+        sys.exit(1)
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--db", required=True)

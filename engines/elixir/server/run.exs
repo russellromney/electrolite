@@ -1,3 +1,14 @@
+if System.get_env("ELECTROLITE_TEST_SERVER") != "1" do
+  IO.puts(
+    :stderr,
+    "engines/elixir/server/run.exs is a test-only HTTP server with " <>
+      "an unauthenticated /_test/exec endpoint. Set " <>
+      "ELECTROLITE_TEST_SERVER=1 to launch it."
+  )
+
+  System.halt(1)
+end
+
 {opts, _, _} =
   OptionParser.parse(System.argv(),
     strict: [port: :integer, db: :string]

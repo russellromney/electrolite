@@ -94,6 +94,27 @@ Each predicate type must:
 - Normalize deterministically so the shape handle is identical across
   engines (sort `in` values, sort `and` children).
 
+### Numeric edge cases in `in` dedup
+
+Engines dedup `in` values by canonical JSON encoding. JSON does not
+distinguish integers from same-valued floats: `1` and `1.0` may
+encode the same way (`"1"`) or differently (`"1"` vs `"1.0"`)
+depending on the language. Today every engine produces the same
+encoding for integers passed in, but if you pass a float that is
+exactly an integer value (e.g. `1.0` from JS), the engine you happen
+to be running may either dedup it against `1` or treat it as
+distinct. Avoid mixing `1` and `1.0` in the same `in` list.
+
+### Bad-input boundary
+
+Predicates that reference a column that does not exist, or that
+attach a boolean value to a non-`BOOLEAN`-affinity column, or that
+use `null` with a range op, surface as `400 bad_request` from
+`handle()`. Direct `snapshot()` / `replay()` callers receive a
+language-native error (`Error::BadInput` in Rust, `errBadInput` in
+Go, `{:bad_input, msg}` in Elixir, `BadInput` exception in Python,
+an `Error` with `electroliteBadInput = true` in Node).
+
 ## Shape handle
 
 ```

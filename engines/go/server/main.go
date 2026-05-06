@@ -19,6 +19,13 @@ import (
 )
 
 func main() {
+	if os.Getenv("ELECTROLITE_TEST_SERVER") != "1" {
+		fmt.Fprintln(os.Stderr,
+			"engines/go/server is a test-only HTTP server with an "+
+				"unauthenticated /_test/exec endpoint. Set "+
+				"ELECTROLITE_TEST_SERVER=1 to launch it.")
+		os.Exit(1)
+	}
 	port := flag.Int("port", 0, "listen port")
 	dbPath := flag.String("db", "", "sqlite database path")
 	flag.Parse()

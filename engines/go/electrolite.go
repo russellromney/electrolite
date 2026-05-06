@@ -205,6 +205,14 @@ func Open(path string) (*Electrolite, error) {
 // Close releases the SQLite connection.
 func (e *Electrolite) Close() error { return e.db.Close() }
 
+// Shutdown wakes any live waiters then closes the SQLite connection.
+// Live waiters return whatever replay state they currently have;
+// callers re-snapshot on reconnect.
+func (e *Electrolite) Shutdown() error {
+	e.notify()
+	return e.db.Close()
+}
+
 // AddShape registers a named shape.
 func (e *Electrolite) AddShape(name string, def ShapeDef) {
 	if def.SchemaVersion == 0 {

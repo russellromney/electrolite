@@ -169,6 +169,15 @@ export class Electrolite<TContext = unknown> {
     );
   }
 
+  shutdown(): void {
+    // Wake any live waiters; they return whatever replay state they
+    // have (typically empty; clients re-snapshot on reconnect).
+    this.notifyChanged();
+    if (typeof (this.engine as any).close === "function") {
+      (this.engine as any).close();
+    }
+  }
+
   notifyChanged(): void {
     const waiters = new Set();
     for (const shapeWaiters of this.waiters.values()) {

@@ -512,6 +512,18 @@ impl Electrolite {
         })
     }
 
+    /// Wake any live waiters, then drop the SQLite connection. Live
+    /// waiters return with whatever replay state they currently have
+    /// (typically empty; clients re-snapshot on reconnect).
+    pub fn shutdown(self) {
+        let (lock, cv) = &*self.wake;
+        let mut g = lock.lock().unwrap();
+        *g = g.wrapping_add(1);
+        cv.notify_all();
+        drop(g);
+        // Connection is dropped when self goes out of scope.
+    }
+
     /// Block until the log changes or live_timeout elapses.
     pub fn wait_for_change(&self) {
         let (lock, cv) = &*self.wake;

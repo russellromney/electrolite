@@ -107,6 +107,17 @@ class Electrolite:
                 "columns": info["columns"],
             }
 
+    def shutdown(self) -> None:
+        """Wake any live waiters then close the SQLite connection.
+
+        Live waiters return whatever replay state they currently have
+        (typically empty; they re-snapshot on reconnect). Subsequent
+        calls to engine methods will fail.
+        """
+        with self._changed:
+            self._changed.notify_all()
+        self.db.close()
+
     def compact(self, table: str, keep_last: int = 0) -> dict[str, int]:
         with self._changed:
             row = self.db.execute(

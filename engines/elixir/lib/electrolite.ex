@@ -52,6 +52,16 @@ defmodule Electrolite do
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: opts[:name])
   def stop(pid), do: GenServer.stop(pid)
 
+  @doc """
+  Wake any live waiters, then stop the GenServer (and close the
+  SQLite connection). Live waiters return with whatever replay state
+  they currently have; clients re-snapshot on reconnect.
+  """
+  def shutdown(pid) do
+    GenServer.cast(pid, :wake_all_waiters)
+    GenServer.stop(pid)
+  end
+
   def execute(pid, sql, args \\ []), do: GenServer.call(pid, {:execute, sql, args})
   def execute_batch(pid, sql), do: GenServer.call(pid, {:execute_batch, sql})
   def install_triggers(pid, table), do: GenServer.call(pid, {:install_triggers, table})
@@ -228,6 +238,10 @@ defmodule Electrolite do
   @impl true
   def handle_cast({:unsubscribe_change, pid}, state) do
     {:noreply, %{state | subscribers: MapSet.delete(state.subscribers, pid)}}
+  end
+
+  def handle_cast(:wake_all_waiters, state) do
+    {:noreply, notify(state)}
   end
 
   defp notify(state) do

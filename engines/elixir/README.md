@@ -29,9 +29,30 @@ shape =
 {:ok, replay} = Electrolite.replay(pid, shape, snap.offset, 1000)
 ```
 
-This engine implements the same SQLite trigger log, snapshot, replay,
-and shared-batch shape as the Node and Python engines. Wire `snapshot`
-and `replay` into Plug or Phoenix as you like.
+This engine implements the conformance contract in
+[`engines/PROTOCOL.md`](../PROTOCOL.md). Wire `Electrolite.handle/4`
+into Plug or Phoenix as you like.
+
+## Live wait
+
+`Exqlite` does not expose SQLite's `update_hook` to Elixir code, so
+this engine relies on its own notify-on-write inside the GenServer.
+**Writes that bypass `Electrolite.execute/3`** (for example, a raw
+`Exqlite.Sqlite3.execute` against the same connection from another
+process, or a separate process with its own connection to the same
+file) **will not wake live waiters.** All writes should go through
+the GenServer.
+
+## Recommended PRAGMAs
+
+The engine does not issue `PRAGMA` statements; the user owns those.
+For production-shaped apps:
+
+```elixir
+:ok = Exqlite.Sqlite3.execute(conn, "PRAGMA journal_mode = WAL")
+:ok = Exqlite.Sqlite3.execute(conn, "PRAGMA synchronous = NORMAL")
+:ok = Exqlite.Sqlite3.execute(conn, "PRAGMA busy_timeout = 5000")
+```
 
 Run the tests:
 

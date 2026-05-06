@@ -134,7 +134,11 @@ async function startSubprocessRaw(
 ): Promise<{ proc: ChildProcess; ready: Promise<void> }> {
   const proc = spawn(command, args, {
     cwd: options.cwd,
-    env: { ...process.env, ...(options.env ?? {}) },
+    env: {
+      ...process.env,
+      ELECTROLITE_TEST_SERVER: "1",
+      ...(options.env ?? {}),
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
 
