@@ -15,6 +15,8 @@ import {
   eq,
   gt,
   inList,
+  not,
+  or,
   shape,
 } from "../../packages/electrolite-node/electrolite-node.ts";
 import { predicateMatchesRow } from "../../packages/electrolite-node/electrolite-node-engine.ts";
@@ -93,6 +95,16 @@ async function startNode(port: number, dbPath: string): Promise<Server> {
         table: "todos",
         columns: ["id", "project_id", "title", "done"],
         where: () => and([eq("project_id", "p1"), gt("id", 1)]),
+      }),
+      // OR + NOT predicate parity through SQL.
+      activeP1OrP2: shape({
+        table: "todos",
+        columns: ["id", "project_id", "title", "done"],
+        where: () =>
+          and([
+            or([eq("project_id", "p1"), eq("project_id", "p2")]),
+            not(eq("done", 1)),
+          ]),
       }),
     },
   });

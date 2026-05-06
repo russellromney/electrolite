@@ -144,6 +144,26 @@ pid = Electrolite.TestServer.engine_name()
     )
   )
 
+# OR + NOT predicate parity through SQL.
+:ok =
+  Electrolite.add_shape(
+    pid,
+    "activeP1OrP2",
+    Electrolite.shape_def(
+      table: "todos",
+      columns: ["id", "project_id", "title", "done"],
+      where: fn _ ->
+        Electrolite.and_pred([
+          Electrolite.or_pred([
+            Electrolite.eq("project_id", "p1"),
+            Electrolite.eq("project_id", "p2")
+          ]),
+          Electrolite.not_pred(Electrolite.eq("done", 1))
+        ])
+      end
+    )
+  )
+
 {:ok, _} = Electrolite.TestServer.start(port)
 IO.puts("electrolite-server listening on #{port}")
 

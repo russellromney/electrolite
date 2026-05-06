@@ -8,7 +8,9 @@ export type ElectrolitePredicate =
   | { type: "gte"; column: string; value: unknown }
   | { type: "lte"; column: string; value: unknown }
   | { type: "in"; column: string; values: unknown[] }
-  | { type: "and"; predicates: ElectrolitePredicate[] };
+  | { type: "and"; predicates: ElectrolitePredicate[] }
+  | { type: "or"; predicates: ElectrolitePredicate[] }
+  | { type: "not"; predicate: ElectrolitePredicate };
 
 export interface ShapeDefinitionContext<TContext = unknown> {
   params: Record<string, string>;
@@ -81,6 +83,8 @@ export const gte = (column: string, value: unknown): ElectrolitePredicate => ({ 
 export const lte = (column: string, value: unknown): ElectrolitePredicate => ({ type: "lte", column, value });
 export const inList = (column: string, values: unknown[]): ElectrolitePredicate => ({ type: "in", column, values });
 export const and = (predicates: ElectrolitePredicate[]): ElectrolitePredicate => ({ type: "and", predicates });
+export const or = (predicates: ElectrolitePredicate[]): ElectrolitePredicate => ({ type: "or", predicates });
+export const not = (predicate: ElectrolitePredicate): ElectrolitePredicate => ({ type: "not", predicate });
 
 export function shape<TContext = unknown>(
   definition: ShapeDefinition<TContext>,

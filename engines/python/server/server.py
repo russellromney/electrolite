@@ -30,6 +30,8 @@ from electrolite import (  # noqa: E402
     eq,
     gt,
     in_list,
+    not_,
+    or_,
     predicate_matches,
     shape,
 )
@@ -84,6 +86,15 @@ def build_app(db_path: str):
                 table="todos",
                 columns=["id", "project_id", "title", "done"],
                 where=lambda ctx: and_(eq("project_id", "p1"), gt("id", 1)),
+            ),
+            # OR + NOT predicate parity through SQL.
+            "activeP1OrP2": shape(
+                table="todos",
+                columns=["id", "project_id", "title", "done"],
+                where=lambda ctx: and_(
+                    or_(eq("project_id", "p1"), eq("project_id", "p2")),
+                    not_(eq("done", 1)),
+                ),
             ),
         },
     )

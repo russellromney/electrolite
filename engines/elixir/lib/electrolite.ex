@@ -46,6 +46,8 @@ defmodule Electrolite do
   def lte(column, value), do: %{type: :lte, column: column, value: value}
   def in_list(column, values), do: %{type: :in, column: column, values: values}
   def and_pred(children), do: %{type: :and, predicates: children}
+  def or_pred(children), do: %{type: :or, predicates: children}
+  def not_pred(child), do: %{type: :not, predicate: child}
 
   # ---- public API ----
 
@@ -798,6 +800,12 @@ defmodule Electrolite do
   def predicate_from_json(%{"type" => "and", "predicates" => ps}),
     do: %{type: :and, predicates: Enum.map(ps, &predicate_from_json/1)}
 
+  def predicate_from_json(%{"type" => "or", "predicates" => ps}),
+    do: %{type: :or, predicates: Enum.map(ps, &predicate_from_json/1)}
+
+  def predicate_from_json(%{"type" => "not", "predicate" => inner}),
+    do: %{type: :not, predicate: predicate_from_json(inner)}
+
   defp predicate_matches(_p, nil), do: false
   defp predicate_matches(%{type: :all}, _row), do: true
   defp predicate_matches(%{type: :eq, column: c, value: v}, row), do: Map.get(row, c) == v
@@ -813,6 +821,14 @@ defmodule Electrolite do
 
   defp predicate_matches(%{type: :and, predicates: children}, row) do
     Enum.all?(children, &predicate_matches(&1, row))
+  end
+
+  defp predicate_matches(%{type: :or, predicates: children}, row) do
+    Enum.any?(children, &predicate_matches(&1, row))
+  end
+
+  defp predicate_matches(%{type: :not, predicate: inner}, row) do
+    not predicate_matches(inner, row)
   end
 
   defp compare_scalar(nil, _, _), do: false
@@ -882,6 +898,34 @@ defmodule Electrolite do
       end)
 
     {Enum.join(parts, " AND "), args}
+  end
+
+  defp compile_predicate(%{type: :or, predicates: children}) do
+    {parts, args} =
+      Enum.reduce(children, {[], []}, fn child, {ps, as} ->
+        case compile_predicate(child) do
+          {"", _} -> {ps, as}
+          {w, a} -> {ps ++ ["(#{w})"], as ++ a}
+        end
+      end)
+
+    if parts == [] do
+      {"", []}
+    else
+      {Enum.join(parts, " OR "), args}
+    end
+  end
+
+  defp compile_predicate(%{type: :not, predicate: %{type: :eq, column: c, value: nil}}) do
+    # Special case: NOT (col IS NULL) → col IS NOT NULL
+    {"#{quote_ident(c)} IS NOT NULL", []}
+  end
+
+  defp compile_predicate(%{type: :not, predicate: inner}) do
+    case compile_predicate(inner) do
+      {"", _} -> {"0", []}
+      {w, a} -> {"NOT (#{w})", a}
+    end
   end
 
   # ---- introspection ----
@@ -986,6 +1030,27 @@ defmodule Electrolite do
     end
   end
 
+  defp normalize_predicate_tree(info, %{type: :or, predicates: children}) do
+    nchildren =
+      Enum.reduce_while(children, {:ok, []}, fn c, {:ok, acc} ->
+        case normalize_predicate_tree(info, c) do
+          {:ok, nc} -> {:cont, {:ok, [nc | acc]}}
+          err -> {:halt, err}
+        end
+      end)
+
+    case nchildren do
+      {:ok, cs} -> {:ok, %{type: :or, predicates: Enum.reverse(cs)}}
+      err -> err
+    end
+  end
+
+  defp normalize_predicate_tree(info, %{type: :not, predicate: inner}) do
+    with {:ok, ninner} <- normalize_predicate_tree(info, inner) do
+      {:ok, %{type: :not, predicate: ninner}}
+    end
+  end
+
   defp watched_info(conn, table) do
     with {:ok, info} <- inspect_table(conn, table),
          {:ok, [[pk_json]]} <-
@@ -1055,6 +1120,19 @@ defmodule Electrolite do
       |> Enum.sort_by(&Jason.encode!/1)
 
     %{"type" => "and", "predicates" => sorted}
+  end
+
+  defp predicate_to_json(%{type: :or, predicates: children}) do
+    sorted =
+      children
+      |> Enum.map(&predicate_to_json/1)
+      |> Enum.sort_by(&Jason.encode!/1)
+
+    %{"type" => "or", "predicates" => sorted}
+  end
+
+  defp predicate_to_json(%{type: :not, predicate: inner}) do
+    %{"type" => "not", "predicate" => predicate_to_json(inner)}
   end
 
   defp canonical_json(value) when is_map(value) do

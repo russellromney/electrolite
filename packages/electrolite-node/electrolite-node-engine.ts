@@ -515,6 +515,29 @@ function compilePredicate(info, predicate) {
         params: compiled.flatMap((child) => child.params),
       };
     }
+    case "or": {
+      const compiled = predicate.predicates.map((child) => compilePredicate(info, child))
+        .filter((child) => child.where);
+      if (compiled.length === 0) {
+        return { where: "", params: [] };
+      }
+      return {
+        where: compiled.map((child) => `(${child.where})`).join(" OR "),
+        params: compiled.flatMap((child) => child.params),
+      };
+    }
+    case "not": {
+      // Special case: NOT (col IS NULL) → col IS NOT NULL so SQLite can use the column index.
+      const inner = predicate.predicate;
+      if (inner?.type === "eq" && inner.value === null) {
+        return { where: `${quoteIdent(inner.column)} IS NOT NULL`, params: [] };
+      }
+      const child = compilePredicate(info, inner);
+      if (!child.where) {
+        return { where: "0", params: [] };
+      }
+      return { where: `NOT (${child.where})`, params: child.params };
+    }
     default:
       throw new Error(`unsupported predicate type ${predicate?.type}`);
   }
@@ -539,6 +562,10 @@ function predicateMatches(predicate, row) {
       return predicate.values.some((value) => sameJsonValue(row[predicate.column], value));
     case "and":
       return predicate.predicates.every((child) => predicateMatches(child, row));
+    case "or":
+      return predicate.predicates.some((child) => predicateMatches(child, row));
+    case "not":
+      return !predicateMatches(predicate.predicate, row);
     default:
       throw new Error(`unsupported predicate type ${predicate?.type}`);
   }
@@ -611,6 +638,17 @@ function normalizePredicate(info, predicate) {
         type: "and",
         predicates: predicate.predicates.map((child) => normalizePredicate(info, child))
           .sort((a, b) => canonicalJson(a).localeCompare(canonicalJson(b))),
+      };
+    case "or":
+      return {
+        type: "or",
+        predicates: predicate.predicates.map((child) => normalizePredicate(info, child))
+          .sort((a, b) => canonicalJson(a).localeCompare(canonicalJson(b))),
+      };
+    case "not":
+      return {
+        type: "not",
+        predicate: normalizePredicate(info, predicate.predicate),
       };
     default:
       throw new Error(`unsupported predicate type ${predicate?.type}`);

@@ -56,6 +56,8 @@ pub enum Predicate {
     Range { op: RangeOp, column: String, value: Json },
     In { column: String, values: Vec<Json> },
     And(Vec<Predicate>),
+    Or(Vec<Predicate>),
+    Not(Box<Predicate>),
 }
 
 pub fn all() -> Predicate {
@@ -81,6 +83,12 @@ pub fn in_list<S: Into<String>>(column: S, values: Vec<Json>) -> Predicate {
 }
 pub fn and(children: Vec<Predicate>) -> Predicate {
     Predicate::And(children)
+}
+pub fn or(children: Vec<Predicate>) -> Predicate {
+    Predicate::Or(children)
+}
+pub fn not(child: Predicate) -> Predicate {
+    Predicate::Not(Box::new(child))
 }
 
 // ---------- shapes ----------
@@ -843,6 +851,13 @@ fn normalize_predicate(info: &TableInfo, p: &Predicate) -> Result<Predicate, Err
                 .map(|c| normalize_predicate(info, c))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
+        Predicate::Or(children) => Predicate::Or(
+            children
+                .iter()
+                .map(|c| normalize_predicate(info, c))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        Predicate::Not(child) => Predicate::Not(Box::new(normalize_predicate(info, child)?)),
     })
 }
 
@@ -920,6 +935,8 @@ pub fn predicate_matches_row(p: &Predicate, row: &Json) -> bool {
             values.iter().any(|v| Some(v) == left)
         }
         Predicate::And(children) => children.iter().all(|c| predicate_matches_row(c, row)),
+        Predicate::Or(children) => children.iter().any(|c| predicate_matches_row(c, row)),
+        Predicate::Not(child) => !predicate_matches_row(child, row),
     }
 }
 
@@ -972,6 +989,22 @@ pub fn predicate_from_json(value: &Json) -> Result<Predicate, String> {
             let parsed: Result<Vec<Predicate>, String> =
                 children.iter().map(predicate_from_json).collect();
             Ok(Predicate::And(parsed?))
+        }
+        "or" => {
+            let children = value
+                .get("predicates")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let parsed: Result<Vec<Predicate>, String> =
+                children.iter().map(predicate_from_json).collect();
+            Ok(Predicate::Or(parsed?))
+        }
+        "not" => {
+            let inner = value
+                .get("predicate")
+                .ok_or_else(|| "not missing predicate".to_string())?;
+            Ok(Predicate::Not(Box::new(predicate_from_json(inner)?)))
         }
         other => Err(format!("unknown predicate type: {other}")),
     }
@@ -1094,6 +1127,37 @@ fn compile_predicate(p: &Predicate) -> (String, Vec<Value>) {
             let args = compiled.into_iter().flat_map(|(_, a)| a).collect();
             (where_part, args)
         }
+        Predicate::Or(children) => {
+            let compiled: Vec<(String, Vec<Value>)> = children
+                .iter()
+                .map(compile_predicate)
+                .filter(|(w, _)| !w.is_empty())
+                .collect();
+            if compiled.is_empty() {
+                return (String::new(), vec![]);
+            }
+            let where_part = compiled
+                .iter()
+                .map(|(w, _)| format!("({})", w))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let args = compiled.into_iter().flat_map(|(_, a)| a).collect();
+            (where_part, args)
+        }
+        Predicate::Not(child) => {
+            // Special case: NOT (col IS NULL) → col IS NOT NULL so SQLite
+            // can use the column index.
+            if let Predicate::Eq { column, value } = child.as_ref() {
+                if value.is_null() {
+                    return (format!("{} IS NOT NULL", quote_ident(column)), vec![]);
+                }
+            }
+            let (sql, args) = compile_predicate(child);
+            if sql.is_empty() {
+                return ("0".to_string(), vec![]);
+            }
+            (format!("NOT ({sql})"), args)
+        }
     }
 }
 
@@ -1138,6 +1202,18 @@ fn predicate_to_json(p: &Predicate) -> Json {
                     .cmp(&serde_json::to_string(b).unwrap())
             });
             json!({"type": "and", "predicates": child_jsons})
+        }
+        Predicate::Or(children) => {
+            let mut child_jsons: Vec<Json> = children.iter().map(predicate_to_json).collect();
+            child_jsons.sort_by(|a, b| {
+                serde_json::to_string(a)
+                    .unwrap()
+                    .cmp(&serde_json::to_string(b).unwrap())
+            });
+            json!({"type": "or", "predicates": child_jsons})
+        }
+        Predicate::Not(child) => {
+            json!({"type": "not", "predicate": predicate_to_json(child)})
         }
     }
 }

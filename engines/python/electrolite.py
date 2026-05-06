@@ -47,6 +47,14 @@ def and_(*predicates: Predicate) -> Predicate:
     return {"type": "and", "predicates": list(predicates)}
 
 
+def or_(*predicates: Predicate) -> Predicate:
+    return {"type": "or", "predicates": list(predicates)}
+
+
+def not_(predicate: Predicate) -> Predicate:
+    return {"type": "not", "predicate": predicate}
+
+
 _RANGE_OPS = {"gt": ">", "lt": "<", "gte": ">=", "lte": "<="}
 
 
@@ -434,6 +442,25 @@ class Electrolite:
             return " AND ".join(f"({child[0]})" for child in children), [
                 param for child in children for param in child[1]
             ]
+        if predicate["type"] == "or":
+            children = [self._compile_predicate(info, child) for child in predicate["predicates"]]
+            children = [child for child in children if child[0]]
+            if not children:
+                return "", []
+            return " OR ".join(f"({child[0]})" for child in children), [
+                param for child in children for param in child[1]
+            ]
+        if predicate["type"] == "not":
+            inner = predicate["predicate"]
+            # Special case: not(eq(col, null)) → "col IS NOT NULL"
+            # so SQLite can use the column index.
+            if inner.get("type") == "eq" and inner.get("value") is None:
+                column = quote_ident(inner["column"])
+                return f"{column} IS NOT NULL", []
+            child_sql, child_args = self._compile_predicate(info, inner)
+            if not child_sql:
+                return "0", []
+            return f"NOT ({child_sql})", child_args
         raise ValueError(f"unsupported predicate type {predicate.get('type')}")
 
     def _normalize_shape(self, info: dict[str, Any], shape_spec: dict[str, Any]) -> dict[str, Any]:
@@ -471,6 +498,15 @@ class Electrolite:
             children = [self._normalize_predicate(info, child) for child in predicate["predicates"]]
             children.sort(key=lambda child: json.dumps(child, sort_keys=True))
             return {"type": "and", "predicates": children}
+        if predicate["type"] == "or":
+            children = [self._normalize_predicate(info, child) for child in predicate["predicates"]]
+            children.sort(key=lambda child: json.dumps(child, sort_keys=True))
+            return {"type": "or", "predicates": children}
+        if predicate["type"] == "not":
+            return {
+                "type": "not",
+                "predicate": self._normalize_predicate(info, predicate["predicate"]),
+            }
         raise ValueError(f"unsupported predicate type {predicate.get('type')}")
 
     def _normalize_predicate_value(self, info: dict[str, Any], column: str, value: Any) -> Any:
@@ -638,6 +674,10 @@ def predicate_matches(predicate: Optional[Predicate], row: Optional[dict[str, An
         return row.get(predicate["column"]) in predicate["values"]
     if predicate["type"] == "and":
         return builtins.all(predicate_matches(child, row) for child in predicate["predicates"])
+    if predicate["type"] == "or":
+        return any(predicate_matches(child, row) for child in predicate["predicates"])
+    if predicate["type"] == "not":
+        return not predicate_matches(predicate["predicate"], row)
     raise ValueError(f"unsupported predicate type {predicate.get('type')}")
 
 

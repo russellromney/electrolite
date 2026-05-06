@@ -69,6 +69,20 @@ type AndPredicate struct {
 
 func (AndPredicate) predicateKind() string { return "and" }
 
+// OrPredicate is the disjunction of its children.
+type OrPredicate struct {
+	Predicates []Predicate
+}
+
+func (OrPredicate) predicateKind() string { return "or" }
+
+// NotPredicate is the negation of its child.
+type NotPredicate struct {
+	Predicate Predicate
+}
+
+func (NotPredicate) predicateKind() string { return "not" }
+
 // All / Eq / Gt / Lt / Gte / Lte / In / And construct predicates.
 func All() Predicate                              { return AllPredicate{} }
 func Eq(col string, v interface{}) Predicate     { return EqPredicate{Column: col, Value: v} }
@@ -78,6 +92,8 @@ func Gte(col string, v interface{}) Predicate    { return RangePredicate{Op: "gt
 func Lte(col string, v interface{}) Predicate    { return RangePredicate{Op: "lte", Column: col, Value: v} }
 func In(col string, vs ...interface{}) Predicate { return InPredicate{Column: col, Values: vs} }
 func And(children ...Predicate) Predicate        { return AndPredicate{Predicates: children} }
+func Or(children ...Predicate) Predicate         { return OrPredicate{Predicates: children} }
+func Not(child Predicate) Predicate              { return NotPredicate{Predicate: child} }
 
 var rangeOps = map[string]string{"gt": ">", "lt": "<", "gte": ">=", "lte": "<="}
 
@@ -860,6 +876,22 @@ func normalizePredicate(info *tableInfo, p Predicate) (Predicate, error) {
 			children = append(children, nc)
 		}
 		return AndPredicate{Predicates: children}, nil
+	case OrPredicate:
+		children := make([]Predicate, 0, len(x.Predicates))
+		for _, c := range x.Predicates {
+			nc, err := normalizePredicate(info, c)
+			if err != nil {
+				return nil, err
+			}
+			children = append(children, nc)
+		}
+		return OrPredicate{Predicates: children}, nil
+	case NotPredicate:
+		nc, err := normalizePredicate(info, x.Predicate)
+		if err != nil {
+			return nil, err
+		}
+		return NotPredicate{Predicate: nc}, nil
 	}
 	return nil, fmt.Errorf("unsupported predicate type %T", p)
 }
@@ -1083,6 +1115,32 @@ func PredicateFromJSON(raw map[string]interface{}) (Predicate, error) {
 			}
 		}
 		return AndPredicate{Predicates: children}, nil
+	case "or":
+		var children []Predicate
+		if cs, ok := raw["predicates"].([]interface{}); ok {
+			for _, c := range cs {
+				cm, ok := c.(map[string]interface{})
+				if !ok {
+					return nil, fmt.Errorf("or child not an object")
+				}
+				child, err := PredicateFromJSON(cm)
+				if err != nil {
+					return nil, err
+				}
+				children = append(children, child)
+			}
+		}
+		return OrPredicate{Predicates: children}, nil
+	case "not":
+		inner, ok := raw["predicate"].(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("not missing predicate")
+		}
+		child, err := PredicateFromJSON(inner)
+		if err != nil {
+			return nil, err
+		}
+		return NotPredicate{Predicate: child}, nil
 	}
 	return nil, fmt.Errorf("unknown predicate type: %s", kind)
 }
@@ -1112,6 +1170,15 @@ func predicateMatches(p Predicate, row map[string]interface{}) bool {
 			}
 		}
 		return true
+	case OrPredicate:
+		for _, c := range x.Predicates {
+			if predicateMatches(c, row) {
+				return true
+			}
+		}
+		return false
+	case NotPredicate:
+		return !predicateMatches(x.Predicate, row)
 	}
 	return false
 }
@@ -1180,6 +1247,30 @@ func compilePredicate(p Predicate) (string, []interface{}) {
 			}
 		}
 		return strings.Join(parts, " AND "), args
+	case OrPredicate:
+		var parts []string
+		var args []interface{}
+		for _, c := range x.Predicates {
+			where, a := compilePredicate(c)
+			if where != "" {
+				parts = append(parts, "("+where+")")
+				args = append(args, a...)
+			}
+		}
+		if len(parts) == 0 {
+			return "", nil
+		}
+		return strings.Join(parts, " OR "), args
+	case NotPredicate:
+		// Special case: NOT (col IS NULL) → col IS NOT NULL.
+		if eq, ok := x.Predicate.(EqPredicate); ok && eq.Value == nil {
+			return fmt.Sprintf("%s IS NOT NULL", quoteIdent(eq.Column)), nil
+		}
+		sql, args := compilePredicate(x.Predicate)
+		if sql == "" {
+			return "0", nil
+		}
+		return "NOT (" + sql + ")", args
 	}
 	return "", nil
 }
@@ -1313,6 +1404,19 @@ func predicateToJSON(p Predicate) interface{} {
 			return string(a) < string(b)
 		})
 		return map[string]interface{}{"type": "and", "predicates": children}
+	case OrPredicate:
+		children := make([]interface{}, 0, len(x.Predicates))
+		for _, c := range x.Predicates {
+			children = append(children, predicateToJSON(c))
+		}
+		sort.Slice(children, func(i, j int) bool {
+			a, _ := json.Marshal(children[i])
+			b, _ := json.Marshal(children[j])
+			return string(a) < string(b)
+		})
+		return map[string]interface{}{"type": "or", "predicates": children}
+	case NotPredicate:
+		return map[string]interface{}{"type": "not", "predicate": predicateToJSON(x.Predicate)}
 	}
 	return map[string]interface{}{"type": "all"}
 }

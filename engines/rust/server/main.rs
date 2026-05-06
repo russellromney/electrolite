@@ -6,8 +6,8 @@
 //!     --bin electrolite-server -- --port 5103 --db /tmp/x/app.db
 
 use electrolite::{
-    and, eq, gt, in_list, predicate_from_json, predicate_matches_row, AuthContext, BuildContext,
-    Electrolite, Predicate, ShapeDef,
+    and, eq, gt, in_list, not, or, predicate_from_json, predicate_matches_row, AuthContext,
+    BuildContext, Electrolite, Predicate, ShapeDef,
 };
 use serde_json::{json, Value as Json};
 use std::env;
@@ -159,6 +159,28 @@ fn main() {
             ],
         )
         .where_fn(|_| and(vec![eq("project_id", json!("p1")), gt("id", json!(1))])),
+    );
+    // OR + NOT predicate parity through SQL.
+    app.add_shape(
+        "activeP1OrP2",
+        ShapeDef::new(
+            "todos",
+            vec![
+                "id".into(),
+                "project_id".into(),
+                "title".into(),
+                "done".into(),
+            ],
+        )
+        .where_fn(|_| {
+            and(vec![
+                or(vec![
+                    eq("project_id", json!("p1")),
+                    eq("project_id", json!("p2")),
+                ]),
+                not(eq("done", json!(1))),
+            ])
+        }),
     );
 
     let app = Arc::new(app);

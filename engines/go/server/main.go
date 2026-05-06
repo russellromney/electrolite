@@ -120,6 +120,17 @@ func main() {
 			return electrolite.And(electrolite.Eq("project_id", "p1"), electrolite.Gt("id", 1))
 		},
 	})
+	// OR + NOT predicate parity through SQL.
+	app.AddShape("activeP1OrP2", electrolite.ShapeDef{
+		Table:   "todos",
+		Columns: []string{"id", "project_id", "title", "done"},
+		Where: func(electrolite.BuildContext) electrolite.Predicate {
+			return electrolite.And(
+				electrolite.Or(electrolite.Eq("project_id", "p1"), electrolite.Eq("project_id", "p2")),
+				electrolite.Not(electrolite.Eq("done", 1)),
+			)
+		},
+	})
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/electrolite/", func(w http.ResponseWriter, r *http.Request) {
