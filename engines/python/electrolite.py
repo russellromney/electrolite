@@ -107,6 +107,27 @@ class Electrolite:
                 "columns": info["columns"],
             }
 
+    def compact(self, table: str, keep_last: int = 0) -> dict[str, int]:
+        with self._changed:
+            row = self.db.execute(
+                "SELECT seq FROM _electrolite_log WHERE table_name = ? ORDER BY seq DESC LIMIT 1 OFFSET ?",
+                (table, max(0, int(keep_last))),
+            ).fetchone()
+            retained_offset = int(row["seq"]) if row else self.high_water_mark()
+            cursor = self.db.execute(
+                "DELETE FROM _electrolite_log WHERE table_name = ? AND seq <= ?",
+                (table, retained_offset),
+            )
+            self.db.execute(
+                """
+                INSERT INTO _electrolite_meta (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (f"retained_offset:{table}", str(retained_offset)),
+            )
+            self.db.commit()
+            return {"retained_offset": retained_offset, "deleted_rows": cursor.rowcount}
+
     def execute(self, sql: str, params: Union[list[Any], tuple[Any, ...]] = ()) -> int:
         with self._changed:
             cursor = self.db.execute(sql, tuple(params))

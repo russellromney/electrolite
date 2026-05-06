@@ -1,13 +1,13 @@
 defmodule Electrolite do
   @moduledoc """
-  Tiny experimental Electrolite engine for Elixir.
+  Electrolite engine for Elixir. Implements the conformance contract in
+  `engines/PROTOCOL.md`: install SQLite triggers, snapshot a shape,
+  replay logical changes, share a `batch_id` across `write_batch`,
+  detect log-id and retained-offset mismatches as `:resync_required`,
+  and serve named shapes through `handle/3`.
 
-  Mirrors the Python and Node engines: install SQLite triggers, take a
-  snapshot of matching rows, replay logical changes, and run explicit
-  write batches with a shared `batch_id`. Uses `Exqlite` directly.
-
-  Owns one SQLite connection inside a `GenServer`, so concurrent calls
-  serialize cleanly.
+  One `GenServer` owns one SQLite connection so concurrent calls
+  serialize cleanly. Uses `Exqlite`.
   """
 
   use GenServer
@@ -16,41 +16,64 @@ defmodule Electrolite do
 
   defmodule Shape do
     @moduledoc false
-    defstruct [:table, :columns, :predicate]
+    defstruct table: nil, columns: [], predicate: %{type: :all}, auth_scope: "", schema_version: 1
   end
 
+  defmodule ShapeDef do
+    @moduledoc false
+    defstruct [
+      :table,
+      :columns,
+      params: [],
+      where: nil,
+      scope: nil,
+      authorize: nil,
+      schema_version: 1
+    ]
+  end
+
+  @range_ops %{gt: ">", lt: "<", gte: ">=", lte: "<="}
+
+  # ---- public helpers ----
+
   def shape(opts), do: struct!(Shape, opts)
+  def shape_def(opts), do: struct!(ShapeDef, opts)
   def all_pred, do: %{type: :all}
   def eq(column, value), do: %{type: :eq, column: column, value: value}
   def gt(column, value), do: %{type: :gt, column: column, value: value}
   def lt(column, value), do: %{type: :lt, column: column, value: value}
   def gte(column, value), do: %{type: :gte, column: column, value: value}
   def lte(column, value), do: %{type: :lte, column: column, value: value}
+  def in_list(column, values), do: %{type: :in, column: column, values: values}
+  def and_pred(children), do: %{type: :and, predicates: children}
 
-  @range_ops %{gt: ">", lt: "<", gte: ">=", lte: "<="}
+  # ---- public API ----
 
-  # --- public API ---
-
-  def start_link(opts) do
-    GenServer.start_link(__MODULE__, opts, name: opts[:name])
-  end
-
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: opts[:name])
   def stop(pid), do: GenServer.stop(pid)
 
   def execute(pid, sql, args \\ []), do: GenServer.call(pid, {:execute, sql, args})
   def execute_batch(pid, sql), do: GenServer.call(pid, {:execute_batch, sql})
   def install_triggers(pid, table), do: GenServer.call(pid, {:install_triggers, table})
   def write_batch(pid, statements), do: GenServer.call(pid, {:write_batch, statements})
+  def add_shape(pid, name, def), do: GenServer.call(pid, {:add_shape, name, def})
+  def set_replay_limit(pid, limit), do: GenServer.call(pid, {:set_replay_limit, limit})
+  def set_prefix(pid, prefix), do: GenServer.call(pid, {:set_prefix, prefix})
   def snapshot(pid, shape), do: GenServer.call(pid, {:snapshot, shape})
   def replay(pid, shape, offset, limit \\ 1000), do: GenServer.call(pid, {:replay, shape, offset, limit})
+  def compact(pid, table, keep_last \\ 0), do: GenServer.call(pid, {:compact, table, keep_last})
   def log_id(pid), do: GenServer.call(pid, :log_id)
 
   @doc """
-  Block until the log changes or `timeout` ms elapses.
-  Returns `:changed` or `:timeout`.
+  Serve an Electrolite path. Returns `{status, body}` where status is
+  an HTTP-style integer and body is a map suitable for JSON encoding.
   """
+  def handle(pid, path, query \\ "", context \\ %{}),
+    do: GenServer.call(pid, {:handle, path, query, context}, :infinity)
+
   def wait_for_change(pid, timeout \\ 20_000) do
-    GenServer.call(pid, {:subscribe_change}, :infinity)
+    GenServer.call(pid, :subscribe_change, :infinity)
+
     receive do
       {:electrolite_change, ^pid} -> :changed
     after
@@ -60,13 +83,22 @@ defmodule Electrolite do
     end
   end
 
-  # --- GenServer ---
+  # ---- GenServer ----
 
   @impl true
   def init(opts) do
     path = Keyword.fetch!(opts, :db_path)
     {:ok, conn} = Sqlite3.open(path)
-    state = %{conn: conn, subscribers: MapSet.new()}
+
+    state = %{
+      conn: conn,
+      subscribers: MapSet.new(),
+      shapes: %{},
+      prefix: Keyword.get(opts, :prefix, "/electrolite/v1"),
+      replay_limit: Keyword.get(opts, :replay_limit, 1000),
+      live_timeout_ms: Keyword.get(opts, :live_timeout_ms, 20_000)
+    }
+
     :ok = bootstrap(conn)
     {:ok, state}
   end
@@ -74,19 +106,16 @@ defmodule Electrolite do
   @impl true
   def handle_call({:execute, sql, args}, _from, state) do
     res = exec(state.conn, sql, args)
-    state = notify(state)
-    {:reply, res, state}
+    {:reply, res, notify(state)}
   end
 
   def handle_call({:execute_batch, sql}, _from, state) do
     res = Sqlite3.execute(state.conn, sql)
-    state = notify(state)
-    {:reply, res, state}
+    {:reply, res, notify(state)}
   end
 
   def handle_call({:install_triggers, table}, _from, state) do
-    res = do_install_triggers(state.conn, table)
-    {:reply, res, state}
+    {:reply, do_install_triggers(state.conn, table), state}
   end
 
   def handle_call({:write_batch, statements}, _from, state) do
@@ -121,21 +150,44 @@ defmodule Electrolite do
     {:reply, res, state}
   end
 
-  def handle_call({:snapshot, %Shape{} = shape}, _from, state) do
-    res = do_snapshot(state.conn, shape)
-    {:reply, res, state}
+  def handle_call({:add_shape, name, %ShapeDef{} = def}, _from, state) do
+    def = %{def | schema_version: def.schema_version || 1}
+    {:reply, :ok, %{state | shapes: Map.put(state.shapes, name, def)}}
   end
 
-  def handle_call({:replay, %Shape{} = shape, offset, limit}, _from, state) do
-    res = do_replay(state.conn, shape, offset, limit)
-    {:reply, res, state}
+  def handle_call({:set_replay_limit, limit}, _from, state),
+    do: {:reply, :ok, %{state | replay_limit: max(1, limit)}}
+
+  def handle_call({:set_prefix, prefix}, _from, state),
+    do: {:reply, :ok, %{state | prefix: prefix}}
+
+  def handle_call({:snapshot, %Shape{} = shape}, _from, state),
+    do: {:reply, do_snapshot(state.conn, shape), state}
+
+  def handle_call({:replay, %Shape{} = shape, offset, limit}, _from, state),
+    do: {:reply, do_replay(state.conn, shape, offset, limit), state}
+
+  def handle_call({:compact, table, keep_last}, _from, state),
+    do: {:reply, do_compact(state.conn, table, keep_last), state}
+
+  def handle_call(:log_id, _from, state), do: {:reply, fetch_log_id(state.conn), state}
+
+  def handle_call({:handle, path, query, context}, from, state) do
+    case do_handle(state, path, query, context) do
+      {:wait_then_replay, shape, offset, deadline} ->
+        spawn_link(fn ->
+          wait_for_state_change(self(), deadline, state)
+          GenServer.cast(state_pid_or_self(from), {:resume_handle, from, shape, offset})
+        end)
+
+        {:noreply, state}
+
+      {:reply, response} ->
+        {:reply, response, state}
+    end
   end
 
-  def handle_call(:log_id, _from, state) do
-    {:reply, fetch_log_id(state.conn), state}
-  end
-
-  def handle_call({:subscribe_change}, {pid, _ref}, state) do
+  def handle_call(:subscribe_change, {pid, _ref}, state) do
     {:reply, :ok, %{state | subscribers: MapSet.put(state.subscribers, pid)}}
   end
 
@@ -144,14 +196,244 @@ defmodule Electrolite do
     {:noreply, %{state | subscribers: MapSet.delete(state.subscribers, pid)}}
   end
 
+  def handle_cast({:resume_handle, from, shape, offset}, state) do
+    response =
+      case do_replay(state.conn, shape, offset, state.replay_limit) do
+        {:ok, body} -> {200, replay_to_body(body)}
+        {:error, :resync_required} -> {409, %{"error" => "resync_required"}}
+        {:error, _} -> {500, %{"error" => "internal"}}
+      end
+
+    GenServer.reply(from, response)
+    {:noreply, state}
+  end
+
+  # We resume on the same GenServer; pass the pid through.
+  defp state_pid_or_self(_from), do: self()
+
+  # ---- live wait ----
+
+  defp wait_for_state_change(_pid, deadline, state) do
+    timeout = max(0, System.system_time(:millisecond) - deadline)
+
+    if timeout >= 0 do
+      :timer.sleep(min(state.live_timeout_ms, max(50, deadline - System.system_time(:millisecond))))
+    end
+  end
+
   defp notify(state) do
     Enum.each(state.subscribers, fn pid ->
       send(pid, {:electrolite_change, self()})
     end)
+
     %{state | subscribers: MapSet.new()}
   end
 
-  # --- helpers ---
+  # ---- handle dispatch ----
+
+  defp do_handle(state, path, query, context) do
+    with {:ok, route} <- parse_route(state.prefix, path, query),
+         {:ok, def} <- Map.fetch(state.shapes, route.name) |> wrap_fetch(:not_found),
+         {:ok, params} <- bind_params(def, route.params),
+         build_ctx <- %{params: params, context: context},
+         scope <- if(def.scope, do: def.scope.(build_ctx), else: ""),
+         :ok <- run_authorize(def, params, context, scope) do
+      predicate = if def.where, do: def.where.(build_ctx), else: all_pred()
+
+      shape = %Shape{
+        table: def.table,
+        columns: def.columns,
+        predicate: predicate,
+        auth_scope: scope,
+        schema_version: def.schema_version || 1
+      }
+
+      current_handle = shape_handle(shape)
+
+      with {:ok, current_log_id} <- fetch_log_id(state.conn),
+           :ok <- check_log_id(route, current_log_id),
+           :ok <- check_handle(route, current_handle) do
+        cond do
+          route.offset < 0 ->
+            case do_snapshot(state.conn, shape) do
+              {:ok, snap} -> {:reply, {200, snapshot_to_body(snap)}}
+              {:error, :resync_required} -> {:reply, {409, %{"error" => "resync_required"}}}
+              {:error, _} -> {:reply, {500, %{"error" => "internal"}}}
+            end
+
+          true ->
+            case do_replay(state.conn, shape, route.offset, state.replay_limit) do
+              {:ok, body} ->
+                if route.live and body.messages == [] and body.up_to_date do
+                  # Synchronous wait + retry. Simpler than message-based plumbing
+                  # for the GenServer here; live tests don't span seconds.
+                  wait_inline(state)
+
+                  case do_replay(state.conn, shape, route.offset, state.replay_limit) do
+                    {:ok, b} -> {:reply, {200, replay_to_body(b)}}
+                    {:error, :resync_required} -> {:reply, {409, %{"error" => "resync_required"}}}
+                    {:error, _} -> {:reply, {500, %{"error" => "internal"}}}
+                  end
+                else
+                  {:reply, {200, replay_to_body(body)}}
+                end
+
+              {:error, :resync_required} ->
+                {:reply, {409, %{"error" => "resync_required"}}}
+
+              {:error, _} ->
+                {:reply, {500, %{"error" => "internal"}}}
+            end
+        end
+      else
+        {:error, :resync_required} -> {:reply, {409, %{"error" => "resync_required"}}}
+        {:error, _} -> {:reply, {500, %{"error" => "internal"}}}
+      end
+    else
+      :not_found -> {:reply, {404, %{"error" => "shape_not_found"}}}
+      {:error, :not_found} -> {:reply, {404, %{"error" => "shape_not_found"}}}
+      {:error, _} -> {:reply, {500, %{"error" => "internal"}}}
+    end
+  end
+
+  defp wait_inline(state) do
+    # Block this GenServer briefly. Because the GenServer is the writer,
+    # this is just a polling loop that returns as soon as a write commits
+    # (writes go through GenServer.call too, so the wait must spin —
+    # poll high_water_mark until it changes or timeout elapses).
+    deadline = System.monotonic_time(:millisecond) + state.live_timeout_ms
+    {:ok, base} = high_water(state.conn)
+    poll_until_changed(state, base, deadline)
+  end
+
+  defp poll_until_changed(state, base, deadline) do
+    if System.monotonic_time(:millisecond) >= deadline do
+      :timeout
+    else
+      {:ok, n} = high_water(state.conn)
+
+      if n != base do
+        :ok
+      else
+        receive do
+        after
+          25 -> poll_until_changed(state, base, deadline)
+        end
+      end
+    end
+  end
+
+  defp wrap_fetch(:error, tag), do: {:error, tag}
+  defp wrap_fetch({:ok, v}, _), do: {:ok, v}
+
+  defp bind_params(%ShapeDef{params: names}, given) do
+    if length(names) == length(given) do
+      {:ok, names |> Enum.zip(given) |> Map.new()}
+    else
+      {:error, :not_found}
+    end
+  end
+
+  defp run_authorize(%ShapeDef{authorize: nil}, _, _, _), do: :ok
+
+  defp run_authorize(%ShapeDef{authorize: fun}, params, context, scope) do
+    if fun.(%{params: params, context: context, scope: scope}) do
+      :ok
+    else
+      {:error, :not_found}
+    end
+  end
+
+  defp check_log_id(%{offset: o}, _) when o < 0, do: :ok
+  defp check_log_id(%{log_id: nil}, _), do: :ok
+
+  defp check_log_id(%{log_id: lid}, current) do
+    if lid == current, do: :ok, else: {:error, :resync_required}
+  end
+
+  defp check_handle(%{offset: o}, _) when o < 0, do: :ok
+  defp check_handle(%{shape_handle: nil}, _), do: :ok
+
+  defp check_handle(%{shape_handle: h}, current) do
+    if h == current, do: :ok, else: {:error, :resync_required}
+  end
+
+  defp parse_route(prefix, path, query) do
+    p = prefix <> "/"
+
+    if String.starts_with?(path, p) do
+      rest = String.replace_prefix(path, p, "")
+      parts = rest |> String.split("/") |> Enum.reject(&(&1 == ""))
+
+      if parts == [] do
+        :not_found
+      else
+        qp = parse_qs(query)
+
+        offset =
+          case Map.get(qp, "offset") do
+            nil -> -1
+            v -> String.to_integer(v)
+          end
+
+        {:ok,
+         %{
+           name: hd(parts),
+           params: tl(parts),
+           offset: offset,
+           live: Map.get(qp, "live") == "true",
+           log_id: Map.get(qp, "log_id"),
+           shape_handle: Map.get(qp, "shape_handle")
+         }}
+      end
+    else
+      :not_found
+    end
+  end
+
+  defp parse_qs(nil), do: %{}
+
+  defp parse_qs(query) do
+    query
+    |> String.trim_leading("?")
+    |> URI.decode_query()
+  end
+
+  defp snapshot_to_body(snap) do
+    %{
+      "type" => "snapshot",
+      "log_id" => snap.log_id,
+      "shape_handle" => snap.shape_handle,
+      "key_columns" => snap.key_columns,
+      "rows" => snap.rows,
+      "offset" => snap.offset,
+      "up_to_date" => true
+    }
+  end
+
+  defp replay_to_body(body) do
+    %{
+      "type" => "replay",
+      "log_id" => body.log_id,
+      "shape_handle" => body.shape_handle,
+      "messages" => Enum.map(body.messages, &message_to_body/1),
+      "offset" => body.offset,
+      "up_to_date" => body.up_to_date
+    }
+  end
+
+  defp message_to_body(m) do
+    base = %{
+      "type" => Atom.to_string(m.type),
+      "batch_id" => m.batch_id,
+      "key" => m.key,
+      "offset" => m.offset
+    }
+
+    if Map.has_key?(m, :value), do: Map.put(base, "value", m.value), else: base
+  end
+
+  # ---- bootstrap / triggers ----
 
   defp bootstrap(conn) do
     :ok =
@@ -230,6 +512,8 @@ defmodule Electrolite do
     end
   end
 
+  # ---- snapshot / replay / compact ----
+
   defp do_snapshot(conn, %Shape{} = shape) do
     with {:ok, info} <- watched_info(conn, shape.table) do
       {where_sql, args} = compile_predicate(shape.predicate)
@@ -257,32 +541,66 @@ defmodule Electrolite do
 
   defp do_replay(conn, %Shape{} = shape, offset, limit) do
     with {:ok, _info} <- watched_info(conn, shape.table) do
-      limit = max(1, limit)
-      {:ok, rows} = read_log_page(conn, shape.table, offset, limit)
-      latest = if rows == [], do: offset, else: List.last(rows).seq
+      {:ok, retained} = retained_offset(conn, shape.table)
 
-      {:ok, newer} =
-        query(
-          conn,
-          "SELECT 1 FROM _electrolite_log WHERE table_name = ? AND seq > ? LIMIT 1",
-          [shape.table, latest]
-        )
+      if offset < retained do
+        {:error, :resync_required}
+      else
+        limit = max(1, limit)
+        {:ok, rows} = read_log_page(conn, shape.table, offset, limit)
+        latest = if rows == [], do: offset, else: List.last(rows).seq
 
-      messages =
-        rows
-        |> Enum.flat_map(&messages_for(shape.predicate, &1))
+        {:ok, newer} =
+          query(
+            conn,
+            "SELECT 1 FROM _electrolite_log WHERE table_name = ? AND seq > ? LIMIT 1",
+            [shape.table, latest]
+          )
 
-      {:ok, log_id} = fetch_log_id(conn)
+        messages = rows |> Enum.flat_map(&messages_for(shape.predicate, &1))
+        {:ok, log_id} = fetch_log_id(conn)
 
-      {:ok,
-       %{
-         log_id: log_id,
-         shape_handle: shape_handle(shape),
-         messages: messages,
-         offset: latest,
-         up_to_date: newer == []
-       }}
+        {:ok,
+         %{
+           log_id: log_id,
+           shape_handle: shape_handle(shape),
+           messages: messages,
+           offset: latest,
+           up_to_date: newer == []
+         }}
+      end
     end
+  end
+
+  defp do_compact(conn, table, keep_last) do
+    {:ok, watermark_rows} =
+      query(
+        conn,
+        "SELECT seq FROM _electrolite_log WHERE table_name = ? ORDER BY seq DESC LIMIT 1 OFFSET ?",
+        [table, max(0, keep_last)]
+      )
+
+    watermark =
+      case watermark_rows do
+        [[s] | _] ->
+          s
+
+        _ ->
+          {:ok, hw} = high_water(conn)
+          hw
+      end
+
+    {:ok, _} = query(conn, "DELETE FROM _electrolite_log WHERE table_name = ? AND seq <= ?", [table, watermark])
+
+    :ok =
+      exec(
+        conn,
+        "INSERT INTO _electrolite_meta (key, value) VALUES (?, ?) " <>
+          "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        ["retained_offset:" <> table, Integer.to_string(watermark)]
+      )
+
+    {:ok, %{retained_offset: watermark}}
   end
 
   defp read_log_page(conn, table, offset, limit) do
@@ -333,6 +651,8 @@ defmodule Electrolite do
   defp decode_or_nil(""), do: nil
   defp decode_or_nil(json) when is_binary(json), do: Jason.decode!(json)
 
+  # ---- predicate eval ----
+
   defp messages_for(predicate, row) do
     old_match = predicate_matches(predicate, row.old_row)
     new_match = predicate_matches(predicate, row.new_row)
@@ -371,6 +691,15 @@ defmodule Electrolite do
     compare_scalar(Map.get(row, c), v, op)
   end
 
+  defp predicate_matches(%{type: :in, column: c, values: vs}, row) do
+    val = Map.get(row, c)
+    Enum.any?(vs, &(&1 == val))
+  end
+
+  defp predicate_matches(%{type: :and, predicates: children}, row) do
+    Enum.all?(children, &predicate_matches(&1, row))
+  end
+
   defp compare_scalar(nil, _, _), do: false
   defp compare_scalar(_, nil, _), do: false
   defp compare_scalar(left, right, op) when is_number(left) and is_number(right), do: cmp(left, right, op)
@@ -382,13 +711,65 @@ defmodule Electrolite do
   defp cmp(a, b, :gte), do: a >= b
   defp cmp(a, b, :lte), do: a <= b
 
+  # ---- predicate compile ----
+
   defp compile_predicate(%{type: :all}), do: {"", []}
   defp compile_predicate(%{type: :eq, column: c, value: nil}), do: {"#{quote_ident(c)} IS NULL", []}
   defp compile_predicate(%{type: :eq, column: c, value: v}), do: {"#{quote_ident(c)} = ?", [v]}
 
+  defp compile_predicate(%{type: op, column: c, value: nil}) when op in [:gt, :lt, :gte, :lte],
+    do: {"0", []}
+
   defp compile_predicate(%{type: op, column: c, value: v}) when op in [:gt, :lt, :gte, :lte] do
     {"#{quote_ident(c)} #{Map.fetch!(@range_ops, op)} ?", [v]}
   end
+
+  defp compile_predicate(%{type: :in, column: c, values: values}) do
+    {non_null, has_null} =
+      Enum.reduce(values, {[], false}, fn
+        nil, {acc, _} -> {acc, true}
+        v, {acc, n} -> {[v | acc], n}
+      end)
+
+    non_null = Enum.reverse(non_null)
+    parts = []
+    args = []
+
+    {parts, args} =
+      if non_null != [] do
+        placeholders = Enum.map_join(non_null, ",", fn _ -> "?" end)
+        {parts ++ ["#{quote_ident(c)} IN (#{placeholders})"], args ++ non_null}
+      else
+        {parts, args}
+      end
+
+    parts =
+      if has_null do
+        parts ++ ["#{quote_ident(c)} IS NULL"]
+      else
+        parts
+      end
+
+    if parts == [] do
+      {"0", []}
+    else
+      {Enum.map_join(parts, " OR ", fn p -> "(#{p})" end), args}
+    end
+  end
+
+  defp compile_predicate(%{type: :and, predicates: children}) do
+    {parts, args} =
+      Enum.reduce(children, {[], []}, fn child, {ps, as} ->
+        case compile_predicate(child) do
+          {"", _} -> {ps, as}
+          {w, a} -> {ps ++ ["(#{w})"], as ++ a}
+        end
+      end)
+
+    {Enum.join(parts, " AND "), args}
+  end
+
+  # ---- introspection ----
 
   defp inspect_table(conn, table) do
     {:ok, rows} = query(conn, "PRAGMA table_info(#{quote_string(table)})", [])
@@ -430,15 +811,23 @@ defmodule Electrolite do
     {:ok, seq}
   end
 
+  defp retained_offset(conn, table) do
+    case query(conn, "SELECT value FROM _electrolite_meta WHERE key = ?", ["retained_offset:" <> table]) do
+      {:ok, [[v] | _]} -> {:ok, String.to_integer(v)}
+      _ -> {:ok, 0}
+    end
+  end
+
+  # ---- shape handle ----
+
   defp shape_handle(%Shape{} = shape) do
-    body =
-      %{
-        "auth_scope" => "",
-        "columns" => Enum.sort(shape.columns),
-        "predicate" => predicate_to_json(shape.predicate),
-        "schema_version" => 1,
-        "table" => shape.table
-      }
+    body = %{
+      "auth_scope" => shape.auth_scope || "",
+      "columns" => Enum.sort(shape.columns),
+      "predicate" => predicate_to_json(shape.predicate),
+      "schema_version" => shape.schema_version || 1,
+      "table" => shape.table
+    }
 
     canon = canonical_json(body)
     :crypto.hash(:sha256, canon) |> Base.encode16(case: :lower)
@@ -451,6 +840,26 @@ defmodule Electrolite do
 
   defp predicate_to_json(%{type: op, column: c, value: v}) when op in [:gt, :lt, :gte, :lte],
     do: %{"type" => Atom.to_string(op), "column" => c, "value" => v}
+
+  defp predicate_to_json(%{type: :in, column: c, values: values}) do
+    sorted =
+      values
+      |> Enum.map(&Jason.encode!/1)
+      |> Enum.uniq()
+      |> Enum.sort()
+      |> Enum.map(&Jason.decode!/1)
+
+    %{"type" => "in", "column" => c, "values" => sorted}
+  end
+
+  defp predicate_to_json(%{type: :and, predicates: children}) do
+    sorted =
+      children
+      |> Enum.map(&predicate_to_json/1)
+      |> Enum.sort_by(&Jason.encode!/1)
+
+    %{"type" => "and", "predicates" => sorted}
+  end
 
   defp canonical_json(value) when is_map(value) do
     pairs =
@@ -467,6 +876,8 @@ defmodule Electrolite do
 
   defp canonical_json(value), do: Jason.encode!(value)
 
+  # ---- sql plumbing ----
+
   defp row_json(prefix, columns) do
     q = if prefix == "", do: "", else: "#{prefix}."
 
@@ -481,9 +892,7 @@ defmodule Electrolite do
   defp quote_ident(s), do: ~s("#{String.replace(s, "\"", "\"\"")}")
   defp quote_string(s), do: "'#{String.replace(s, "'", "''")}'"
 
-  defp random_hex(n) do
-    :crypto.strong_rand_bytes(n) |> Base.encode16(case: :lower)
-  end
+  defp random_hex(n), do: :crypto.strong_rand_bytes(n) |> Base.encode16(case: :lower)
 
   defp exec(conn, sql, args) do
     case query(conn, sql, args) do

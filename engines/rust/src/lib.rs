@@ -1,13 +1,16 @@
-//! Tiny experimental Electrolite engine for Rust.
-//!
-//! Mirrors the protocol shape of the Python and Node engines:
-//! install SQLite triggers, take a snapshot, replay logical changes,
-//! and run explicit write batches with a shared batch_id.
+//! Electrolite engine for Rust. Implements the conformance contract in
+//! `engines/PROTOCOL.md`: install SQLite triggers, snapshot a shape,
+//! replay logical changes, share a `batch_id` across `write_batch`,
+//! detect log-id and retained-offset mismatches as `409
+//! resync_required`, and serve named shapes through `handle()`.
 
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use serde_json::{json, Map, Value as Json};
+use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+// ---------- predicates ----------
 
 #[derive(Clone, Debug)]
 pub enum RangeOp {
@@ -34,6 +37,15 @@ impl RangeOp {
             RangeOp::Lte => "lte",
         }
     }
+    pub fn from_key(k: &str) -> Option<Self> {
+        match k {
+            "gt" => Some(RangeOp::Gt),
+            "lt" => Some(RangeOp::Lt),
+            "gte" => Some(RangeOp::Gte),
+            "lte" => Some(RangeOp::Lte),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -41,18 +53,121 @@ pub enum Predicate {
     All,
     Eq { column: String, value: Json },
     Range { op: RangeOp, column: String, value: Json },
+    In { column: String, values: Vec<Json> },
+    And(Vec<Predicate>),
 }
+
+pub fn all() -> Predicate {
+    Predicate::All
+}
+pub fn eq<S: Into<String>>(column: S, value: Json) -> Predicate {
+    Predicate::Eq { column: column.into(), value }
+}
+pub fn gt<S: Into<String>>(column: S, value: Json) -> Predicate {
+    Predicate::Range { op: RangeOp::Gt, column: column.into(), value }
+}
+pub fn lt<S: Into<String>>(column: S, value: Json) -> Predicate {
+    Predicate::Range { op: RangeOp::Lt, column: column.into(), value }
+}
+pub fn gte<S: Into<String>>(column: S, value: Json) -> Predicate {
+    Predicate::Range { op: RangeOp::Gte, column: column.into(), value }
+}
+pub fn lte<S: Into<String>>(column: S, value: Json) -> Predicate {
+    Predicate::Range { op: RangeOp::Lte, column: column.into(), value }
+}
+pub fn in_list<S: Into<String>>(column: S, values: Vec<Json>) -> Predicate {
+    Predicate::In { column: column.into(), values }
+}
+pub fn and(children: Vec<Predicate>) -> Predicate {
+    Predicate::And(children)
+}
+
+// ---------- shapes ----------
 
 #[derive(Clone, Debug)]
 pub struct Shape {
     pub table: String,
     pub columns: Vec<String>,
     pub predicate: Predicate,
+    pub auth_scope: String,
+    pub schema_version: u32,
 }
+
+impl Shape {
+    pub fn new<S: Into<String>>(table: S, columns: Vec<String>, predicate: Predicate) -> Self {
+        Self {
+            table: table.into(),
+            columns,
+            predicate,
+            auth_scope: String::new(),
+            schema_version: 1,
+        }
+    }
+}
+
+pub struct BuildContext<'a> {
+    pub params: &'a HashMap<String, String>,
+    pub context: &'a Json,
+}
+
+pub struct AuthContext<'a> {
+    pub params: &'a HashMap<String, String>,
+    pub context: &'a Json,
+    pub scope: &'a str,
+}
+
+type WhereFn = Box<dyn Fn(&BuildContext) -> Predicate + Send + Sync>;
+type ScopeFn = Box<dyn Fn(&BuildContext) -> String + Send + Sync>;
+type AuthFn = Box<dyn Fn(&AuthContext) -> bool + Send + Sync>;
+
+pub struct ShapeDef {
+    pub table: String,
+    pub columns: Vec<String>,
+    pub params: Vec<String>,
+    pub where_fn: Option<WhereFn>,
+    pub scope_fn: Option<ScopeFn>,
+    pub authorize_fn: Option<AuthFn>,
+    pub schema_version: u32,
+}
+
+impl ShapeDef {
+    pub fn new<S: Into<String>>(table: S, columns: Vec<String>) -> Self {
+        Self {
+            table: table.into(),
+            columns,
+            params: Vec::new(),
+            where_fn: None,
+            scope_fn: None,
+            authorize_fn: None,
+            schema_version: 1,
+        }
+    }
+    pub fn params(mut self, params: Vec<String>) -> Self {
+        self.params = params;
+        self
+    }
+    pub fn where_fn(mut self, f: impl Fn(&BuildContext) -> Predicate + Send + Sync + 'static) -> Self {
+        self.where_fn = Some(Box::new(f));
+        self
+    }
+    pub fn scope_fn(mut self, f: impl Fn(&BuildContext) -> String + Send + Sync + 'static) -> Self {
+        self.scope_fn = Some(Box::new(f));
+        self
+    }
+    pub fn authorize_fn(mut self, f: impl Fn(&AuthContext) -> bool + Send + Sync + 'static) -> Self {
+        self.authorize_fn = Some(Box::new(f));
+        self
+    }
+}
+
+// ---------- engine ----------
 
 pub struct Electrolite {
     db: Mutex<Connection>,
     wake: Arc<(Mutex<u64>, Condvar)>,
+    shapes: HashMap<String, ShapeDef>,
+    prefix: String,
+    replay_limit: i64,
     pub live_timeout: Duration,
 }
 
@@ -75,9 +190,16 @@ pub struct Replay {
 }
 
 #[derive(Debug)]
+pub struct CompactStats {
+    pub retained_offset: i64,
+    pub deleted_rows: usize,
+}
+
+#[derive(Debug)]
 pub enum Error {
     Sqlite(rusqlite::Error),
     Bad(String),
+    ResyncRequired,
 }
 
 impl From<rusqlite::Error> for Error {
@@ -91,10 +213,8 @@ impl Electrolite {
         let db = Connection::open(path)?;
         let wake: Arc<(Mutex<u64>, Condvar)> = Arc::new((Mutex::new(0), Condvar::new()));
 
-        // Use SQLite's update_hook so any row change in this connection
-        // (including writes that don't go through engine.execute()) wakes
-        // subscribers. The hook fires while SQLite's internal lock is held;
-        // waiters will block on the Connection mutex until the write returns.
+        // SQLite update_hook keeps the wake authoritative even when
+        // writes bypass engine.execute() on this connection.
         let wake_for_hook = Arc::clone(&wake);
         db.update_hook(Some(
             move |_action, _db: &str, _tbl: &str, _rowid: i64| {
@@ -108,10 +228,28 @@ impl Electrolite {
         let me = Self {
             db: Mutex::new(db),
             wake,
+            shapes: HashMap::new(),
+            prefix: "/electrolite/v1".to_string(),
+            replay_limit: 1000,
             live_timeout: Duration::from_millis(20_000),
         };
         me.bootstrap()?;
         Ok(me)
+    }
+
+    pub fn add_shape<S: Into<String>>(&mut self, name: S, def: ShapeDef) -> &mut Self {
+        self.shapes.insert(name.into(), def);
+        self
+    }
+
+    pub fn set_prefix<S: Into<String>>(&mut self, prefix: S) -> &mut Self {
+        self.prefix = prefix.into();
+        self
+    }
+
+    pub fn set_replay_limit(&mut self, limit: i64) -> &mut Self {
+        self.replay_limit = limit.max(1);
+        self
     }
 
     fn bootstrap(&self) -> Result<(), Error> {
@@ -155,7 +293,6 @@ impl Electrolite {
     }
 
     pub fn execute(&self, sql: &str, args: &[Value]) -> Result<usize, Error> {
-        // update_hook handles wake on row changes; no manual notify needed.
         let db = self.db.lock().unwrap();
         Ok(db.execute(sql, params_from_iter(args.iter()))?)
     }
@@ -228,9 +365,37 @@ impl Electrolite {
         Ok(())
     }
 
+    pub fn compact(&self, table: &str, keep_last: usize) -> Result<CompactStats, Error> {
+        let db = self.db.lock().unwrap();
+        let watermark: Option<i64> = db
+            .query_row(
+                "SELECT seq FROM _electrolite_log WHERE table_name = ? ORDER BY seq DESC LIMIT 1 OFFSET ?",
+                params![table, keep_last as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let retained_offset = match watermark {
+            Some(s) => s,
+            None => high_water(&db)?,
+        };
+        let deleted = db.execute(
+            "DELETE FROM _electrolite_log WHERE table_name = ? AND seq <= ?",
+            params![table, retained_offset],
+        )?;
+        db.execute(
+            "INSERT INTO _electrolite_meta (key, value) VALUES (?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![format!("retained_offset:{table}"), retained_offset.to_string()],
+        )?;
+        Ok(CompactStats {
+            retained_offset,
+            deleted_rows: deleted,
+        })
+    }
+
     pub fn snapshot(&self, shape: &Shape) -> Result<Snapshot, Error> {
         let info = self.watched_info(&shape.table)?;
-        let normalized = normalize(shape);
+        let normalized = normalize_shape(shape);
         let (where_sql, args) = compile_predicate(&shape.predicate);
         let mut sql = format!(
             "SELECT {} AS row_json FROM {}",
@@ -271,8 +436,12 @@ impl Electrolite {
 
     pub fn replay(&self, shape: &Shape, offset: i64, limit: i64) -> Result<Replay, Error> {
         let _info = self.watched_info(&shape.table)?;
-        let normalized = normalize(shape);
+        let normalized = normalize_shape(shape);
         let db = self.db.lock().unwrap();
+        let retained = retained_offset(&db, &shape.table)?;
+        if offset < retained {
+            return Err(Error::ResyncRequired);
+        }
         let mut stmt = db.prepare(
             "SELECT seq, batch_id, op, pk_json, old_pk_json, new_pk_json, old_json, new_json \
              FROM _electrolite_log WHERE table_name = ? AND seq > ? ORDER BY seq LIMIT ?",
@@ -322,6 +491,141 @@ impl Electrolite {
         let _ = cv.wait_timeout(lock, self.live_timeout).unwrap();
     }
 
+    fn wait_for_change_until(&self, deadline: Instant) {
+        let now = Instant::now();
+        if deadline <= now {
+            return;
+        }
+        let (lock, cv) = &*self.wake;
+        let lock = lock.lock().unwrap();
+        let _ = cv.wait_timeout(lock, deadline - now).unwrap();
+    }
+
+    pub fn handle(&self, path: &str, query: &str, context: &Json) -> (u16, Json) {
+        let route = match self.parse_route(path, query) {
+            Some(r) => r,
+            None => return (404, json!({"error": "shape_not_found"})),
+        };
+        let def = match self.shapes.get(&route.name) {
+            Some(d) => d,
+            None => return (404, json!({"error": "shape_not_found"})),
+        };
+
+        let params: HashMap<String, String> = def
+            .params
+            .iter()
+            .cloned()
+            .zip(route.params.iter().cloned())
+            .collect();
+        if params.len() != def.params.len() {
+            return (404, json!({"error": "shape_not_found"}));
+        }
+        let build_ctx = BuildContext { params: &params, context };
+        let scope = def
+            .scope_fn
+            .as_ref()
+            .map(|f| f(&build_ctx))
+            .unwrap_or_default();
+        let auth_ctx = AuthContext { params: &params, context, scope: &scope };
+        if let Some(authorize) = &def.authorize_fn {
+            if !authorize(&auth_ctx) {
+                return (404, json!({"error": "shape_not_found"}));
+            }
+        }
+        let predicate = def
+            .where_fn
+            .as_ref()
+            .map(|f| f(&build_ctx))
+            .unwrap_or(Predicate::All);
+
+        let shape = Shape {
+            table: def.table.clone(),
+            columns: def.columns.clone(),
+            predicate,
+            auth_scope: scope.clone(),
+            schema_version: def.schema_version,
+        };
+        let normalized = normalize_shape(&shape);
+        let current_handle = handle(&normalized);
+        let current_log_id = match self.current_log_id() {
+            Ok(s) => s,
+            Err(_) => return (500, json!({"error": "internal"})),
+        };
+
+        if route.offset >= 0 {
+            if let Some(client_log_id) = &route.log_id {
+                if client_log_id != &current_log_id {
+                    return (409, json!({"error": "resync_required"}));
+                }
+            }
+            if let Some(client_handle) = &route.shape_handle {
+                if client_handle != &current_handle {
+                    return (409, json!({"error": "resync_required"}));
+                }
+            }
+        }
+
+        if route.offset < 0 {
+            return match self.snapshot(&shape) {
+                Ok(s) => (200, snapshot_to_json(&s)),
+                Err(Error::ResyncRequired) => (409, json!({"error": "resync_required"})),
+                Err(_) => (500, json!({"error": "internal"})),
+            };
+        }
+
+        let body = match self.replay(&shape, route.offset, self.replay_limit) {
+            Ok(b) => b,
+            Err(Error::ResyncRequired) => return (409, json!({"error": "resync_required"})),
+            Err(_) => return (500, json!({"error": "internal"})),
+        };
+        if route.live && body.messages.is_empty() && body.up_to_date {
+            let deadline = Instant::now() + self.live_timeout;
+            self.wait_for_change_until(deadline);
+            let body = match self.replay(&shape, route.offset, self.replay_limit) {
+                Ok(b) => b,
+                Err(Error::ResyncRequired) => return (409, json!({"error": "resync_required"})),
+                Err(_) => return (500, json!({"error": "internal"})),
+            };
+            return (200, replay_to_json(&body));
+        }
+        (200, replay_to_json(&body))
+    }
+
+    fn parse_route(&self, path: &str, query: &str) -> Option<Route> {
+        let prefix = format!("{}/", self.prefix);
+        if !path.starts_with(&prefix) {
+            return None;
+        }
+        let rest = &path[prefix.len()..];
+        let parts: Vec<String> = rest
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if parts.is_empty() {
+            return None;
+        }
+        let qp = parse_query(query);
+        let offset = qp
+            .get("offset")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(-1);
+        let live = qp.get("live").map(|s| s == "true").unwrap_or(false);
+        Some(Route {
+            name: parts[0].clone(),
+            params: parts[1..].to_vec(),
+            offset,
+            live,
+            log_id: qp.get("log_id").cloned(),
+            shape_handle: qp.get("shape_handle").cloned(),
+        })
+    }
+
+    fn current_log_id(&self) -> Result<String, Error> {
+        let db = self.db.lock().unwrap();
+        log_id(&db)
+    }
+
     fn inspect_table(&self, table: &str) -> Result<TableInfo, Error> {
         let db = self.db.lock().unwrap();
         let mut stmt = db.prepare(&format!("PRAGMA table_info({})", quote_string(table)))?;
@@ -365,6 +669,15 @@ impl Electrolite {
     }
 }
 
+struct Route {
+    name: String,
+    params: Vec<String>,
+    offset: i64,
+    live: bool,
+    log_id: Option<String>,
+    shape_handle: Option<String>,
+}
+
 struct TableInfo {
     columns: Vec<String>,
     pk: Vec<String>,
@@ -374,6 +687,7 @@ struct TableInfo {
 struct LogRow {
     seq: i64,
     batch_id: String,
+    #[allow(dead_code)]
     op: String,
     pk: Json,
     old_pk: Option<Json>,
@@ -415,6 +729,11 @@ fn predicate_matches(p: &Predicate, row: &Option<Json>) -> bool {
             Some(left) => compare_json(left, value, op),
             None => false,
         },
+        Predicate::In { column, values } => {
+            let left = row.get(column);
+            values.iter().any(|v| Some(v) == left)
+        }
+        Predicate::And(children) => children.iter().all(|c| predicate_matches(c, &Some(row.clone()))),
     }
 }
 
@@ -488,12 +807,52 @@ fn compile_predicate(p: &Predicate) -> (String, Vec<Value>) {
         }
         Predicate::Range { op, column, value } => {
             if value.is_null() {
-                panic!("range predicate {} requires a non-null value", op.key());
+                ("0".to_string(), vec![])
+            } else {
+                (
+                    format!("{} {} ?", quote_ident(column), op.sql()),
+                    vec![json_to_value(value)],
+                )
+            }
+        }
+        Predicate::In { column, values } => {
+            if values.is_empty() {
+                return ("0".to_string(), vec![]);
+            }
+            let non_null: Vec<&Json> = values.iter().filter(|v| !v.is_null()).collect();
+            let has_null = non_null.len() != values.len();
+            let mut parts: Vec<String> = vec![];
+            let mut args: Vec<Value> = vec![];
+            if !non_null.is_empty() {
+                let placeholders = vec!["?"; non_null.len()].join(",");
+                parts.push(format!("{} IN ({})", quote_ident(column), placeholders));
+                args.extend(non_null.iter().map(|v| json_to_value(v)));
+            }
+            if has_null {
+                parts.push(format!("{} IS NULL", quote_ident(column)));
             }
             (
-                format!("{} {} ?", quote_ident(column), op.sql()),
-                vec![json_to_value(value)],
+                parts
+                    .into_iter()
+                    .map(|p| format!("({})", p))
+                    .collect::<Vec<_>>()
+                    .join(" OR "),
+                args,
             )
+        }
+        Predicate::And(children) => {
+            let compiled: Vec<(String, Vec<Value>)> = children
+                .iter()
+                .map(compile_predicate)
+                .filter(|(w, _)| !w.is_empty())
+                .collect();
+            let where_part = compiled
+                .iter()
+                .map(|(w, _)| format!("({})", w))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let args = compiled.into_iter().flat_map(|(_, a)| a).collect();
+            (where_part, args)
         }
     }
 }
@@ -514,22 +873,44 @@ fn json_to_value(v: &Json) -> Value {
     }
 }
 
-fn normalize(shape: &Shape) -> Json {
-    let mut cols = shape.columns.clone();
-    cols.sort();
-    let pred = match &shape.predicate {
+fn predicate_to_json(p: &Predicate) -> Json {
+    match p {
         Predicate::All => json!({"type": "all"}),
         Predicate::Eq { column, value } => json!({"type": "eq", "column": column, "value": value}),
         Predicate::Range { op, column, value } => {
             json!({"type": op.key(), "column": column, "value": value})
         }
-    };
+        Predicate::In { column, values } => {
+            let mut sorted: Vec<Json> = values.clone();
+            sorted.sort_by(|a, b| {
+                serde_json::to_string(a)
+                    .unwrap()
+                    .cmp(&serde_json::to_string(b).unwrap())
+            });
+            sorted.dedup_by(|a, b| serde_json::to_string(a).unwrap() == serde_json::to_string(b).unwrap());
+            json!({"type": "in", "column": column, "values": sorted})
+        }
+        Predicate::And(children) => {
+            let mut child_jsons: Vec<Json> = children.iter().map(predicate_to_json).collect();
+            child_jsons.sort_by(|a, b| {
+                serde_json::to_string(a)
+                    .unwrap()
+                    .cmp(&serde_json::to_string(b).unwrap())
+            });
+            json!({"type": "and", "predicates": child_jsons})
+        }
+    }
+}
+
+fn normalize_shape(shape: &Shape) -> Json {
+    let mut cols = shape.columns.clone();
+    cols.sort();
     json!({
-        "table": shape.table,
+        "auth_scope": shape.auth_scope,
         "columns": cols,
-        "predicate": pred,
-        "auth_scope": "",
-        "schema_version": 1,
+        "predicate": predicate_to_json(&shape.predicate),
+        "schema_version": shape.schema_version,
+        "table": shape.table,
     })
 }
 
@@ -565,6 +946,83 @@ fn log_id(db: &Connection) -> Result<String, Error> {
         [],
         |r| r.get(0),
     )?)
+}
+
+fn retained_offset(db: &Connection, table: &str) -> Result<i64, Error> {
+    let row: Option<String> = db
+        .query_row(
+            "SELECT value FROM _electrolite_meta WHERE key = ?",
+            params![format!("retained_offset:{table}")],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(row.and_then(|s| s.parse().ok()).unwrap_or(0))
+}
+
+fn parse_query(query: &str) -> HashMap<String, String> {
+    let q = query.trim_start_matches('?');
+    let mut out = HashMap::new();
+    if q.is_empty() {
+        return out;
+    }
+    for pair in q.split('&') {
+        let mut it = pair.splitn(2, '=');
+        let k = it.next().unwrap_or("");
+        let v = it.next().unwrap_or("");
+        if !k.is_empty() {
+            out.insert(k.to_string(), url_decode(v));
+        }
+    }
+    out
+}
+
+fn url_decode(s: &str) -> String {
+    // Minimal: handle %XX and +. Good enough for the tests we drive.
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16).unwrap_or(0);
+                let lo = (bytes[i + 2] as char).to_digit(16).unwrap_or(0);
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
+
+fn snapshot_to_json(s: &Snapshot) -> Json {
+    json!({
+        "type": "snapshot",
+        "log_id": s.log_id,
+        "shape_handle": s.shape_handle,
+        "key_columns": s.key_columns,
+        "rows": s.rows,
+        "offset": s.offset,
+        "up_to_date": true,
+    })
+}
+
+fn replay_to_json(r: &Replay) -> Json {
+    json!({
+        "type": "replay",
+        "log_id": r.log_id,
+        "shape_handle": r.shape_handle,
+        "messages": r.messages,
+        "offset": r.offset,
+        "up_to_date": r.up_to_date,
+    })
 }
 
 fn row_json(prefix: &str, columns: &[String]) -> String {
@@ -605,7 +1063,6 @@ fn random_hex(bytes: usize) -> String {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    // Minimal SHA-256 implementation to avoid pulling a crypto crate.
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
