@@ -179,6 +179,7 @@ type Replay struct {
 	Messages    []Message `json:"messages"`
 	Offset      int64     `json:"offset"`
 	UpToDate    bool      `json:"up_to_date"`
+	Replica     string    `json:"replica,omitempty"`
 }
 
 // CompactStats is what compact() returns.
@@ -485,8 +486,23 @@ func (e *Electrolite) Snapshot(s Shape) (*Snapshot, error) {
 	}, nil
 }
 
-// Replay returns logical changes after offset, snapping batch boundaries.
+// ReplicaMode controls whether UPDATE messages carry the full new
+// row or only the changed columns.
+type ReplicaMode string
+
+const (
+	ReplicaFull ReplicaMode = "full"
+	ReplicaDiff ReplicaMode = "diff"
+)
+
+// Replay returns logical changes after offset, snapping batch
+// boundaries. Defaults to ReplicaFull; use ReplayWithReplica to
+// request diff-mode UPDATE messages.
 func (e *Electrolite) Replay(s Shape, offset, limit int64) (*Replay, error) {
+	return e.ReplayWithReplica(s, offset, limit, ReplicaFull)
+}
+
+func (e *Electrolite) ReplayWithReplica(s Shape, offset, limit int64, replica ReplicaMode) (*Replay, error) {
 	if s.SchemaVersion == 0 {
 		s.SchemaVersion = 1
 	}
@@ -519,7 +535,7 @@ func (e *Electrolite) Replay(s Shape, offset, limit int64) (*Replay, error) {
 		if r.Seq > latest {
 			latest = r.Seq
 		}
-		msgs = append(msgs, messagesFor(s.Predicate, r)...)
+		msgs = append(msgs, messagesFor(s.Predicate, r, replica)...)
 	}
 	if msgs == nil {
 		msgs = []Message{}
@@ -537,13 +553,17 @@ func (e *Electrolite) Replay(s Shape, offset, limit int64) (*Replay, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Replay{
+	r := &Replay{
 		LogID:       logID,
 		ShapeHandle: shapeHandle(s),
 		Messages:    msgs,
 		Offset:      latest,
 		UpToDate:    upToDate,
-	}, nil
+	}
+	if replica == ReplicaDiff {
+		r.Replica = "diff"
+	}
+	return r, nil
 }
 
 // WaitForChange blocks until Exec/ExecBatch/WriteBatch fires or LiveTimeout.
@@ -660,7 +680,7 @@ func (e *Electrolite) Handle(path, query string, context interface{}) HandleResp
 		}}
 	}
 
-	body, err := e.Replay(shape, route.Offset, e.replayLimit)
+	body, err := e.ReplayWithReplica(shape, route.Offset, e.replayLimit, route.Replica)
 	if err != nil {
 		if _, ok := err.(errResync); ok {
 			return HandleResponse{Status: 409, Body: errBody("resync_required")}
@@ -683,7 +703,7 @@ func (e *Electrolite) Handle(path, query string, context interface{}) HandleResp
 				"shutdown":     true,
 			}}
 		}
-		body, err = e.Replay(shape, route.Offset, e.replayLimit)
+		body, err = e.ReplayWithReplica(shape, route.Offset, e.replayLimit, route.Replica)
 		if err != nil {
 			if _, ok := err.(errResync); ok {
 				return HandleResponse{Status: 409, Body: errBody("resync_required")}
@@ -694,14 +714,18 @@ func (e *Electrolite) Handle(path, query string, context interface{}) HandleResp
 			return HandleResponse{Status: 500, Body: errBody("internal")}
 		}
 	}
-	return HandleResponse{Status: 200, Body: map[string]interface{}{
+	out := map[string]interface{}{
 		"type":         "replay",
 		"log_id":       body.LogID,
 		"shape_handle": body.ShapeHandle,
 		"messages":     body.Messages,
 		"offset":       body.Offset,
 		"up_to_date":   body.UpToDate,
-	}}
+	}
+	if body.Replica != "" {
+		out["replica"] = body.Replica
+	}
+	return HandleResponse{Status: 200, Body: out}
 }
 
 func (e *Electrolite) waitUntil(deadline time.Time) {
@@ -732,6 +756,7 @@ type route struct {
 	Live        bool
 	LogID       string
 	ShapeHandle string
+	Replica     ReplicaMode
 }
 
 // parseRoute returns (route, ok=true) on success, (zero, ok=false)
@@ -761,6 +786,10 @@ func (e *Electrolite) parseRoute(path, query string) (route, bool, error) {
 		}
 		off = x
 	}
+	replica := ReplicaFull
+	if values.Get("replica") == "diff" {
+		replica = ReplicaDiff
+	}
 	return route{
 		Name:        parts[0],
 		Params:      parts[1:],
@@ -768,6 +797,7 @@ func (e *Electrolite) parseRoute(path, query string) (route, bool, error) {
 		Live:        values.Get("live") == "true",
 		LogID:       values.Get("log_id"),
 		ShapeHandle: values.Get("shape_handle"),
+		Replica:     replica,
 	}, true, nil
 }
 
@@ -1042,7 +1072,7 @@ func scanLogRow(rows *sql.Rows) (logRow, error) {
 	return r, nil
 }
 
-func messagesFor(p Predicate, r logRow) []Message {
+func messagesFor(p Predicate, r logRow, replica ReplicaMode) []Message {
 	oldMatch := predicateMatches(p, r.OldRow)
 	newMatch := predicateMatches(p, r.NewRow)
 	oldKey := r.OldPK
@@ -1054,11 +1084,19 @@ func messagesFor(p Predicate, r logRow) []Message {
 		newKey = r.PK
 	}
 	if !oldMatch && newMatch && r.NewRow != nil {
+		// Predicate-transition INSERT always carries full row.
 		return []Message{newMsg("insert", r, newKey, r.NewRow)}
 	}
 	if oldMatch && newMatch && r.NewRow != nil {
 		if mapEq(oldKey, newKey) {
-			return []Message{newMsg("update", r, newKey, r.NewRow)}
+			value := r.NewRow
+			if replica == ReplicaDiff && r.OldRow != nil {
+				value = diffRow(r.OldRow, r.NewRow)
+				if len(value) == 0 {
+					return nil
+				}
+			}
+			return []Message{newMsg("update", r, newKey, value)}
 		}
 		return []Message{newMsg("delete", r, oldKey, nil), newMsg("insert", r, newKey, r.NewRow)}
 	}
@@ -1066,6 +1104,16 @@ func messagesFor(p Predicate, r logRow) []Message {
 		return []Message{newMsg("delete", r, oldKey, nil)}
 	}
 	return nil
+}
+
+func diffRow(old, new map[string]interface{}) map[string]interface{} {
+	out := map[string]interface{}{}
+	for k, v := range new {
+		if !jsonEqual(old[k], v) {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 func newMsg(kind string, r logRow, key, value map[string]interface{}) Message {

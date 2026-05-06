@@ -11,6 +11,7 @@ export class ShapeClient {
       transport = "long-poll",
       headers,
       onError,
+      replica = "full",
     } = options;
     if (keyColumns !== undefined && (!Array.isArray(keyColumns) || keyColumns.length === 0)) {
       throw new Error("ShapeClient keyColumns must be a non-empty array");
@@ -30,6 +31,10 @@ export class ShapeClient {
     this.headersFn = headers ?? null;
     this.onError = onError ?? null;
     this.maxOnErrorRetries = 3;
+    if (replica !== "full" && replica !== "diff") {
+      throw new Error(`ShapeClient replica must be 'full' or 'diff', got ${replica}`);
+    }
+    this.replica = replica;
     this.retryMinDelayMs = retry.minDelayMs ?? 250;
     this.retryMaxDelayMs = retry.maxDelayMs ?? 5_000;
     this.logId = null;
@@ -319,6 +324,9 @@ export class ShapeClient {
     if (this.logId && params.offset >= 0) {
       url.searchParams.set("log_id", this.logId);
     }
+    if (this.replica === "diff") {
+      url.searchParams.set("replica", "diff");
+    }
     return url;
   }
 
@@ -367,10 +375,11 @@ export class ShapeClient {
       if (body.shape_handle) {
         this.shapeHandle = body.shape_handle;
       }
+      const isDiff = body.replica === "diff";
       let changed = false;
       const nextRows = new Map(this.pendingRows ?? this.rows);
       for (const message of body.messages) {
-        changed = this.applyMessageTo(nextRows, message) || changed;
+        changed = this.applyMessageTo(nextRows, message, isDiff) || changed;
         this.emitEvent({ type: message.type, offset: message.offset, message });
       }
       this.offset = body.offset;
@@ -405,12 +414,26 @@ export class ShapeClient {
     return this.applyMessageTo(this.rows, message);
   }
 
-  applyMessageTo(rows, message) {
+  applyMessageTo(rows, message, isDiff = false) {
     const key = JSON.stringify(message.key);
     if (message.type === "delete") {
       return rows.delete(key);
     }
-    if (message.type === "insert" || message.type === "update") {
+    if (message.type === "insert") {
+      rows.set(key, message.value);
+      return true;
+    }
+    if (message.type === "update") {
+      // In diff mode, the value is a sparse object of only changed
+      // columns. Merge into the existing row instead of overwriting
+      // so untouched columns survive.
+      if (isDiff) {
+        const existing = rows.get(key);
+        if (existing) {
+          rows.set(key, { ...existing, ...message.value });
+          return true;
+        }
+      }
       rows.set(key, message.value);
       return true;
     }

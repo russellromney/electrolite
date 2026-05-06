@@ -190,6 +190,12 @@ pub struct Snapshot {
     pub offset: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaMode {
+    Full,
+    Diff,
+}
+
 #[derive(Debug)]
 pub struct Replay {
     pub log_id: String,
@@ -197,6 +203,7 @@ pub struct Replay {
     pub messages: Vec<Json>,
     pub offset: i64,
     pub up_to_date: bool,
+    pub replica: ReplicaMode,
 }
 
 #[derive(Debug)]
@@ -462,6 +469,16 @@ impl Electrolite {
     }
 
     pub fn replay(&self, shape: &Shape, offset: i64, limit: i64) -> Result<Replay, Error> {
+        self.replay_with_replica(shape, offset, limit, ReplicaMode::Full)
+    }
+
+    pub fn replay_with_replica(
+        &self,
+        shape: &Shape,
+        offset: i64,
+        limit: i64,
+        replica: ReplicaMode,
+    ) -> Result<Replay, Error> {
         let info = self.watched_info(&shape.table)?;
         let normalized_predicate = normalize_predicate(&info, &shape.predicate)?;
         let normalized_shape = Shape {
@@ -512,7 +529,7 @@ impl Electrolite {
 
         let mut messages = Vec::new();
         for r in &rows {
-            messages.extend(messages_for(&normalized_predicate, r));
+            messages.extend(messages_for(&normalized_predicate, r, replica));
         }
         Ok(Replay {
             log_id: log_id(&db)?,
@@ -520,6 +537,7 @@ impl Electrolite {
             messages,
             offset: latest,
             up_to_date: newer.is_none(),
+            replica,
         })
     }
 
@@ -633,7 +651,7 @@ impl Electrolite {
             };
         }
 
-        let body = match self.replay(&shape, route.offset, self.replay_limit) {
+        let body = match self.replay_with_replica(&shape, route.offset, self.replay_limit, route.replica) {
             Ok(b) => b,
             Err(Error::ResyncRequired) => return (409, json!({"error": "resync_required"})),
             Err(Error::BadInput(msg)) => {
@@ -658,7 +676,7 @@ impl Electrolite {
                     }),
                 );
             }
-            let body = match self.replay(&shape, route.offset, self.replay_limit) {
+            let body = match self.replay_with_replica(&shape, route.offset, self.replay_limit, route.replica) {
                 Ok(b) => b,
                 Err(Error::ResyncRequired) => return (409, json!({"error": "resync_required"})),
                 Err(Error::BadInput(msg)) => {
@@ -693,6 +711,10 @@ impl Electrolite {
                 .map_err(|_| format!("offset must be an integer, got {s:?}"))?,
         };
         let live = qp.get("live").map(|s| s == "true").unwrap_or(false);
+        let replica = match qp.get("replica").map(String::as_str) {
+            Some("diff") => ReplicaMode::Diff,
+            _ => ReplicaMode::Full,
+        };
         Ok(Some(Route {
             name: parts[0].clone(),
             params: parts[1..].to_vec(),
@@ -700,6 +722,7 @@ impl Electrolite {
             live,
             log_id: qp.get("log_id").cloned(),
             shape_handle: qp.get("shape_handle").cloned(),
+            replica,
         }))
     }
 
@@ -770,6 +793,7 @@ struct Route {
     live: bool,
     log_id: Option<String>,
     shape_handle: Option<String>,
+    replica: ReplicaMode,
 }
 
 struct TableInfo {
@@ -1032,20 +1056,31 @@ fn compare_json(left: &Json, right: &Json, op: &RangeOp) -> bool {
     }
 }
 
-fn messages_for(p: &Predicate, r: &LogRow) -> Vec<Json> {
+fn messages_for(p: &Predicate, r: &LogRow, replica: ReplicaMode) -> Vec<Json> {
     let old_match = predicate_matches(p, &r.old_row);
     let new_match = predicate_matches(p, &r.new_row);
     let old_key = r.old_pk.clone().unwrap_or_else(|| r.pk.clone());
     let new_key = r.new_pk.clone().unwrap_or_else(|| r.pk.clone());
     if !old_match && new_match {
         if let Some(v) = &r.new_row {
+            // Predicate-transition INSERT always carries the full row.
             return vec![msg("insert", r, &new_key, Some(v))];
         }
     }
     if old_match && new_match {
         if let Some(v) = &r.new_row {
             if old_key == new_key {
-                return vec![msg("update", r, &new_key, Some(v))];
+                let value = match replica {
+                    ReplicaMode::Diff => match &r.old_row {
+                        Some(old) => match diff_value(old, v) {
+                            Some(d) => d,
+                            None => return vec![],
+                        },
+                        None => v.clone(),
+                    },
+                    ReplicaMode::Full => v.clone(),
+                };
+                return vec![msg("update", r, &new_key, Some(&value))];
             }
             return vec![msg("delete", r, &old_key, None), msg("insert", r, &new_key, Some(v))];
         }
@@ -1054,6 +1089,22 @@ fn messages_for(p: &Predicate, r: &LogRow) -> Vec<Json> {
         return vec![msg("delete", r, &old_key, None)];
     }
     vec![]
+}
+
+fn diff_value(old: &Json, new: &Json) -> Option<Json> {
+    let old_map = old.as_object()?;
+    let new_map = new.as_object()?;
+    let mut out = Map::new();
+    for (k, v) in new_map {
+        if old_map.get(k) != Some(v) {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(Json::Object(out))
+    }
 }
 
 fn msg(kind: &str, r: &LogRow, key: &Json, value: Option<&Json>) -> Json {
@@ -1331,14 +1382,18 @@ fn snapshot_to_json(s: &Snapshot) -> Json {
 }
 
 fn replay_to_json(r: &Replay) -> Json {
-    json!({
+    let mut body = json!({
         "type": "replay",
         "log_id": r.log_id,
         "shape_handle": r.shape_handle,
         "messages": r.messages,
         "offset": r.offset,
         "up_to_date": r.up_to_date,
-    })
+    });
+    if r.replica == ReplicaMode::Diff {
+        body.as_object_mut().unwrap().insert("replica".into(), json!("diff"));
+    }
+    body
 }
 
 fn row_json(prefix: &str, columns: &[String]) -> String {

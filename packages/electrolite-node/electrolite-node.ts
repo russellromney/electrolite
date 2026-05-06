@@ -286,10 +286,10 @@ export class Electrolite<TContext = unknown> {
     }
 
     if (route.live) {
-      return this.liveResponse(built.shape, route.offset);
+      return this.liveResponse(built.shape, route.offset, (route as any).replica ?? "full");
     }
 
-    return this.replayResponse(built.shape, route.offset);
+    return this.replayResponse(built.shape, route.offset, (route as any).replica ?? "full");
   }
 
   async buildShape(
@@ -332,10 +332,10 @@ export class Electrolite<TContext = unknown> {
     };
   }
 
-  replayResponse(shape, offset) {
+  replayResponse(shape, offset, replica: "full" | "diff" = "full") {
     try {
       return jsonResponse(
-        JSON.parse(this.engine.replay(JSON.stringify(shape), Number(offset), this.replayLimit)),
+        JSON.parse(this.engine.replay(JSON.stringify(shape), Number(offset), this.replayLimit, replica)),
       );
     } catch (error) {
       if (isResyncError(error)) {
@@ -348,7 +348,7 @@ export class Electrolite<TContext = unknown> {
     }
   }
 
-  async liveResponse(shape, offset) {
+  async liveResponse(shape, offset, replica: "full" | "diff" = "full") {
     const shapeHandle = this.engine.shapeHandle(JSON.stringify(shape));
     this.activeShapes.set(shapeHandle, shape);
     try {
@@ -368,7 +368,7 @@ export class Electrolite<TContext = unknown> {
         let replay;
         try {
           replay = JSON.parse(
-            this.engine.replay(JSON.stringify(shape), Number(offset), this.replayLimit),
+            this.engine.replay(JSON.stringify(shape), Number(offset), this.replayLimit, replica),
           );
         } catch (error) {
           if (isResyncError(error)) {
@@ -445,12 +445,14 @@ export class Electrolite<TContext = unknown> {
         detail: `offset must be an integer, got ${JSON.stringify(offsetRaw)}`,
       } as any;
     }
+    const replica = parsed.searchParams.get("replica") === "diff" ? "diff" : "full";
     return {
       name: segments[0],
       path: segments.slice(1),
       offset,
       live: parsed.searchParams.get("live") === "true",
       logId: parsed.searchParams.get("log_id"),
+      replica,
     };
   }
 }

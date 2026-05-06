@@ -182,7 +182,7 @@ export class JsElectroliteEngine {
     });
   }
 
-  replay(shapeJson: string, offset: number, limit = 1000): string {
+  replay(shapeJson: string, offset: number, limit = 1000, replica: "full" | "diff" = "full"): string {
     const shape = JSON.parse(shapeJson) as Shape;
     const info = this.validatedWatchedTable(shape);
     const normalizedShape = normalizeShape(info, shape);
@@ -197,16 +197,20 @@ export class JsElectroliteEngine {
       let latest = offset;
       for (const row of page.rows) {
         latest = Math.max(latest, row.seq);
-        messages.push(...messagesForLog(normalizedShape, row));
+        messages.push(...messagesForLog(normalizedShape, row, replica));
       }
-      return JSON.stringify({
+      const body: any = {
         type: "replay",
         log_id: logIdUnbootstrapped(this.db),
         shape_handle: shapeHandleFor(normalizedShape),
         messages,
         offset: latest,
         up_to_date: page.upToDate,
-      });
+      };
+      if (replica === "diff") {
+        body.replica = "diff";
+      }
+      return JSON.stringify(body);
     });
   }
 
@@ -437,7 +441,17 @@ function logIdUnbootstrapped(db) {
   return db.prepare("SELECT value FROM _electrolite_meta WHERE key = 'log_id'").get().value;
 }
 
-function messagesForLog(shape, row) {
+function diffRow(oldRow, newRow) {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(newRow)) {
+    if (!sameJsonValue(oldRow[k], v)) {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+function messagesForLog(shape, row, replica = "full") {
   if (row.table_name !== shape.table) {
     return [];
   }
@@ -451,7 +465,14 @@ function messagesForLog(shape, row) {
   }
   if (oldMatches && newMatches && row.new_json) {
     if (JSON.stringify(oldKey) === JSON.stringify(newKey)) {
-      return [{ type: "update", batch_id: row.batch_id, key: newKey, value: row.new_json, offset: row.seq }];
+      let value = row.new_json;
+      if (replica === "diff" && row.old_json) {
+        value = diffRow(row.old_json, row.new_json);
+        if (Object.keys(value).length === 0) {
+          return [];
+        }
+      }
+      return [{ type: "update", batch_id: row.batch_id, key: newKey, value, offset: row.seq }];
     }
     return [
       { type: "delete", batch_id: row.batch_id, key: oldKey, offset: row.seq },

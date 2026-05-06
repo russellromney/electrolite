@@ -1,0 +1,17 @@
+{
+  "name": "replica=diff produces only changed columns in UPDATE messages, identical bytes across engines",
+  "setup": "INSERT INTO todos (id, project_id, title, done) VALUES (1, 'p1', 'first', 0);",
+  "operations": [
+    { "kind": "GET", "path": "/electrolite/v1/projectTodos/p1", "query": "offset=-1" },
+    { "kind": "exec", "sql": "UPDATE todos SET title = ? WHERE id = ?", "args": ["renamed", 1] },
+    {
+      "kind": "GET",
+      "path": "/electrolite/v1/projectTodos/p1",
+      "query": "offset={prev[0].body.offset}&log_id={prev[0].body.log_id}&shape_handle={prev[0].body.shape_handle}&replica=diff"
+    }
+  ],
+  "cross_engine": [
+    "2.body.replica",
+    "2.body.shape_handle"
+  ]
+}

@@ -357,7 +357,7 @@ defmodule Electrolite do
             end
 
           true ->
-            case do_replay(state.conn, shape, route.offset, state.replay_limit) do
+            case do_replay(state.conn, shape, route.offset, state.replay_limit, route.replica) do
               {:ok, body} ->
                 if route.live and body.messages == [] and body.up_to_date do
                   # Tell the caller to wait; the GenServer must stay
@@ -438,6 +438,8 @@ defmodule Electrolite do
 
         case parse_offset(Map.get(qp, "offset")) do
           {:ok, offset} ->
+            replica = if Map.get(qp, "replica") == "diff", do: :diff, else: :full
+
             {:ok,
              %{
                name: hd(parts),
@@ -445,7 +447,8 @@ defmodule Electrolite do
                offset: offset,
                live: Map.get(qp, "live") == "true",
                log_id: Map.get(qp, "log_id"),
-               shape_handle: Map.get(qp, "shape_handle")
+               shape_handle: Map.get(qp, "shape_handle"),
+               replica: replica
              }}
 
           :error ->
@@ -487,7 +490,7 @@ defmodule Electrolite do
   end
 
   defp replay_to_body(body) do
-    %{
+    base = %{
       "type" => "replay",
       "log_id" => body.log_id,
       "shape_handle" => body.shape_handle,
@@ -495,6 +498,11 @@ defmodule Electrolite do
       "offset" => body.offset,
       "up_to_date" => body.up_to_date
     }
+
+    case Map.get(body, :replica) do
+      nil -> base
+      r -> Map.put(base, "replica", r)
+    end
   end
 
   defp message_to_body(m) do
@@ -622,7 +630,7 @@ defmodule Electrolite do
     end
   end
 
-  defp do_replay(conn, %Shape{} = shape, offset, limit) do
+  defp do_replay(conn, %Shape{} = shape, offset, limit, replica \\ :full) do
     with {:ok, info} <- watched_info(conn, shape.table),
          {:ok, np} <- normalize_predicate_tree(info, shape.predicate) do
       shape = %{shape | predicate: np}
@@ -642,17 +650,19 @@ defmodule Electrolite do
             [shape.table, latest]
           )
 
-        messages = rows |> Enum.flat_map(&messages_for(shape.predicate, &1))
+        messages = rows |> Enum.flat_map(&messages_for(shape.predicate, &1, replica))
         {:ok, log_id} = fetch_log_id(conn)
 
-        {:ok,
-         %{
-           log_id: log_id,
-           shape_handle: shape_handle(shape),
-           messages: messages,
-           offset: latest,
-           up_to_date: newer == []
-         }}
+        body = %{
+          log_id: log_id,
+          shape_handle: shape_handle(shape),
+          messages: messages,
+          offset: latest,
+          up_to_date: newer == []
+        }
+
+        body = if replica == :diff, do: Map.put(body, :replica, "diff"), else: body
+        {:ok, body}
       end
     end
   end
@@ -743,7 +753,7 @@ defmodule Electrolite do
 
   # ---- predicate eval ----
 
-  defp messages_for(predicate, row) do
+  defp messages_for(predicate, row, replica \\ :full) do
     old_match = predicate_matches(predicate, row.old_row)
     new_match = predicate_matches(predicate, row.new_row)
     old_key = row.old_pk || row.pk
@@ -751,11 +761,25 @@ defmodule Electrolite do
 
     cond do
       not old_match and new_match and row.new_row != nil ->
+        # Predicate-transition INSERT always carries full row.
         [build_msg(:insert, row, new_key, row.new_row)]
 
       old_match and new_match and row.new_row != nil ->
         if old_key == new_key do
-          [build_msg(:update, row, new_key, row.new_row)]
+          value =
+            case replica do
+              :diff when row.old_row != nil ->
+                diff_row(row.old_row, row.new_row)
+
+              _ ->
+                row.new_row
+            end
+
+          if value == %{} do
+            []
+          else
+            [build_msg(:update, row, new_key, value)]
+          end
         else
           [build_msg(:delete, row, old_key, nil), build_msg(:insert, row, new_key, row.new_row)]
         end
@@ -766,6 +790,12 @@ defmodule Electrolite do
       true ->
         []
     end
+  end
+
+  defp diff_row(old, new) do
+    new
+    |> Enum.filter(fn {k, v} -> Map.get(old, k) != v end)
+    |> Map.new()
   end
 
   defp build_msg(kind, row, key, value) do

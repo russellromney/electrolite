@@ -209,7 +209,8 @@ class Electrolite:
                 return 409, {"error": "resync_required"}
             if route["offset"] < 0:
                 return 200, self.snapshot(built)
-            body = self.replay(built, route["offset"], self.replay_limit)
+            replica_mode = route.get("replica") or "full"
+            body = self.replay(built, route["offset"], self.replay_limit, replica=replica_mode)
             if route.get("shape_handle") and route["shape_handle"] != body["shape_handle"]:
                 return 409, {"error": "resync_required"}
             if route["live"] and not body["messages"] and body["up_to_date"]:
@@ -228,7 +229,7 @@ class Electrolite:
                         "up_to_date": True,
                         "shutdown": True,
                     }
-                body = self.replay(built, route["offset"], self.replay_limit)
+                body = self.replay(built, route["offset"], self.replay_limit, replica=replica_mode)
             return 200, body
         except ResyncRequired:
             return 409, {"error": "resync_required"}
@@ -259,7 +260,14 @@ class Electrolite:
                 "up_to_date": True,
             }
 
-    def replay(self, shape_spec: dict[str, Any], offset: int, limit: int = 1000) -> dict[str, Any]:
+    def replay(
+        self,
+        shape_spec: dict[str, Any],
+        offset: int,
+        limit: int = 1000,
+        *,
+        replica: str = "full",
+    ) -> dict[str, Any]:
         with self._lock:
             info = self._validated_watched_table(shape_spec)
             normalized = self._normalize_shape(info, shape_spec)
@@ -271,8 +279,8 @@ class Electrolite:
             latest = offset
             for row in page["rows"]:
                 latest = max(latest, row["seq"])
-                messages.extend(messages_for_log(normalized, row))
-            return {
+                messages.extend(messages_for_log(normalized, row, replica=replica))
+            body = {
                 "type": "replay",
                 "log_id": self.log_id(),
                 "shape_handle": shape_handle(normalized),
@@ -280,6 +288,9 @@ class Electrolite:
                 "offset": latest,
                 "up_to_date": page["up_to_date"],
             }
+            if replica == "diff":
+                body["replica"] = "diff"
+            return body
 
     def high_water_mark(self) -> int:
         row = self.db.execute("SELECT COALESCE(MAX(seq), 0) AS seq FROM _electrolite_log").fetchone()
@@ -589,6 +600,7 @@ class Electrolite:
             "live": first(query_dict.get("live"), "false") == "true",
             "log_id": first(query_dict.get("log_id")),
             "shape_handle": first(query_dict.get("shape_handle")),
+            "replica": first(query_dict.get("replica"), "full"),
         }
 
     def _build_shape(self, definition: Shape, route: dict[str, Any], context: Any) -> Optional[dict[str, Any]]:
@@ -638,16 +650,33 @@ def parse_log_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def messages_for_log(shape_spec: dict[str, Any], row: dict[str, Any]) -> list[dict[str, Any]]:
+def messages_for_log(
+    shape_spec: dict[str, Any],
+    row: dict[str, Any],
+    *,
+    replica: str = "full",
+) -> list[dict[str, Any]]:
     old_matches = predicate_matches(shape_spec["predicate"], row["old_json"])
     new_matches = predicate_matches(shape_spec["predicate"], row["new_json"])
     old_key = row["old_pk_json"] or row["pk_json"]
     new_key = row["new_pk_json"] or row["pk_json"]
     if not old_matches and new_matches and row["new_json"]:
+        # Predicate-transition INSERT always carries the full row;
+        # the client has no prior state for this key.
         return [message("insert", row, new_key, row["new_json"])]
     if old_matches and new_matches and row["new_json"]:
         if old_key == new_key:
-            return [message("update", row, new_key, row["new_json"])]
+            value = row["new_json"]
+            if replica == "diff" and row["old_json"]:
+                value = {
+                    k: v
+                    for k, v in row["new_json"].items()
+                    if row["old_json"].get(k) != v
+                }
+                if not value:
+                    # No shape-visible columns changed; skip.
+                    return []
+            return [message("update", row, new_key, value)]
         return [message("delete", row, old_key), message("insert", row, new_key, row["new_json"])]
     if old_matches and not new_matches:
         return [message("delete", row, old_key)]
