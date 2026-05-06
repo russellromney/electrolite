@@ -1,2 +1,13 @@
 # Commits for phase 0002
-# format: <step> <feature> <commit sha> — <message>
+# format: <step> <commit sha> — <message>
+
+d03202c step 0  IDD scaffolding (plan.md, review.md, commits.txt)
+5958b2a step 1  or / not predicates across all five engines
+c348e8b step 2  headers callback + onError retry on ShapeClient
+825e8d2 step 3  clients/react/ package
+23ddb14 step 4  CDN-cacheable response headers + ETag + 304
+5288dae step 5  replica=diff UPDATE messages with browser-side merge
+[next]   step 6  optimistic-writes docs + LocalMutationBuffer helper
+
+# remaining
+# (none — all 6 features landed)

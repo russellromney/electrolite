@@ -1,6 +1,6 @@
 {
   "type": "module",
   "scripts": {
-    "test": "node --test electrolite.test.ts"
+    "test": "node --test electrolite.test.ts local-mutation-buffer.test.ts"
   }
 }

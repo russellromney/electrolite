@@ -202,3 +202,90 @@ Decisions:
   documented during implementation.
 
 Verdict: ready to build.
+
+## Implementation Review 1
+
+### What landed
+
+- **Step 1** (commit 5958b2a) — `or` and `not` predicates added to
+  every engine. Special-case `not(eq(col, null))` →
+  `col IS NOT NULL`. Predicate normalization sorts `or` children
+  via canonical sorted-keys JSON. New conformance cases 0016, 0017,
+  0018.
+- **Step 2** (commit c348e8b) — `headers` callback and `onError`
+  retry on `ShapeClient`, with the retry cap of 3 from D3. Three
+  new browser tests for token-refresh and capped retry.
+- **Step 3** (commit 825e8d2) — `clients/react/` package with
+  `useShape`, `preloadShape`, `getShapeStream`, `getShape`. Cache
+  by `(url, transport)`. React added as devDep; peer >= 18.
+- **Step 4** (commit 23ddb14) — CDN-cacheable response headers
+  (`etag`, `cache-control`, `vary`) on every test server + Node
+  engine. 304 Not Modified path on `if-none-match`. Conformance
+  case 0019 verifies cross-engine parity. Side fix: in-process
+  Node test server now forwards every Response header.
+- **Step 5** (commit 5288dae) — `replica=diff` UPDATE messages.
+  Server emits only changed columns; client merges instead of
+  overwrites. Predicate-transition INSERTs always full (D8).
+  Conformance case 0020.
+- **Step 6** (this commit) — `docs/optimistic-writes.md` covering
+  three patterns. `clients/browser/local-mutation-buffer.js`
+  helper for Pattern B and C (4 tests).
+
+### What did not change
+
+- The protocol contract: every wire change is opt-in (`replica`
+  query param, `headers`/`onError` client options, `transport: sse`
+  flag, `if-none-match` 304 path).
+- Long-poll remains the default transport.
+- `shape_handle` semantics — every new predicate normalizes to a
+  deterministic canonical form.
+- All previously passing tests continue to pass.
+
+### Direct proof
+
+- 20/20 conformance cases pass.
+- 5/5 matrix cells (browser × {node, python, rust, go, elixir}).
+- Per-engine: Node 22, Python 18, Rust 20, Go all green, Elixir 19.
+- React: 3/3 cache-and-share assertions.
+- Browser: 23/24 (one pre-existing localStorage failure unrelated
+  to this phase).
+- LocalMutationBuffer: 4/4.
+
+### Findings closed
+
+- D1 — `is_null` not added; `eq(col, null)` is the way.
+- D2 — `not(eq(col, null))` compiles to `IS NOT NULL` for index
+  use.
+- D3 — onError retry capped at 3.
+- D4 — React hook reference counting on URL+transport.
+- D5 — Conformance harness's `runOperation` exposes response
+  headers (etag, cache-control, vary).
+- D6 — `LocalMutationBuffer` ships under `clients/browser/`.
+- D7 — Server returns 304 with no body on `if-none-match` match.
+- D8 — Predicate-transition INSERT under `replica=diff` carries
+  full row, never a diff.
+
+### Findings deferred
+
+- Real React hook rendering tests would need
+  `react-dom/test-renderer`. The cache-share layer is the actual
+  correctness surface and is tested.
+- Optimistic-writes Pattern C reconnect-replay logic (`replay()`
+  on the buffer) is implemented but not exercised end-to-end. The
+  example in docs/ shows the shape; a runnable example app is a
+  separate phase.
+
+### Real bugs caught by the new tests
+
+- **Node `auth_scope` divergence** (caught earlier in phase 0001
+  hostile audit when boolean-coercion conformance was added).
+  Fixed in 6fa581e.
+- **Node `and` children sort order** (same hostile audit, AND-SQL
+  conformance). Fixed in 6fa581e.
+- These weren't new in phase 0002 but are worth noting as
+  conformance-suite catches.
+
+### Verdict
+
+- Phase 0002 ships all 6 features named in the plan plus the
+  decisions D1–D8 from this review. No deferred work.

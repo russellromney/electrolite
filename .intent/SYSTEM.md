@@ -37,6 +37,26 @@ long-polls for replay messages.
   scenario (snapshot, insert/update/delete, batch, predicate
   boundary) over each transport against each engine: 5 × 2 = 10
   cells, all green.
+- Predicate language: `all`, `eq`, `gt`/`lt`/`gte`/`lte`, `in`,
+  `and`, `or`, `not`. (`is_null` is not a separate kind;
+  `eq(col, null)` is the way to test null.)
+- CDN-cacheable responses: every server emits `etag`,
+  `cache-control`, and `vary: authorization`. Replay responses
+  with `offset >= 0` are `public, max-age=31536000, immutable`.
+  Snapshot responses are `public, max-age=5`. Live responses are
+  `no-store`. Clients sending `if-none-match` get `304 Not
+  Modified`.
+- `replica=diff` mode: clients can opt into UPDATE messages that
+  carry only the changed columns. Browser materializer merges
+  instead of overwrites.
+- React surface at `clients/react/` exporting `useShape`,
+  `preloadShape`, `getShapeStream`, `getShape`. Cache-and-share
+  by (url, transport).
+- `headers` callback + `onError` retry on `ShapeClient` for
+  auth-token refresh and transient-error recovery.
+- Optimistic-writes: documented in `docs/optimistic-writes.md`.
+  `LocalMutationBuffer` helper at
+  `clients/browser/local-mutation-buffer.js`.
 - The cross-engine in-process predicate matcher is exercised by
   the conformance harness; SQL `WHERE` and the matcher agree on
   every engine.
