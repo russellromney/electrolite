@@ -254,6 +254,34 @@ func TestLogIDMismatchReturns409(t *testing.T) {
 	}
 }
 
+func TestMissingLogIDOnReplayReturns409(t *testing.T) {
+	app := projectTodosApp(t)
+	snap := bodyMap(app.Handle("/electrolite/v1/projectTodos/p1", "offset=-1", map[string]bool{"p1": true}))
+	// Replay request with an offset but no log_id at all must resync.
+	q := "offset=" + asString(snap["offset"]) + "&shape_handle=" + asString(snap["shape_handle"])
+	r := app.Handle("/electrolite/v1/projectTodos/p1", q, map[string]bool{"p1": true})
+	if r.Status != 409 {
+		t.Fatalf("status: %d body: %v", r.Status, r.Body)
+	}
+	if body, ok := r.Body.(map[string]string); !ok || body["error"] != "resync_required" {
+		t.Fatalf("expected resync_required, got %v", r.Body)
+	}
+}
+
+func TestShapeHandleMismatchOnReplayReturns409(t *testing.T) {
+	app := projectTodosApp(t)
+	snap := bodyMap(app.Handle("/electrolite/v1/projectTodos/p1", "offset=-1", map[string]bool{"p1": true}))
+	q := buildQ(map[string]interface{}{
+		"offset":       snap["offset"],
+		"log_id":       snap["log_id"],
+		"shape_handle": "deadbeef",
+	}, false)
+	r := app.Handle("/electrolite/v1/projectTodos/p1", q, map[string]bool{"p1": true})
+	if r.Status != 409 {
+		t.Fatalf("status: %d body: %v", r.Status, r.Body)
+	}
+}
+
 func TestCompactMakesOldOffsetsResync(t *testing.T) {
 	app := projectTodosApp(t)
 	snap := bodyMap(app.Handle("/electrolite/v1/projectTodos/p1", "offset=-1", map[string]bool{"p1": true}))
@@ -271,6 +299,98 @@ func TestCompactMakesOldOffsetsResync(t *testing.T) {
 	r := app.Handle("/electrolite/v1/projectTodos/p1", q, map[string]bool{"p1": true})
 	if r.Status != 409 {
 		t.Fatalf("status: %d body: %v", r.Status, r.Body)
+	}
+}
+
+func TestCompactQuietTableNotWipedByGlobalSequence(t *testing.T) {
+	dir := t.TempDir()
+	app, err := Open(filepath.Join(dir, "app.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = app.Close() })
+	if err := app.ExecBatch(`
+		CREATE TABLE todos (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
+		CREATE TABLE events (id INTEGER PRIMARY KEY, kind TEXT NOT NULL);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.InstallTriggers("todos"); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.InstallTriggers("events"); err != nil {
+		t.Fatal(err)
+	}
+	// A few todos rows.
+	for i := 1; i <= 3; i++ {
+		if _, err := app.Exec("INSERT INTO todos (id, title) VALUES (?, ?)", i, "t"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Many events rows so global max(seq) >> todos max(seq).
+	for i := 1; i <= 50; i++ {
+		if _, err := app.Exec("INSERT INTO events (id, kind) VALUES (?, ?)", i, "e"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	countTodos := func() int {
+		var n int
+		if err := app.db.QueryRow("SELECT COUNT(*) FROM _electrolite_log WHERE table_name = 'todos'").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	before := countTodos()
+	if before != 3 {
+		t.Fatalf("expected 3 todos log rows, got %d", before)
+	}
+
+	// keepLast far exceeds the number of todos rows: candidate must be 0
+	// (keep everything), NOT the global high-water mark.
+	stats, err := app.Compact("todos", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.DeletedRows != 0 {
+		t.Fatalf("expected DeletedRows == 0, got %d", stats.DeletedRows)
+	}
+	if stats.RetainedOffset != 0 {
+		t.Fatalf("expected RetainedOffset == 0, got %d", stats.RetainedOffset)
+	}
+	if after := countTodos(); after != before {
+		t.Fatalf("todos log rows changed: before %d, after %d", before, after)
+	}
+}
+
+func TestCompactRetainedOffsetIsMonotonic(t *testing.T) {
+	app := projectTodosApp(t)
+	// The seed rows predate trigger install, so write a couple of rows to
+	// populate the todos log.
+	if _, err := app.Exec("INSERT INTO todos (id, project_id, title, done) VALUES (?, ?, ?, 0)", 40, "p1", "a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.Exec("INSERT INTO todos (id, project_id, title, done) VALUES (?, ?, ?, 0)", 41, "p1", "b"); err != nil {
+		t.Fatal(err)
+	}
+	// Compact("todos", 0) retains everything up to todos' max seq.
+	first, err := app.Compact("todos", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.RetainedOffset <= 0 {
+		t.Fatalf("expected positive retained offset, got %d", first.RetainedOffset)
+	}
+	// A later keepLast=1000 (candidate would be 0) must NOT lower it.
+	second, err := app.Compact("todos", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.RetainedOffset != first.RetainedOffset {
+		t.Fatalf("retained offset regressed: first %d, second %d", first.RetainedOffset, second.RetainedOffset)
+	}
+	if second.DeletedRows != 0 {
+		t.Fatalf("expected no further deletions, got %d", second.DeletedRows)
 	}
 }
 

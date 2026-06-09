@@ -526,9 +526,9 @@ test("drains replay pages before switching back to live requests", async () => {
 
   assert.deepEqual(requested, [
     "http://app.test/electrolite/v1/shape/activeUsers?offset=-1",
-    "http://app.test/electrolite/v1/shape/activeUsers?offset=1&live=true&log_id=log-a",
-    "http://app.test/electrolite/v1/shape/activeUsers?offset=2&log_id=log-a",
-    "http://app.test/electrolite/v1/shape/activeUsers?offset=2&live=true&log_id=log-a",
+    "http://app.test/electrolite/v1/shape/activeUsers?offset=1&live=true&log_id=log-a&shape_handle=shape-a",
+    "http://app.test/electrolite/v1/shape/activeUsers?offset=2&log_id=log-a&shape_handle=shape-a",
+    "http://app.test/electrolite/v1/shape/activeUsers?offset=2&live=true&log_id=log-a&shape_handle=shape-a",
   ]);
 });
 
@@ -612,6 +612,9 @@ test("multi-tab clients release leadership on pagehide", () => {
   const client = new ShapeClient("http://app.test/electrolite/v1/shape/activeUsers", {
     keyColumns: ["id"],
     multiTab: true,
+    // Force the localStorage lease fallback (this test covers that path;
+    // the Web Locks path is covered separately).
+    locks: null,
     channelFactory: () => ({
       addEventListener() {},
       removeEventListener() {},
@@ -807,6 +810,179 @@ test("SSE onError retry is capped so a misbehaving callback can't loop", async (
   await assert.rejects(() => client.streamSse());
   // Initial attempt + 3 capped retries = 4 calls.
   assert.equal(calls, 4);
+});
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function stubChannel() {
+  return {
+    addEventListener() {},
+    removeEventListener() {},
+    close() {},
+    postMessage() {},
+  };
+}
+
+// --- F6: multi-tab leadership must grant to exactly one tab. The old
+// localStorage check-then-act let two tabs both win. Web Locks give
+// true mutual exclusion. ---
+test("multi-tab leadership grants to exactly one client via Web Locks (F6)", async () => {
+  const url = "http://app.test/electrolite/v1/shape/f6-locktest";
+  const opts = {
+    keyColumns: ["id"],
+    multiTab: true,
+    channelFactory: () => stubChannel(),
+    fetch: async () => {
+      throw new Error("unused");
+    },
+  };
+  const a = new ShapeClient(url, opts);
+  const b = new ShapeClient(url, opts);
+  try {
+    // Both tabs are backed by the platform Web Locks API (Node ships one).
+    assert.ok(a.locks && b.locks);
+
+    // Poll like the real start() loop: keep asking until leadership
+    // settles. At most one tab may ever hold it.
+    const pollUntil = async (cond, ...clients) => {
+      const deadline = Date.now() + 500;
+      while (Date.now() < deadline && !cond()) {
+        for (const c of clients) c.canUseNetwork();
+        await sleep(10);
+      }
+    };
+    await pollUntil(() => a.leaderHeld || b.leaderHeld, a, b);
+    assert.equal(
+      [a.leaderHeld, b.leaderHeld].filter(Boolean).length,
+      1,
+      "exactly one tab may hold leadership",
+    );
+
+    // When the leader steps down, the follower can take over.
+    const leader = a.leaderHeld ? a : b;
+    const follower = a.leaderHeld ? b : a;
+    leader.releaseLeadership();
+    await pollUntil(() => follower.leaderHeld, follower);
+    assert.equal(follower.leaderHeld, true);
+    assert.equal(leader.leaderHeld, false);
+  } finally {
+    a.stop();
+    b.stop();
+  }
+});
+
+// --- F7: a replica=diff UPDATE for a key we don't hold can't be merged.
+// The client must resync rather than write the sparse value as a whole
+// (partial) row. ---
+test("diff update for an unknown key forces resync, never a partial row (F7)", () => {
+  const client = new ShapeClient("http://app.test/electrolite/v1/shape/f7", {
+    keyColumns: ["id"],
+    replica: "diff",
+  });
+  client.apply({
+    type: "snapshot",
+    log_id: "l",
+    shape_handle: "s",
+    key_columns: ["id"],
+    rows: [{ id: 1, name: "a", active: 1 }],
+    offset: 1,
+    up_to_date: true,
+  });
+  const changed = client.apply({
+    type: "replay",
+    log_id: "l",
+    shape_handle: "s",
+    replica: "diff",
+    messages: [{ type: "update", key: { id: 2 }, value: { active: 0 }, offset: 2 }],
+    offset: 2,
+    up_to_date: true,
+  });
+  assert.equal(changed, false);
+  assert.equal(client.resyncRequired, true);
+  // No partial row for the unknown key was materialized.
+  assert.equal(client.rows.has(JSON.stringify({ id: 2 })), false);
+});
+
+// --- F7 over SSE: a diff UPDATE for an unknown key, delivered as an SSE
+// frame, must break the stale stream and resync (not keep streaming
+// against dropped/partial state). ---
+test("SSE resyncs when a diff update targets an unknown key (F7 over SSE)", async () => {
+  const encoder = new TextEncoder();
+  const frames = [
+    "event: snapshot\ndata: " +
+      JSON.stringify({
+        type: "snapshot",
+        key_columns: ["id"],
+        rows: [{ id: 1, name: "a", active: 1 }],
+        offset: 1,
+        up_to_date: true,
+        log_id: "l",
+        shape_handle: "s",
+      }) +
+      "\n\n",
+    "event: replay\ndata: " +
+      JSON.stringify({
+        type: "replay",
+        log_id: "l",
+        shape_handle: "s",
+        replica: "diff",
+        messages: [{ type: "update", key: { id: 2 }, value: { active: 0 }, offset: 2 }],
+        offset: 2,
+        up_to_date: true,
+      }) +
+      "\n\n",
+  ];
+  const requests = [];
+  const client = new ShapeClient("http://app.test/electrolite/v1/x/p1", {
+    keyColumns: ["id"],
+    transport: "sse",
+    replica: "diff",
+    fetch: async (url) => {
+      requests.push(String(url));
+      if (requests.length === 1) {
+        const body = {
+          getReader() {
+            let i = 0;
+            return {
+              async read() {
+                if (i >= frames.length) return { done: true, value: undefined };
+                return { done: false, value: encoder.encode(frames[i++]) };
+              },
+              async cancel() {},
+            };
+          },
+        };
+        return { ok: true, status: 200, body };
+      }
+      // Recovery snapshot after the unmergeable diff forced a resync.
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          type: "snapshot",
+          key_columns: ["id"],
+          rows: [
+            { id: 1, name: "a", active: 1 },
+            { id: 2, name: "b", active: 0 },
+          ],
+          offset: 3,
+          up_to_date: true,
+          log_id: "l",
+          shape_handle: "s",
+        }),
+      };
+    },
+  });
+
+  await client.streamSse();
+
+  assert.equal(requests.length, 2, "an unmergeable diff frame must trigger a recovery snapshot");
+  assert.ok(requests[1].includes("offset=-1"));
+  // After recovery the unknown key is a full row, not the sparse diff.
+  const row2 = client.rows.get(JSON.stringify({ id: 2 }));
+  assert.ok(row2);
+  assert.equal(row2.name, "b");
+  client.stop();
 });
 
 class TestChannelBus {

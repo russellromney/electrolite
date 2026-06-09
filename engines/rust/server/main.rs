@@ -512,8 +512,8 @@ fn compute_cache_control(query: &str, status: u16) -> Option<String> {
     if live {
         Some("no-store".to_string())
     } else if offset_in >= 0 {
-        Some("public, max-age=31536000, immutable".to_string())
+        Some("private, max-age=31536000, immutable".to_string())
     } else {
-        Some("public, max-age=5".to_string())
+        Some("private, max-age=5".to_string())
     }
 }

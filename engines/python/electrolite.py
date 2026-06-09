@@ -134,7 +134,14 @@ class Electrolite:
                 "SELECT seq FROM _electrolite_log WHERE table_name = ? ORDER BY seq DESC LIMIT 1 OFFSET ?",
                 (table, max(0, int(keep_last))),
             ).fetchone()
-            retained_offset = int(row["seq"]) if row else self.high_water_mark()
+            # Candidate watermark is this table's seq at OFFSET keep_last,
+            # or 0 (keep everything) when the table has fewer rows than
+            # keep_last. Never use high_water_mark() — that is the GLOBAL
+            # max(seq) across all tables, so another busy table would force
+            # this quiet table's whole log to be deleted.
+            candidate = int(row["seq"]) if row else 0
+            # Never regress below what we have already retained.
+            retained_offset = max(self._retained_offset(table), candidate)
             cursor = self.db.execute(
                 "DELETE FROM _electrolite_log WHERE table_name = ? AND seq <= ?",
                 (table, retained_offset),
@@ -205,14 +212,25 @@ class Electrolite:
             return 404, {"error": "shape_not_found"}
 
         try:
-            if route["offset"] >= 0 and route.get("log_id") and route["log_id"] != self.log_id():
-                return 409, {"error": "resync_required"}
+            if route["offset"] >= 0:
+                # F8: log_id is required on any replay/live request. A client
+                # that omits it cannot have validated continuity, so treat it
+                # the same as a stale log_id and force a resync.
+                if not route.get("log_id") or route["log_id"] != self.log_id():
+                    return 409, {"error": "resync_required"}
+                # F5: a stale shape_handle (filter/columns changed underneath
+                # the client) must force a resync before any bytes are served.
+                # Lenient when absent; strict on mismatch.
+                if route.get("shape_handle"):
+                    expected_handle = shape_handle(
+                        self._normalize_shape(self._validated_watched_table(built), built)
+                    )
+                    if route["shape_handle"] != expected_handle:
+                        return 409, {"error": "resync_required"}
             if route["offset"] < 0:
                 return 200, self.snapshot(built)
             replica_mode = route.get("replica") or "full"
             body = self.replay(built, route["offset"], self.replay_limit, replica=replica_mode)
-            if route.get("shape_handle") and route["shape_handle"] != body["shape_handle"]:
-                return 409, {"error": "resync_required"}
             if route["live"] and not body["messages"] and body["up_to_date"]:
                 deadline = time.monotonic() + self.live_timeout_ms / 1000
                 with self._changed:

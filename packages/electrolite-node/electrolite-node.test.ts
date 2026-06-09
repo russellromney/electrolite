@@ -924,6 +924,238 @@ test("shutdown wakes live waiters with a clean response", async () => {
   }
 });
 
+// --- F1: compaction must not delete a quiet table's log or force its
+// subscribers to resync just because another table advanced the log. ---
+test("compacting a quiet table while another churns keeps history (F1)", async () => {
+  const { dir, electrolite } = setup();
+  try {
+    // Snapshot todos to learn its current offset + log_id.
+    const snap = await electrolite.handle(
+      new Request("https://app.test/electrolite/v1/projectTodos/p1?offset=-1"),
+      { user: { projects: new Set(["p1"]) } },
+    );
+    const { offset: todosOffset, log_id } = await snap.json();
+
+    // A second, busy table advances the GLOBAL log sequence far past
+    // todos' own max seq.
+    electrolite.executeBatch(`
+      CREATE TABLE events (id INTEGER PRIMARY KEY, kind TEXT NOT NULL);
+    `);
+    electrolite.installTriggers("events");
+    for (let i = 0; i < 50; i++) {
+      electrolite.execute("INSERT INTO events (id, kind) VALUES (?1, ?2)", [i + 1, "ping"]);
+    }
+    assert.ok(electrolite.highWaterMark() > todosOffset + 10);
+
+    // Keep far more than todos has → nothing should be dropped, and the
+    // retained offset must NOT jump to the global high-water mark.
+    const stats = electrolite.compactLogToLastForTable("todos", 1000);
+    assert.equal(stats.deleted_rows, 0);
+    assert.equal(stats.retained_offset, 0);
+
+    // A client sitting at todos' valid offset must NOT be forced to
+    // resync (the old bug returned 409 here).
+    const replay = await electrolite.handle(
+      new Request(
+        `https://app.test/electrolite/v1/projectTodos/p1?offset=${todosOffset}&log_id=${log_id}`,
+      ),
+      { user: { projects: new Set(["p1"]) } },
+    );
+    assert.equal(replay.status, 200);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("compaction watermark never regresses (F1)", async () => {
+  const { dir, electrolite } = setup();
+  try {
+    // Drop everything: retained advances to todos' max seq (2).
+    const first = electrolite.compactLogToLastForTable("todos", 0);
+    assert.equal(first.retained_offset, 2);
+    // Asking to keep more than exists must not lower the watermark back
+    // toward 0 (which would let a client skip already-deleted offsets).
+    const second = electrolite.compactLogToLastForTable("todos", 1000);
+    assert.equal(second.retained_offset, 2);
+    assert.equal(second.deleted_rows, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- F2: snapshot/replay default to `private`; a shape opts into
+// shared (CDN) caching via `cacheable: true`. ---
+test("cache-control defaults to private and opts into public (F2)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "electrolite-cache-"));
+  try {
+    const electrolite = createElectrolite({
+      dbPath: join(dir, "app.db"),
+      liveTimeoutMs: 30,
+      pollIntervalMs: 5,
+      shapes: {
+        privateTodos: shape({ table: "todos", columns: ["id", "title"], where: () => all() }),
+        publicTodos: shape({
+          table: "todos",
+          columns: ["id", "title"],
+          where: () => all(),
+          cacheable: true,
+        }),
+      },
+    });
+    electrolite.executeBatch(`CREATE TABLE todos (id INTEGER PRIMARY KEY, title TEXT NOT NULL);`);
+    electrolite.installTriggers("todos");
+    electrolite.execute("INSERT INTO todos (id, title) VALUES (?1, ?2)", [1, "a"]);
+
+    const cc = async (name, query) =>
+      (await electrolite.handle(
+        new Request(`https://app.test/electrolite/v1/${name}?${query}`),
+      )).headers.get("cache-control");
+
+    const snap = await electrolite.handle(
+      new Request("https://app.test/electrolite/v1/privateTodos?offset=-1"),
+    );
+    const { offset, log_id, shape_handle } = await snap.json();
+    const replayQ = `offset=${offset}&log_id=${log_id}&shape_handle=${shape_handle}`;
+
+    // Default shape → private (browser-only cache, never a shared CDN).
+    assert.equal(snap.headers.get("cache-control"), "private, max-age=5");
+    assert.equal(await cc("privateTodos", replayQ), "private, max-age=31536000, immutable");
+    // Live request from offset 0 returns the existing insert immediately
+    // (status 200), and a live response is never shared-cacheable.
+    assert.equal(await cc("privateTodos", `offset=0&log_id=${log_id}&live=true`), "no-store");
+
+    // Opt-in cacheable shape → public.
+    const pubSnap = await electrolite.handle(
+      new Request("https://app.test/electrolite/v1/publicTodos?offset=-1"),
+    );
+    const pub = await pubSnap.json();
+    assert.equal(pubSnap.headers.get("cache-control"), "public, max-age=5");
+    assert.equal(
+      await cc("publicTodos", `offset=${pub.offset}&log_id=${pub.log_id}&shape_handle=${pub.shape_handle}`),
+      "public, max-age=31536000, immutable",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- F3: numbered SQLite params (?1) may be reused and reordered. ---
+test("numbered parameters can be reused and reordered (F3)", async () => {
+  const { dir, electrolite } = setup();
+  try {
+    // ?2 reused for both project_id and title — the old placeholder
+    // normalizer turned this into 3 anonymous `?` and threw.
+    electrolite.execute(
+      "INSERT INTO todos (id, project_id, title, done) VALUES (?1, ?2, ?2, 0)",
+      [5, "p1"],
+    );
+    // ?2 before ?1 — reordered.
+    electrolite.execute(
+      "UPDATE todos SET project_id = ?2, title = ?1 WHERE id = ?3",
+      ["renamed", "p9", 5],
+    );
+    const row = electrolite.engine.db
+      .prepare("SELECT project_id, title FROM todos WHERE id = 5")
+      .get();
+    assert.equal(row.project_id, "p9");
+    assert.equal(row.title, "renamed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- F5: server rejects a stale shape_handle with 409. ---
+test("replay with a stale shape_handle returns 409 resync_required (F5)", async () => {
+  const { dir, electrolite } = setup();
+  try {
+    const snap = await electrolite.handle(
+      new Request("https://app.test/electrolite/v1/projectTodos/p1?offset=-1"),
+      { user: { projects: new Set(["p1"]) } },
+    );
+    const { offset, log_id, shape_handle } = await snap.json();
+    const base = `offset=${offset}&log_id=${log_id}`;
+
+    const wrong = await electrolite.handle(
+      new Request(`https://app.test/electrolite/v1/projectTodos/p1?${base}&shape_handle=deadbeef`),
+      { user: { projects: new Set(["p1"]) } },
+    );
+    assert.equal(wrong.status, 409);
+    assert.deepEqual(await wrong.json(), { error: "resync_required" });
+
+    const right = await electrolite.handle(
+      new Request(`https://app.test/electrolite/v1/projectTodos/p1?${base}&shape_handle=${shape_handle}`),
+      { user: { projects: new Set(["p1"]) } },
+    );
+    assert.equal(right.status, 200);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- F8: replay/live with offset >= 0 must present a log_id. ---
+test("replay without a log_id returns 409 resync_required (F8)", async () => {
+  const { dir, electrolite } = setup();
+  try {
+    const res = await electrolite.handle(
+      new Request("https://app.test/electrolite/v1/projectTodos/p1?offset=1"),
+      { user: { projects: new Set(["p1"]) } },
+    );
+    assert.equal(res.status, 409);
+    assert.deepEqual(await res.json(), { error: "resync_required" });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- F9: a write to one table must not trigger a replay scan for live
+// shapes on other tables. ---
+test("writes only replay-scan live shapes on the changed table (F9)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "electrolite-f9-"));
+  try {
+    const electrolite = createElectrolite({
+      dbPath: join(dir, "app.db"),
+      liveTimeoutMs: 200,
+      pollIntervalMs: 1_000,
+      shapes: {
+        todos: shape({ table: "todos", columns: ["id", "title"], where: () => all() }),
+        events: shape({ table: "events", columns: ["id", "kind"], where: () => all() }),
+      },
+    });
+    electrolite.executeBatch(`
+      CREATE TABLE todos (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
+      CREATE TABLE events (id INTEGER PRIMARY KEY, kind TEXT NOT NULL);
+    `);
+    electrolite.installTriggers("todos");
+    electrolite.installTriggers("events");
+
+    const todosLive = electrolite.handle(
+      new Request("https://app.test/electrolite/v1/todos?offset=0&log_id=" + electrolite.logId() + "&live=true"),
+    );
+    const eventsLive = electrolite.handle(
+      new Request("https://app.test/electrolite/v1/events?offset=0&log_id=" + electrolite.logId() + "&live=true"),
+    );
+    await sleep(30);
+
+    // Spy on the engine's replay during the write only. execute() runs
+    // notifyChangedFrom synchronously, so calls captured here are
+    // exactly the targeted wake scans.
+    const scanned = [];
+    const realReplay = electrolite.engine.replay.bind(electrolite.engine);
+    electrolite.engine.replay = (shapeJson, ...rest) => {
+      scanned.push(JSON.parse(shapeJson).table);
+      return realReplay(shapeJson, ...rest);
+    };
+    electrolite.execute("INSERT INTO events (id, kind) VALUES (?1, ?2)", [1, "ping"]);
+    electrolite.engine.replay = realReplay;
+
+    assert.deepEqual(scanned, ["events"]); // never scanned the todos shape
+    assert.equal(await eventsLive.then((r) => r.status), 200);
+    await todosLive; // drains the other waiter (204)
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 function setup(options = {}) {
   const dir = mkdtempSync(join(tmpdir(), "electrolite-node-"));
   const dbPath = join(dir, "app.db");

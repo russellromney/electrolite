@@ -365,6 +365,105 @@ fn compact_makes_old_offsets_resync() {
     assert_eq!(body, json!({"error": "resync_required"}));
 }
 
+// F8: replay/live requests must carry a log_id. A missing log_id is treated the
+// same as a mismatched one and forces a resync.
+#[test]
+fn log_id_missing_on_replay_returns_409() {
+    let (_tmp, app) = project_todos_app();
+    let (status, body) = app.handle(
+        "/electrolite/v1/projectTodos/p1",
+        "offset=0",
+        &json!({"projects": ["p1"]}),
+    );
+    assert_eq!(status, 409);
+    assert_eq!(body, json!({"error": "resync_required"}));
+}
+
+// F1: compacting a quiet table (todos) must not be dragged forward by another
+// busy table (events). With fewer than keep_last rows, nothing is deleted and the
+// retained offset stays 0 — even though the global max(seq) is far higher.
+#[test]
+fn compact_quiet_table_keeps_its_log() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("app.db");
+    let app = Electrolite::open(path.to_str().unwrap()).unwrap();
+    app.execute_batch(
+        r#"
+        CREATE TABLE todos (
+          id INTEGER PRIMARY KEY,
+          title TEXT NOT NULL
+        );
+        CREATE TABLE events (
+          id INTEGER PRIMARY KEY,
+          name TEXT NOT NULL
+        );
+        "#,
+    )
+    .unwrap();
+    app.install_triggers("todos").unwrap();
+    app.install_triggers("events").unwrap();
+
+    // A few todos rows.
+    for i in 1..=3 {
+        app.execute(
+            "INSERT INTO todos (id, title) VALUES (?, ?)",
+            &[Value::Integer(i), Value::Text(format!("todo {i}"))],
+        )
+        .unwrap();
+    }
+    // MANY events rows so the global max(seq) is much higher than todos' max.
+    for i in 1..=500 {
+        app.execute(
+            "INSERT INTO events (id, name) VALUES (?, ?)",
+            &[Value::Integer(i), Value::Text(format!("ev {i}"))],
+        )
+        .unwrap();
+    }
+
+    let stats = app.compact("todos", 1000).unwrap();
+    assert_eq!(stats.deleted_rows, 0, "quiet table log should be untouched");
+    assert_eq!(stats.retained_offset, 0, "must not jump to global high-water");
+
+    // todos log rows are still present — a repeat compact deletes nothing.
+    let remaining = app.compact("todos", 1000).unwrap();
+    assert_eq!(remaining.deleted_rows, 0);
+    assert_eq!(remaining.retained_offset, 0);
+}
+
+// F1: the retained offset must never regress. After compacting at keep_last=0
+// (retain everything up to todos' max), a later wide compact must not lower it.
+#[test]
+fn compact_retained_offset_is_monotonic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("app.db");
+    let app = Electrolite::open(path.to_str().unwrap()).unwrap();
+    app.execute_batch(
+        r#"
+        CREATE TABLE todos (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
+        "#,
+    )
+    .unwrap();
+    app.install_triggers("todos").unwrap();
+    for i in 1..=5 {
+        app.execute(
+            "INSERT INTO todos (id, title) VALUES (?, ?)",
+            &[Value::Integer(i), Value::Text(format!("todo {i}"))],
+        )
+        .unwrap();
+    }
+
+    let high = app.compact("todos", 0).unwrap().retained_offset;
+    assert!(high > 0, "retained offset should advance to todos max");
+
+    // A wide window would compute candidate 0, but monotonicity must hold.
+    let later = app.compact("todos", 1000).unwrap();
+    assert_eq!(
+        later.retained_offset, high,
+        "retained offset must not regress below the previous value"
+    );
+    assert_eq!(later.deleted_rows, 0, "nothing new to delete");
+}
+
 #[test]
 fn install_triggers_requires_primary_key() {
     let tmp = tempfile::tempdir().unwrap();

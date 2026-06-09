@@ -283,6 +283,73 @@ defmodule ElectroliteTest do
     assert body == %{"error" => "resync_required"}
   end
 
+  test "compact uses per-table watermark, not global high-water" do
+    {pid, _} = setup_app()
+    seed_todos(pid)
+    :ok = Electrolite.add_shape(pid, "projectTodos", project_todos_def())
+
+    # A quiet table (todos: 3 rows) and a noisy table (events: many rows)
+    # so the GLOBAL max(seq) is far ahead of todos' own max(seq).
+    :ok =
+      Electrolite.execute_batch(pid, """
+        CREATE TABLE events (
+          id INTEGER PRIMARY KEY,
+          kind TEXT NOT NULL
+        );
+      """)
+
+    :ok = Electrolite.install_triggers(pid, "events")
+
+    for i <- 1..100 do
+      :ok = Electrolite.execute(pid, "INSERT INTO events (id, kind) VALUES (?, ?)", [i, "e"])
+    end
+
+    {:ok, stats} = Electrolite.compact(pid, "todos", 1000)
+
+    # keep_last (1000) exceeds the todos row count, so the candidate is 0
+    # (keep everything) — NOT the global high-water mark.
+    assert stats.retained_offset == 0
+    assert stats.deleted_rows == 0
+
+    # todos rows are still present in the log.
+    {200, snap} =
+      Electrolite.handle(pid, "/electrolite/v1/projectTodos/p1", "offset=-1", %{projects: ["p1"]})
+
+    assert length(snap["rows"]) == 2
+  end
+
+  test "compact never regresses the retained offset" do
+    {pid, _} = setup_app()
+    seed_todos(pid)
+
+    # Generate logged writes (seed rows were inserted before triggers, so
+    # they never hit the log).
+    for i <- 10..14 do
+      :ok = Electrolite.execute(pid, "INSERT INTO todos (id, project_id, title, done) VALUES (?, ?, ?, 0)", [i, "p1", "x"])
+    end
+
+    {:ok, %{retained_offset: max_seq}} = Electrolite.compact(pid, "todos", 0)
+    assert max_seq > 0
+
+    # A later compact with a huge keep_last must not lower the watermark.
+    {:ok, stats} = Electrolite.compact(pid, "todos", 1000)
+    assert stats.retained_offset == max_seq
+  end
+
+  test "missing log_id on replay returns 409" do
+    {pid, _} = setup_app()
+    seed_todos(pid)
+    :ok = Electrolite.add_shape(pid, "projectTodos", project_todos_def())
+
+    {200, snap} =
+      Electrolite.handle(pid, "/electrolite/v1/projectTodos/p1", "offset=-1", %{projects: ["p1"]})
+
+    q = "offset=#{snap["offset"]}"
+    {status, body} = Electrolite.handle(pid, "/electrolite/v1/projectTodos/p1", q, %{projects: ["p1"]})
+    assert status == 409
+    assert body == %{"error" => "resync_required"}
+  end
+
   test "install_triggers requires primary key" do
     {pid, _} = setup_app()
     :ok = Electrolite.execute_batch(pid, "CREATE TABLE no_pk (a INTEGER, b INTEGER);")

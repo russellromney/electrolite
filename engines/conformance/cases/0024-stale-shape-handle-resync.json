@@ -1,0 +1,17 @@
+{
+  "name": "replay with a stale shape_handle returns 409 resync_required (F5)",
+  "setup": "INSERT INTO todos (id, project_id, title, done) VALUES (1, 'p1', 'first', 0);",
+  "operations": [
+    { "kind": "GET", "path": "/electrolite/v1/projectTodos/p1", "query": "offset=-1" },
+    {
+      "kind": "GET",
+      "path": "/electrolite/v1/projectTodos/p1",
+      "query": "offset={prev[0].body.offset}&log_id={prev[0].body.log_id}&shape_handle=deadbeefdeadbeef"
+    }
+  ],
+  "cross_engine": ["1.status", "1.body.error"],
+  "expect": {
+    "1.status": 409,
+    "1.body.error": "resync_required"
+  }
+}

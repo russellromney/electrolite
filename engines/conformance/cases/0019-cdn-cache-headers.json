@@ -19,5 +19,9 @@
     "1.headers.etag",
     "1.headers.cache-control",
     "1.headers.vary"
-  ]
+  ],
+  "expect": {
+    "0.headers.cache-control": "private, max-age=5",
+    "1.headers.cache-control": "private, max-age=31536000, immutable"
+  }
 }

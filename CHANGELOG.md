@@ -5,6 +5,32 @@
 Electrolite is now a Node-only TypeScript library for Electric-style
 SQLite sync.
 
+### Security & correctness (adversarial review fixes)
+
+- **Cache safety:** snapshot/replay responses now default to
+  `cache-control: private` so a shared cache/CDN can no longer serve one
+  user's authorized Shape to another without `authorize()` running.
+  Shapes opt into `public` caching with `cacheable: true` (all 5
+  engines). [F2]
+- **Compaction:** compacting a table to keep more rows than it has no
+  longer deletes that table's whole log or forces its subscribers to
+  resync because an unrelated table advanced the sequence; the retained
+  offset also never regresses (all 5 engines). [F1]
+- **Resync gate:** a replay/live request (`offset >= 0`) now requires a
+  `log_id`, and the server validates a presented `shape_handle`, both
+  returning `409 resync_required` on mismatch (all 5 engines). [F5, F8]
+- **SQL params:** numbered SQLite placeholders (`?1`) can now be reused
+  and reordered in `execute`/`writeBatch` (removed a normalizer that
+  broke them). [F3]
+- **Multi-tab:** leadership now uses the Web Locks API for true mutual
+  exclusion (localStorage lease is a fallback), so two tabs can no
+  longer both poll. [F6]
+- **Diff replay:** a `replica=diff` UPDATE for a key the client doesn't
+  hold now forces a clean resync instead of materializing a partial
+  row. [F7]
+- **Wake fanout:** a write only replay-scans live Shapes on the table
+  that actually changed, instead of one scan per active Shape. [F9]
+
 ### Added
 
 - Embedded Node package using Node's built-in SQLite API.

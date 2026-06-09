@@ -177,9 +177,9 @@ func main() {
 				case live:
 					cacheControl = "no-store"
 				case offsetIn >= 0:
-					cacheControl = "public, max-age=31536000, immutable"
+					cacheControl = "private, max-age=31536000, immutable"
 				default:
-					cacheControl = "public, max-age=5"
+					cacheControl = "private, max-age=5"
 				}
 			}
 		}

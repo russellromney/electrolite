@@ -40,12 +40,20 @@ long-polls for replay messages.
 - Predicate language: `all`, `eq`, `gt`/`lt`/`gte`/`lte`, `in`,
   `and`, `or`, `not`. (`is_null` is not a separate kind;
   `eq(col, null)` is the way to test null.)
-- CDN-cacheable responses: every server emits `etag`,
-  `cache-control`, and `vary: authorization`. Replay responses
-  with `offset >= 0` are `public, max-age=31536000, immutable`.
-  Snapshot responses are `public, max-age=5`. Live responses are
-  `no-store`. Clients sending `if-none-match` get `304 Not
-  Modified`.
+- Cacheable responses: every server emits `etag`, `cache-control`,
+  and `vary: authorization`. **Default is `private`** so a shared
+  cache/CDN never serves one user's authorized Shape bytes to
+  another user without `authorize()` running: replay (`offset >= 0`)
+  is `private, max-age=31536000, immutable`, snapshot is `private,
+  max-age=5`, live is `no-store`. A Shape opts into shared (`public`)
+  caching with `cacheable: true` (Node API) only when its bytes are
+  safe for any URL holder. Clients sending `if-none-match` get `304
+  Not Modified`.
+- Resync gate: a replay/live request (`offset >= 0`) MUST present a
+  `log_id`; a missing or mismatched `log_id` yields `409
+  resync_required`. If the client also presents a `shape_handle`, a
+  mismatch (the Shape definition changed behind the URL) yields `409
+  resync_required` too.
 - `replica=diff` mode: clients can opt into UPDATE messages that
   carry only the changed columns. Browser materializer merges
   instead of overwrites.

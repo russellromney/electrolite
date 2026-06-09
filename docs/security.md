@@ -39,6 +39,22 @@ app can mint signed shape URLs. The signature covers:
 - expiration
 - retention generation
 
+## Caching
+
+Snapshot and replay responses default to `cache-control: private`. A
+`private` response may be stored by the requesting browser's own HTTP
+cache but never by a shared cache or CDN. This matters because a shared
+cache keyed on the URL would serve one user's authorized Shape bytes to
+the next user without `authorize()` running — and `vary: authorization`
+only protects deployments that carry the credential in the
+`Authorization` header (not cookie or query-token auth).
+
+A Shape opts into shared (`public`) caching with `cacheable: true`. Only
+do this when the Shape's bytes are safe for any holder of the URL: it
+carries no per-user data, OR it is delivered via short-lived signed
+URLs, OR auth is in the `Authorization` header. Live responses are
+always `no-store`.
+
 ## Rules
 
 - Raw `_electrolite_log` is private.
@@ -47,6 +63,8 @@ app can mint signed shape URLs. The signature covers:
   bodies.
 - Public/object-store data must be authorized shape output, not global
   database changes.
+- Snapshot/replay responses are `private` by default; `public` caching
+  is per-Shape opt-in and must only cover data safe for any URL holder.
 - Shape handles include auth scope.
 - Column allowlists are required.
 - Delete messages must not reveal rows that were never visible to that

@@ -69,8 +69,10 @@ engines all implement this contract.
   `authorize` returned false. The two are deliberately indistinguishable.
 - `409 { "error": "resync_required" }` — one of:
   - client's `offset` is below the table's `retained_offset`
+  - request has `offset >= 0` but presents **no** `log_id`
   - client's `log_id` does not match the current log id
-  - client's `shape_handle` does not match the shape's current handle
+  - client presents a `shape_handle` that does not match the shape's
+    current handle (absent `shape_handle` is allowed)
 
 ## Shape definition
 
@@ -221,12 +223,36 @@ arrive. Lines starting with `:` are heartbeats that double as
 disconnect probes. The browser `ShapeClient` opts in via
 `new ShapeClient(url, { transport: "sse" })`.
 
+## Caching
+
+Every engine emits `etag`, `vary: authorization`, and `cache-control`
+on `200` JSON responses. The default visibility is `private` so a
+shared cache/CDN never serves one user's authorized Shape bytes to
+another user without `authorize()` running:
+
+- snapshot (`offset == -1`) → `private, max-age=5`
+- replay (`offset >= 0`) → `private, max-age=31536000, immutable`
+- live → `no-store`
+
+The canonical Node API lets a Shape opt into `public` visibility with
+`cacheable: true`; other engines default to `private`. A client sending
+`if-none-match` that matches the etag gets `304 Not Modified`.
+
 ## Compact
 
 `compact(table, retention)` deletes log rows whose `seq` is at or below
 the watermark and writes the watermark to `retained_offset:<table>`.
 After compaction, any client whose stored `offset` is below the
 watermark must receive `409 resync_required` on its next replay.
+
+The watermark is the seq of the row just past the `retention` newest
+rows **for that table**. If the table has fewer than `retention` rows,
+the watermark falls back to `0` (keep everything) — NOT to the global
+`MAX(seq)`. Using the global high-water mark would delete a quiet
+table's whole log and force its subscribers to resync whenever some
+*other* table advanced the sequence. The watermark also never
+regresses: re-running compact with a larger `retention` keeps the
+existing (higher) watermark rather than lowering it.
 
 `compact` and `shutdown` interact: a compaction in progress when
 `shutdown()` is called runs to completion. `shutdown_timeout_ms`
@@ -262,5 +288,13 @@ Every engine implements a test suite that exercises these cases:
 14. Composite primary keys are exposed in `key_columns` and in message
     `key` objects.
 15. Live wait wakes when a write commits.
+16. Replay with `offset >= 0` and no `log_id` yields `409
+    resync_required`.
+17. Replay with a mismatched `shape_handle` yields `409
+    resync_required`.
+18. Compacting a table to keep more rows than it has deletes nothing
+    and does not raise the retained offset to the global high-water
+    mark (no spurious resync for a quiet table).
+19. Snapshot/replay responses default to `private` cache-control.
 
 The engines may add language-specific tests, but each must pass these.
