@@ -245,6 +245,63 @@ class AuthAndResyncConformance(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertEqual(body, {"error": "resync_required"})
 
+    def test_missing_log_id_on_replay_returns_409(self):
+        tmp, app = _setup()
+        self.addCleanup(tmp.cleanup)
+        _, snap = app.handle(
+            "/electrolite/v1/projectTodos/p1", "offset=-1", context={"projects": {"p1"}}
+        )
+        # Replay request (offset >= 0) without a log_id query param must 409.
+        status, body = app.handle(
+            "/electrolite/v1/projectTodos/p1",
+            f"offset={snap['offset']}&shape_handle={snap['shape_handle']}",
+            context={"projects": {"p1"}},
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body, {"error": "resync_required"})
+
+    def test_shape_handle_mismatch_returns_409(self):
+        tmp, app = _setup()
+        self.addCleanup(tmp.cleanup)
+        _, snap = app.handle(
+            "/electrolite/v1/projectTodos/p1", "offset=-1", context={"projects": {"p1"}}
+        )
+        status, body = app.handle(
+            "/electrolite/v1/projectTodos/p1",
+            f"offset={snap['offset']}&log_id={snap['log_id']}&shape_handle=deadbeef",
+            context={"projects": {"p1"}},
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body, {"error": "resync_required"})
+
+    def test_absent_shape_handle_is_lenient(self):
+        tmp, app = _setup()
+        self.addCleanup(tmp.cleanup)
+        _, snap = app.handle(
+            "/electrolite/v1/projectTodos/p1", "offset=-1", context={"projects": {"p1"}}
+        )
+        # log_id present, shape_handle absent → no 409.
+        status, body = app.handle(
+            "/electrolite/v1/projectTodos/p1",
+            f"offset={snap['offset']}&log_id={snap['log_id']}",
+            context={"projects": {"p1"}},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["type"], "replay")
+
+    def test_unauthorized_takes_precedence_over_missing_log_id(self):
+        # Authorization (404) is checked before the offset>=0 resync
+        # checks, so an unauthorized replay request still yields 404.
+        tmp, app = _setup()
+        self.addCleanup(tmp.cleanup)
+        status, body = app.handle(
+            "/electrolite/v1/projectTodos/p1",
+            "offset=5",
+            context={"projects": {"p2"}},
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(body, {"error": "shape_not_found"})
+
     def test_compact_makes_old_offsets_resync(self):
         tmp, app = _setup()
         self.addCleanup(tmp.cleanup)
@@ -262,6 +319,69 @@ class AuthAndResyncConformance(unittest.TestCase):
         )
         self.assertEqual(status, 409)
         self.assertEqual(body, {"error": "resync_required"})
+
+
+class CompactionWatermarkConformance(unittest.TestCase):
+    def _two_table_app(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = os.path.join(tmp.name, "app.db")
+        app = create_electrolite(
+            db_path,
+            shapes={
+                "todos": shape(table="todos", columns=["id", "title"]),
+                "events": shape(table="events", columns=["id", "kind"]),
+            },
+        )
+        app.execute_batch(
+            """
+            CREATE TABLE todos (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
+            CREATE TABLE events (id INTEGER PRIMARY KEY, kind TEXT NOT NULL);
+            """
+        )
+        app.install_triggers("todos")
+        app.install_triggers("events")
+        return app
+
+    def test_compact_does_not_use_global_high_water_mark(self):
+        app = self._two_table_app()
+        # A few todos rows, then MANY events rows so the global max(seq)
+        # is far ahead of todos' own max seq.
+        for i in range(1, 4):
+            app.execute("INSERT INTO todos (id, title) VALUES (?, ?)", [i, f"t{i}"])
+        todos_max = app.db.execute(
+            "SELECT MAX(seq) AS s FROM _electrolite_log WHERE table_name = 'todos'"
+        ).fetchone()["s"]
+        for i in range(1, 200):
+            app.execute("INSERT INTO events (id, kind) VALUES (?, ?)", [i, "e"])
+        self.assertGreater(app.high_water_mark(), todos_max)
+
+        # keep_last larger than todos' row count → keep everything.
+        result = app.compact("todos", 1000)
+        self.assertEqual(result["deleted_rows"], 0)
+        self.assertEqual(result["retained_offset"], 0)
+        remaining = app.db.execute(
+            "SELECT COUNT(*) AS c FROM _electrolite_log WHERE table_name = 'todos'"
+        ).fetchone()["c"]
+        self.assertEqual(remaining, 3)
+
+    def test_compact_retained_offset_is_monotonic(self):
+        app = self._two_table_app()
+        for i in range(1, 6):
+            app.execute("INSERT INTO todos (id, title) VALUES (?, ?)", [i, f"t{i}"])
+        todos_max = app.db.execute(
+            "SELECT MAX(seq) AS s FROM _electrolite_log WHERE table_name = 'todos'"
+        ).fetchone()["s"]
+
+        # keep_last=0 retains up to todos' max seq.
+        first = app.compact("todos", 0)
+        self.assertEqual(first["retained_offset"], todos_max)
+
+        # A later compact with a huge keep_last must NOT lower the
+        # retained offset back down to 0.
+        second = app.compact("todos", 1000)
+        self.assertEqual(second["retained_offset"], todos_max)
+        self.assertEqual(second["deleted_rows"], 0)
 
 
 class TableConformance(unittest.TestCase):

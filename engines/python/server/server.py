@@ -143,12 +143,14 @@ def make_handler(app):
                 shape_handle = body.get("shape_handle", "")
                 offset_out = body.get("offset", -1)
                 etag = f'"{shape_handle}-{offset_out}"'
+                # Default to `private`: a shared CDN keyed only on URL must
+                # not serve one user's authorized Shape bytes to another.
                 if electrolite_route.get("live"):
                     cache_control = "no-store"
                 elif electrolite_route.get("offset", -1) >= 0:
-                    cache_control = "public, max-age=31536000, immutable"
+                    cache_control = "private, max-age=31536000, immutable"
                 else:
-                    cache_control = "public, max-age=5"
+                    cache_control = "private, max-age=5"
 
             # 304 Not Modified path: if client's If-None-Match matches
             # the etag we'd return, send 304 without a body.

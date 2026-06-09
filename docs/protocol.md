@@ -126,9 +126,16 @@ restored, or swapped and the client's `log_id` no longer matches, the
 server returns `409 resync_required`.
 
 Snapshots and replays also include a `shape_handle`, a normalized identity
-for the authorized Shape. Clients persist it with cached rows. If the app
-changes the Shape definition behind the same URL, the next response has a
-different handle and the client discards the stale cache.
+for the authorized Shape. Clients persist it with cached rows and send it
+back on replay/live requests. If the app changes the Shape definition
+behind the same URL, the server's recomputed handle no longer matches the
+presented one and the server returns `409 resync_required`; the client
+also discards the stale cache on its own.
+
+A replay/live request (`offset >= 0`) must present a `log_id`. A missing
+`log_id` is treated the same as a mismatched one — `409 resync_required` —
+so the server never serves offsets from a database whose identity the
+client cannot prove it shares.
 
 Replay messages include `batch_id`. Messages written through an explicit
 Electrolite write batch share a batch id, so UIs and tests can tell when
@@ -229,7 +236,10 @@ electrolite.compactLogToLastForTable("todos", 10_000);
 After compaction, offsets older than the durable retained offset return
 `409 resync_required` even if the compacted log table is empty. Global
 compaction records per-table lower bounds, so unrelated table churn does
-not force a quiet Shape to resync.
+not force a quiet Shape to resync. Asking to keep more rows than a table
+has keeps everything: the retained offset stays where it was rather than
+jumping to the global high-water mark, and the retained offset only ever
+advances, never regresses.
 
 ## Runtime Notes
 

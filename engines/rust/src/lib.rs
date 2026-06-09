@@ -400,21 +400,25 @@ impl Electrolite {
                 |r| r.get(0),
             )
             .optional()?;
-        let retained_offset = match watermark {
-            Some(s) => s,
-            None => high_water(&db)?,
-        };
+        // F1: candidate watermark is the seq at OFFSET keep_last for THIS table,
+        // or 0 (keep everything) when the table has fewer than keep_last rows.
+        // Never fall back to the global high-water mark — that would wipe a quiet
+        // table's log whenever another table advanced the sequence.
+        let candidate = watermark.unwrap_or(0);
+        // Never regress: keep at least what we already retained for this table.
+        let existing = retained_offset(&db, table)?;
+        let retained = existing.max(candidate);
         let deleted = db.execute(
             "DELETE FROM _electrolite_log WHERE table_name = ? AND seq <= ?",
-            params![table, retained_offset],
+            params![table, retained],
         )?;
         db.execute(
             "INSERT INTO _electrolite_meta (key, value) VALUES (?, ?) \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![format!("retained_offset:{table}"), retained_offset.to_string()],
+            params![format!("retained_offset:{table}"), retained.to_string()],
         )?;
         Ok(CompactStats {
-            retained_offset,
+            retained_offset: retained,
             deleted_rows: deleted,
         })
     }
@@ -630,11 +634,13 @@ impl Electrolite {
         };
 
         if route.offset >= 0 {
-            if let Some(client_log_id) = &route.log_id {
-                if client_log_id != &current_log_id {
-                    return (409, json!({"error": "resync_required"}));
-                }
+            // F8: log_id is required on replay/live. Missing log_id is treated
+            // the same as a mismatched one — the client must resync.
+            match &route.log_id {
+                Some(client_log_id) if client_log_id == &current_log_id => {}
+                _ => return (409, json!({"error": "resync_required"})),
             }
+            // F5: if a shape_handle is supplied it must match; absent is allowed.
             if let Some(client_handle) = &route.shape_handle {
                 if client_handle != &current_handle {
                     return (409, json!({"error": "resync_required"}));

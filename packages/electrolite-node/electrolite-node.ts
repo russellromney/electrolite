@@ -39,6 +39,19 @@ export interface ShapeDefinition<TContext = unknown> {
     context: ShapeAuthorizeContext<TContext>,
   ) => boolean | Promise<boolean>;
   schemaVersion?: number;
+  /**
+   * Opt in to *shared* (CDN/proxy) caching of this Shape's snapshot and
+   * replay responses. Default is `false`, which emits `private` cache
+   * headers so a shared cache never serves one user's authorized Shape
+   * bytes to another user without `authorize()` running.
+   *
+   * Only set this when the Shape's bytes are safe for any holder of the
+   * URL — i.e. the Shape carries no per-user data, OR you deliver it
+   * via short-lived signed URLs, OR auth is carried in the
+   * `Authorization` header (covered by `vary: authorization`). Cookie
+   * or query-token auth is NOT safe to mark cacheable.
+   */
+  cacheable?: boolean;
 }
 
 export interface ElectroliteOptions<TContext = unknown> {
@@ -211,8 +224,16 @@ export class Electrolite<TContext = unknown> {
       return;
     }
 
+    // Only the tables that actually changed can wake a shape. Skipping
+    // shapes whose source table is untouched avoids one SQL replay per
+    // active shape on every write (previously O(active shapes) of log
+    // scans even for writes to unrelated tables).
+    const changedTables = this.engine.changedTablesSince(offset);
     const limit = Math.max(1, nextOffset - offset);
     for (const [shapeHandle, shape] of this.activeShapes) {
+      if (!changedTables.has(shape.table)) {
+        continue;
+      }
       try {
         const replay = JSON.parse(
           this.engine.replay(JSON.stringify(shape), Number(offset), limit),
@@ -270,13 +291,42 @@ export class Electrolite<TContext = unknown> {
       return jsonError(404, "shape_not_found");
     }
 
-    if (route.offset >= 0 && route.logId && route.logId !== this.logId()) {
-      return jsonError(409, "resync_required");
+    // Resync gate for any replay/live request (offset >= 0). The client
+    // MUST present its log_id so we can prove it is reading the same log
+    // history; a missing log_id is treated as a forced resync rather
+    // than silently serving offsets from a possibly-swapped database.
+    if (route.offset >= 0) {
+      if (!route.logId || route.logId !== this.logId()) {
+        return jsonError(409, "resync_required");
+      }
+      // If the client presents a shape_handle, it must match the
+      // current normalized handle. A changed Shape definition behind the
+      // same URL yields a new handle, so the client must re-snapshot
+      // rather than materialize messages against a stale cache.
+      if (route.shapeHandle) {
+        let currentHandle;
+        try {
+          currentHandle = this.engine.shapeHandle(JSON.stringify(built.shape));
+        } catch (error) {
+          if (isBadInputError(error)) {
+            return badInputResponse(error);
+          }
+          return jsonError(500, "internal_server_error");
+        }
+        if (route.shapeHandle !== currentHandle) {
+          return jsonError(409, "resync_required");
+        }
+      }
     }
+
+    const cacheable = Boolean(definition.cacheable);
 
     if (route.offset < 0) {
       try {
-        return jsonResponse(JSON.parse(this.engine.snapshot(JSON.stringify(built.shape))));
+        return tagCacheable(
+          jsonResponse(JSON.parse(this.engine.snapshot(JSON.stringify(built.shape)))),
+          cacheable,
+        );
       } catch (error) {
         if (isBadInputError(error)) {
           return badInputResponse(error);
@@ -289,7 +339,10 @@ export class Electrolite<TContext = unknown> {
       return this.liveResponse(built.shape, route.offset, (route as any).replica ?? "full");
     }
 
-    return this.replayResponse(built.shape, route.offset, (route as any).replica ?? "full");
+    return tagCacheable(
+      this.replayResponse(built.shape, route.offset, (route as any).replica ?? "full"),
+      cacheable,
+    );
   }
 
   async buildShape(
@@ -452,6 +505,7 @@ export class Electrolite<TContext = unknown> {
       offset,
       live: parsed.searchParams.get("live") === "true",
       logId: parsed.searchParams.get("log_id"),
+      shapeHandle: parsed.searchParams.get("shape_handle"),
       replica,
     };
   }
@@ -483,6 +537,13 @@ function safeDecode(value) {
 
 function jsonResponse(body) {
   return Response.json(body);
+}
+
+// Mark a response as safe for shared (CDN) caching. Read back by
+// applyCacheHeaders to choose `public` vs `private` cache-control.
+function tagCacheable(response: Response, cacheable: boolean): Response {
+  (response as any).electroliteCacheable = cacheable === true;
+  return response;
 }
 
 function jsonError(status, error) {
@@ -533,13 +594,22 @@ async function applyCacheHeaders(response: Response, request: Request): Promise<
   const url = new URL(request.url, "http://electrolite.local");
   const offsetIn = Number(url.searchParams.get("offset") ?? "-1");
   const live = url.searchParams.get("live") === "true";
+  // Default to `private`: the response is cacheable by the requesting
+  // browser's own HTTP cache but NEVER by a shared cache/CDN, because a
+  // shared cache keyed only on the URL would serve one user's
+  // authorized Shape bytes to another user without authorize() running.
+  // A Shape opts into `public` caching via `cacheable: true` (see
+  // ShapeDefinition.cacheable) only when its bytes are safe for any URL
+  // holder.
+  const sharedCacheable = (response as any).electroliteCacheable === true;
+  const visibility = sharedCacheable ? "public" : "private";
   let cacheControl: string;
   if (live) {
     cacheControl = "no-store";
   } else if (offsetIn >= 0) {
-    cacheControl = "public, max-age=31536000, immutable";
+    cacheControl = `${visibility}, max-age=31536000, immutable`;
   } else {
-    cacheControl = "public, max-age=5";
+    cacheControl = `${visibility}, max-age=5`;
   }
 
   // 304 Not Modified path.

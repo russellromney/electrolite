@@ -236,7 +236,17 @@ export class JsElectroliteEngine {
       ORDER BY seq DESC
       LIMIT 1 OFFSET ?
     `).all(tableName, Math.max(0, Number(keepLast)));
-    const retainedOffset = rows[0]?.seq ?? this.highWaterMark();
+    // When the table has fewer than keepLast rows there is nothing to
+    // drop. Fall back to 0 (keep everything) — NOT the global
+    // high-water mark. Using the global MAX(seq) would delete this
+    // quiet table's entire log and force its subscribers to resync
+    // just because some *other* table advanced the sequence.
+    const candidate = rows[0]?.seq ?? 0;
+    // Never regress the watermark: a prior compaction may have set a
+    // higher retained offset, and lowering it would let a client
+    // silently skip already-deleted offsets.
+    const existing = retainedOffsetForTable(this.db, tableName);
+    const retainedOffset = Math.max(existing, candidate);
     const deleted = this.db.prepare(
       "DELETE FROM _electrolite_log WHERE table_name = ? AND seq <= ?",
     ).run(tableName, retainedOffset).changes;
@@ -254,7 +264,17 @@ export class JsElectroliteEngine {
 
   execute(sql: string, paramsJson = "[]"): number {
     const params = JSON.parse(paramsJson || "[]");
-    return this.db.prepare(normalizePlaceholders(sql)).run(...params).changes;
+    return this.db.prepare(sql).run(...params).changes;
+  }
+
+  // Distinct table names touched after `offset`. Used to wake only the
+  // live shapes whose source table actually changed, instead of
+  // re-querying the log once per active shape on every write.
+  changedTablesSince(offset: number): Set<string> {
+    const rows = this.db.prepare(
+      "SELECT DISTINCT table_name FROM _electrolite_log WHERE seq > ?",
+    ).all(Number(offset));
+    return new Set(rows.map((row) => row.table_name));
   }
 
   writeBatch(statementsJson: string): void {
@@ -268,7 +288,7 @@ export class JsElectroliteEngine {
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
       `).run(batchId);
       for (const statement of statements) {
-        this.db.prepare(normalizePlaceholders(statement.sql)).run(...(statement.params ?? []));
+        this.db.prepare(statement.sql).run(...(statement.params ?? []));
       }
       this.db.prepare("DELETE FROM _electrolite_meta WHERE key = 'current_batch_id'").run();
       this.db.exec("COMMIT");
@@ -811,10 +831,6 @@ function quoteString(value) {
 
 function randomHex(bytes) {
   return randomBytes(bytes).toString("hex");
-}
-
-function normalizePlaceholders(sql) {
-  return String(sql).replace(/\?\d+/g, "?");
 }
 
 function loadNodeSqlite() {

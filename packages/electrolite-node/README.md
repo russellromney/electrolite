@@ -42,6 +42,29 @@ Browser clients can then subscribe to:
 /electrolite/v1/projectTodos/p1
 ```
 
+## Shared caching (`cacheable`)
+
+Snapshot and replay responses are `cache-control: private` by default,
+so a CDN or shared proxy will not serve one user's authorized Shape to
+another user. Live responses are always `no-store`.
+
+A Shape that is safe for any holder of its URL can opt into `public`
+(CDN-shareable) caching:
+
+```ts
+publicChangelog: shape({
+  table: "changelog",
+  columns: ["id", "title", "published_at"],
+  where: () => eq("published", 1),
+  cacheable: true, // public, max-age, immutable on replay pages
+}),
+```
+
+Only set `cacheable: true` when the Shape carries no per-user data, OR
+you deliver it via short-lived signed URLs, OR auth is in the
+`Authorization` header (covered by `vary: authorization`). Cookie or
+query-token auth is **not** safe to mark cacheable.
+
 ## Recommended PRAGMAs
 
 The engine does not issue `PRAGMA` statements; the user owns those.

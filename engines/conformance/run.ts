@@ -37,6 +37,11 @@ interface Case {
   operations: Operation[];
   assert?: ((responses: unknown[]) => void) | { js: string };
   cross_engine?: string[]; // dotted JSON paths into responses[i].body
+  // Map of dotted path (e.g. "1.headers.cache-control" or "1.status")
+  // to the value EVERY engine must produce. Catches absolute-value
+  // regressions (e.g. a `public` cache header) that cross_engine —
+  // which only checks engines agree with each other — would miss.
+  expect?: Record<string, unknown>;
 }
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -246,6 +251,23 @@ for (const c of cases) {
             .join("\n");
           assert.fail(
             `cross-engine mismatch on ${path}:\n${detail}`,
+          );
+        }
+      }
+    }
+
+    // Absolute-value expectations: every engine must produce exactly
+    // this value at the given path.
+    if (c.expect) {
+      for (const [path, want] of Object.entries(c.expect)) {
+        const [opIdx, ...rest] = path.split(".");
+        const restPath = rest.join(".");
+        for (const [name, responses] of responsesPerEngine) {
+          const got = getPath(responses[Number(opIdx)], restPath);
+          assert.equal(
+            canonicalStringify(got),
+            canonicalStringify(want),
+            `${name}: expected ${path} == ${JSON.stringify(want)}, got ${JSON.stringify(got)}`,
           );
         }
       }

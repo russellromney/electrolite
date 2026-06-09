@@ -403,20 +403,27 @@ func (e *Electrolite) WriteBatch(stmts []Stmt) error {
 // Compact deletes log rows older than keepLast and writes the watermark
 // to retained_offset:<table>.
 func (e *Electrolite) Compact(table string, keepLast int) (CompactStats, error) {
-	var watermark int64
+	// Candidate watermark is the seq at OFFSET keepLast for this table. If
+	// the table has fewer than keepLast rows, candidate is 0 (keep
+	// everything) — NOT the global high-water mark, which would wipe a quiet
+	// table's log whenever another table advanced the sequence.
+	var candidate int64
 	err := e.db.QueryRow(
 		"SELECT seq FROM _electrolite_log WHERE table_name = ? ORDER BY seq DESC LIMIT 1 OFFSET ?",
 		table, keepLast,
-	).Scan(&watermark)
+	).Scan(&candidate)
 	if err == sql.ErrNoRows {
-		watermark, err = e.highWater()
-		if err != nil {
-			return CompactStats{}, err
-		}
+		candidate = 0
 	} else if err != nil {
 		return CompactStats{}, err
 	}
-	res, err := e.db.Exec("DELETE FROM _electrolite_log WHERE table_name = ? AND seq <= ?", table, watermark)
+	// Never regress: the retained offset is monotonic.
+	existing, err := e.retainedOffset(table)
+	if err != nil {
+		return CompactStats{}, err
+	}
+	retained := maxInt64(existing, candidate)
+	res, err := e.db.Exec("DELETE FROM _electrolite_log WHERE table_name = ? AND seq <= ?", table, retained)
 	if err != nil {
 		return CompactStats{}, err
 	}
@@ -424,11 +431,18 @@ func (e *Electrolite) Compact(table string, keepLast int) (CompactStats, error) 
 	if _, err := e.db.Exec(
 		`INSERT INTO _electrolite_meta (key, value) VALUES (?, ?)
 		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-		"retained_offset:"+table, strconv.FormatInt(watermark, 10),
+		"retained_offset:"+table, strconv.FormatInt(retained, 10),
 	); err != nil {
 		return CompactStats{}, err
 	}
-	return CompactStats{RetainedOffset: watermark, DeletedRows: deleted}, nil
+	return CompactStats{RetainedOffset: retained, DeletedRows: deleted}, nil
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // Snapshot returns the current matching rows pinned to a log offset.
@@ -650,7 +664,9 @@ func (e *Electrolite) Handle(path, query string, context interface{}) HandleResp
 	}
 
 	if route.Offset >= 0 {
-		if route.LogID != "" && route.LogID != currentLogID {
+		// log_id is required on replay/live. Missing or mismatched both
+		// force a resync.
+		if route.LogID == "" || route.LogID != currentLogID {
 			return HandleResponse{Status: 409, Body: errBody("resync_required")}
 		}
 		if route.ShapeHandle != "" && route.ShapeHandle != currentHandle {

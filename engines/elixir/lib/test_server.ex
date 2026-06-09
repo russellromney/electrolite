@@ -67,8 +67,8 @@ defmodule Electrolite.TestServer do
 
     cond do
       Map.get(qp, "live") == "true" -> "no-store"
-      (Map.get(qp, "offset") || "-1") |> safe_int() |> Kernel.>=(0) -> "public, max-age=31536000, immutable"
-      true -> "public, max-age=5"
+      (Map.get(qp, "offset") || "-1") |> safe_int() |> Kernel.>=(0) -> "private, max-age=31536000, immutable"
+      true -> "private, max-age=5"
     end
   end
 

@@ -411,7 +411,10 @@ defmodule Electrolite do
   end
 
   defp check_log_id(%{offset: o}, _) when o < 0, do: :ok
-  defp check_log_id(%{log_id: nil}, _), do: :ok
+  # On any replay/live request (offset >= 0) the client MUST present its
+  # log_id so we can prove it is reading the same log history. A missing
+  # log_id is treated as a forced resync rather than silently accepted.
+  defp check_log_id(%{log_id: nil}, _), do: {:error, :resync_required}
 
   defp check_log_id(%{log_id: lid}, current) do
     if lid == current, do: :ok, else: {:error, :resync_required}
@@ -668,34 +671,42 @@ defmodule Electrolite do
   end
 
   defp do_compact(conn, table, keep_last) do
-    {:ok, watermark_rows} =
+    {:ok, candidate_rows} =
       query(
         conn,
         "SELECT seq FROM _electrolite_log WHERE table_name = ? ORDER BY seq DESC LIMIT 1 OFFSET ?",
         [table, max(0, keep_last)]
       )
 
-    watermark =
-      case watermark_rows do
-        [[s] | _] ->
-          s
-
-        _ ->
-          {:ok, hw} = high_water(conn)
-          hw
+    # When the table has fewer than keep_last rows there is nothing to
+    # drop. Fall back to 0 (keep everything) — NOT the global high-water
+    # mark. Using the global MAX(seq) would delete this quiet table's
+    # entire log and force its subscribers to resync just because some
+    # *other* table advanced the sequence.
+    candidate =
+      case candidate_rows do
+        [[s] | _] -> s
+        _ -> 0
       end
 
-    {:ok, _} = query(conn, "DELETE FROM _electrolite_log WHERE table_name = ? AND seq <= ?", [table, watermark])
+    # Never regress the watermark: a prior compaction may have set a
+    # higher retained offset, and lowering it would let a client
+    # silently skip already-deleted offsets.
+    {:ok, existing} = retained_offset(conn, table)
+    retained = max(existing, candidate)
+
+    {:ok, _} = query(conn, "DELETE FROM _electrolite_log WHERE table_name = ? AND seq <= ?", [table, retained])
+    {:ok, deleted} = Sqlite3.changes(conn)
 
     :ok =
       exec(
         conn,
         "INSERT INTO _electrolite_meta (key, value) VALUES (?, ?) " <>
           "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        ["retained_offset:" <> table, Integer.to_string(watermark)]
+        ["retained_offset:" <> table, Integer.to_string(retained)]
       )
 
-    {:ok, %{retained_offset: watermark}}
+    {:ok, %{retained_offset: retained, deleted_rows: deleted}}
   end
 
   defp read_log_page(conn, table, offset, limit) do

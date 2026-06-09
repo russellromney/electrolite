@@ -12,6 +12,7 @@ export class ShapeClient {
       headers,
       onError,
       replica = "full",
+      locks,
     } = options;
     if (keyColumns !== undefined && (!Array.isArray(keyColumns) || keyColumns.length === 0)) {
       throw new Error("ShapeClient keyColumns must be a non-empty array");
@@ -54,6 +55,15 @@ export class ShapeClient {
     this.clientId = randomId();
     this.leaderKey = `electrolite:leader:${stableString(this.url)}`;
     this.leaderTtlMs = 5_000;
+    // Web Locks give true cross-tab mutual exclusion (no localStorage
+    // check-then-act race). When unavailable, fall back to the
+    // best-effort localStorage lease below.
+    // `locks: null` explicitly opts out (forcing the localStorage
+    // fallback); omitting it uses the platform's Web Locks if present.
+    this.locks = locks === undefined ? (globalThis.navigator?.locks ?? null) : locks;
+    this.leaderHeld = false;
+    this.acquiringLeader = false;
+    this.releaseLeader = null;
     this.channel = null;
     this.channelHandler = null;
     this.visibilityHandler = null;
@@ -228,7 +238,7 @@ export class ShapeClient {
     const decoder = new TextDecoder();
     let buffer = "";
     try {
-      while (!this.stopped) {
+      while (!this.stopped && !this.resyncRequired) {
         const { value, done } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
@@ -237,6 +247,10 @@ export class ShapeClient {
           const frame = buffer.slice(0, idx);
           buffer = buffer.slice(idx + 2);
           this.handleSseFrame(frame);
+          // A frame can invalidate local state: a changed log_id /
+          // shape_handle, or a diff UPDATE for a row we don't hold. Stop
+          // consuming the stale stream and resync.
+          if (this.resyncRequired) break;
         }
       }
     } finally {
@@ -244,6 +258,15 @@ export class ShapeClient {
         await reader.cancel();
       } catch {}
       this.abortController = null;
+    }
+    if (this.resyncRequired) {
+      this.resyncRequired = false;
+      await this.resetLocalState();
+      // offset is now -1; start()'s loop re-snapshots. When called
+      // directly, re-snapshot here so callers get a clean recovery.
+      if (!this.stopped) {
+        return this.request({ offset: -1 });
+      }
     }
   }
 
@@ -340,6 +363,11 @@ export class ShapeClient {
     if (this.logId && params.offset >= 0) {
       url.searchParams.set("log_id", this.logId);
     }
+    // Present our shape_handle on replay/live so the server can 409 if
+    // the Shape definition changed behind this URL.
+    if (this.shapeHandle && params.offset >= 0) {
+      url.searchParams.set("shape_handle", this.shapeHandle);
+    }
     if (this.replica === "diff") {
       url.searchParams.set("replica", "diff");
     }
@@ -395,6 +423,21 @@ export class ShapeClient {
       let changed = false;
       const nextRows = new Map(this.pendingRows ?? this.rows);
       for (const message of body.messages) {
+        // A diff UPDATE only carries the changed columns. If we don't
+        // already hold the row, merging is impossible and writing the
+        // sparse value would materialize a row missing its other
+        // columns. That means our view has drifted from the server's,
+        // so force a clean resync instead of corrupting local state.
+        if (
+          isDiff
+          && message.type === "update"
+          && !nextRows.has(JSON.stringify(message.key))
+        ) {
+          this.dropLocalState();
+          this.resyncRequired = true;
+          this.notifyStatus({ type: "resync_required", offset: this.offset });
+          return false;
+        }
         changed = this.applyMessageTo(nextRows, message, isDiff) || changed;
         this.emitEvent({ type: message.type, offset: message.offset, message });
       }
@@ -449,6 +492,9 @@ export class ShapeClient {
           rows.set(key, { ...existing, ...message.value });
           return true;
         }
+        // No existing row to merge into. apply() guards against this and
+        // forces a resync; never write the sparse diff as a whole row.
+        return false;
       }
       rows.set(key, message.value);
       return true;
@@ -594,6 +640,15 @@ export class ShapeClient {
     if (!this.multiTab) {
       return true;
     }
+    // Preferred path: a real exclusive Web Lock. At most one tab can
+    // hold it at a time, so two tabs can never both think they are
+    // leader (the localStorage path below is a check-then-act and can).
+    if (this.locks) {
+      if (!this.leaderHeld) {
+        this.acquireLeadershipLock();
+      }
+      return this.leaderHeld;
+    }
     if (!globalThis.localStorage) {
       return true;
     }
@@ -609,8 +664,44 @@ export class ShapeClient {
     return false;
   }
 
+  // Fire-and-forget attempt to grab the exclusive Web Lock without
+  // blocking. If we win it, we hold it (the request callback stays
+  // pending) until releaseLeadership() runs or the tab is torn down, at
+  // which point the browser auto-releases it for a follower to claim.
+  acquireLeadershipLock() {
+    if (!this.locks || this.leaderHeld || this.acquiringLeader) {
+      return;
+    }
+    this.acquiringLeader = true;
+    const held = new Promise((resolve) => {
+      this.releaseLeader = resolve;
+    });
+    Promise.resolve(
+      this.locks.request(
+        this.leaderKey,
+        { mode: "exclusive", ifAvailable: true },
+        (lock) => {
+          this.acquiringLeader = false;
+          if (!lock) {
+            // Another tab holds it; we stay a follower and retry later.
+            this.releaseLeader = null;
+            return undefined;
+          }
+          this.leaderHeld = true;
+          return held;
+        },
+      ),
+    ).catch(() => {
+      this.acquiringLeader = false;
+      this.leaderHeld = false;
+      this.releaseLeader = null;
+    });
+  }
+
   renewLeadership() {
-    if (!this.multiTab || !globalThis.localStorage) {
+    // Web Locks need no renewal — the lock is held for the tab's
+    // lifetime. Only the localStorage lease has to be refreshed.
+    if (!this.multiTab || this.locks || !globalThis.localStorage) {
       return;
     }
     const current = parseJson(globalThis.localStorage.getItem(this.leaderKey));
@@ -623,7 +714,7 @@ export class ShapeClient {
   }
 
   startLeadershipHeartbeat() {
-    if (!this.multiTab || !globalThis.setInterval || !globalThis.clearInterval) {
+    if (!this.multiTab || this.locks || !globalThis.setInterval || !globalThis.clearInterval) {
       return null;
     }
     const interval = globalThis.setInterval(
@@ -634,7 +725,19 @@ export class ShapeClient {
   }
 
   releaseLeadership() {
-    if (!this.multiTab || !globalThis.localStorage) {
+    if (!this.multiTab) {
+      return;
+    }
+    if (this.locks) {
+      this.leaderHeld = false;
+      this.acquiringLeader = false;
+      if (this.releaseLeader) {
+        this.releaseLeader();
+        this.releaseLeader = null;
+      }
+      return;
+    }
+    if (!globalThis.localStorage) {
       return;
     }
     const current = parseJson(globalThis.localStorage.getItem(this.leaderKey));
